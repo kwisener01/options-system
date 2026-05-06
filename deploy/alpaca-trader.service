@@ -1,0 +1,19 @@
+[Unit]
+Description=Alpaca Algorithmic Trader
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/alpaca
+ExecStart=/home/ubuntu/alpaca/.venv/bin/python main.py
+EnvironmentFile=/home/ubuntu/alpaca/.env
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=alpaca-trader
+
+[Install]
+WantedBy=multi-user.target

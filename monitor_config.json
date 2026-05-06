@@ -1,0 +1,32 @@
+{
+  "symbols": [
+    "SPY",
+    "QQQ",
+    "GLD",
+    "USO"
+  ],
+  "check_interval_minutes": 5,
+  "market_open": "09:30",
+  "market_close": "16:00",
+  "notifications": {
+    "desktop": true,
+    "email": false,
+    "slack": true,
+    "console": true
+  },
+  "email": {
+    "smtp_server": "smtp.gmail.com",
+    "smtp_port": 587,
+    "from_email": "your-email@gmail.com",
+    "password": "your-app-password",
+    "to_email": "your-email@gmail.com"
+  },
+  "slack": {
+    "webhook_url": "${SLACK_WEBHOOK_URL}"
+  },
+  "signal_thresholds": {
+    "distance_to_max_pain_pct": 0.5,
+    "distance_to_wall_pct": 0.5,
+    "implied_move_pct": 0.8
+  }
+}

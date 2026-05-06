@@ -1,0 +1,26 @@
+# Secrets — never commit
+.env
+
+# Claude Code local settings
+.claude/
+claude instructions.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# Generated data & cache
+data/*.pkl
+data/gex_chain/
+data/options_paper_state.json
+data/rotating_paper_state.json
+
+# Reports (large images/csvs)
+reports/
+
+# Logs
+logs/
+*.log
