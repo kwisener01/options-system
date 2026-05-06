@@ -12,11 +12,11 @@ IS_PAPER = "paper" in ALPACA_BASE_URL
 # Slack
 SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
 
-# Trading parameters
-ACCOUNT_RISK_PCT = 0.02          # max 2% of account per trade
-MAX_POSITIONS = 10               # max concurrent positions
-MIN_STOCK_PRICE = 10.0           # skip penny stocks
-MIN_MARKET_CAP = 1_000_000_000  # $1B+ market cap only
+# Trading parameters — tunable via env vars (change in Render dashboard, no redeploy needed)
+ACCOUNT_RISK_PCT  = float(os.getenv("ACCOUNT_RISK_PCT", "0.08"))   # 8% per position
+MAX_POSITIONS     = int(os.getenv("MAX_POSITIONS", "3"))            # max concurrent positions
+MIN_STOCK_PRICE   = float(os.getenv("MIN_STOCK_PRICE", "10.0"))    # skip penny stocks
+MIN_MARKET_CAP    = 1_000_000_000                                   # $1B+ market cap only
 
 # Monitor
 MONITOR_INTERVAL_MINUTES = 15
@@ -39,7 +39,7 @@ SIGNAL_THRESHOLDS = {
 # ML model
 ML_TARGET_RETURN_PCT = 0.02      # label positive if 5-day forward return > 2%
 ML_LOOKBACK_DAYS = 504           # 2 years of training history
-ML_TOP_N = 10                    # stocks to select per cycle (matches MAX_POSITIONS)
+ML_TOP_N          = int(os.getenv("ML_TOP_N", "3"))   # stocks to select per cycle
 ML_MIN_TRAIN_WEEKS = 26          # minimum weeks before first walk-forward fold
 
 # Backtest
@@ -56,8 +56,8 @@ WHEEL_VOL_WINDOW = 20          # trading days for realized-vol calculation
 WHEEL_INITIAL_CAPITAL = 100_000.0   # SPY/XSP ~$500 => 1 contract needs ~$47-55k collateral
 
 # GEX intraday trader
-GEX_RISK_PCT    = 0.01    # 1% of equity risked per GEX trade
-ALLOW_SHORT_GEX = True    # set False if account lacks margin/shorting
+GEX_RISK_PCT    = float(os.getenv("GEX_RISK_PCT", "0.01"))              # % of equity per GEX trade
+ALLOW_SHORT_GEX = os.getenv("ALLOW_SHORT_GEX", "false").lower() == "true"
 
 # Paths
 import pathlib
