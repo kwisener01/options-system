@@ -177,18 +177,18 @@ class AlpacaClient:
         return {}
 
     def get_stock_price(self, ticker: str) -> Optional[float]:
-        data = self._get(f"{self.data_url}/v2/stocks/{ticker}/trades/latest",
-                         params={"feed": "iex"})
-        price = (data.get("trade") or {}).get("p")
-        if price and price > 0:
-            return round(float(price), 2)
-        data = self._get(f"{self.data_url}/v2/stocks/{ticker}/quotes/latest",
-                         params={"feed": "iex"})
-        q   = data.get("quote", {})
-        ask = q.get("ap", 0)
-        bid = q.get("bp", 0)
-        if ask > bid > 0:
-            return round((ask + bid) / 2, 2)
+        for feed in ("sip", "iex", None):
+            params = {"feed": feed} if feed else {}
+            data  = self._get(f"{self.data_url}/v2/stocks/{ticker}/trades/latest", params=params)
+            price = (data.get("trade") or {}).get("p")
+            if price and price > 0:
+                return round(float(price), 2)
+            data = self._get(f"{self.data_url}/v2/stocks/{ticker}/quotes/latest", params=params)
+            q    = data.get("quote", {})
+            ask  = q.get("ap", 0)
+            bid  = q.get("bp", 0)
+            if ask > bid > 0:
+                return round((ask + bid) / 2, 2)
         return None
 
     def get_contracts(self, ticker: str, opt_type: str,
@@ -770,7 +770,13 @@ def _send_slack_alerts(ranked: list, spy_gex) -> None:
 
     payload = {"text": "\n".join(lines)}
     try:
-        r = requests.post(webhook, json=payload, verify=_SSL_VERIFY, timeout=10)
+        import certifi
+        slack_verify = certifi.where()
+    except Exception:
+        slack_verify = False
+
+    try:
+        r = requests.post(webhook, json=payload, verify=slack_verify, timeout=10)
         if r.status_code == 200:
             log.info(f"Slack alert sent ({len(ranked)} setup(s))")
         else:
