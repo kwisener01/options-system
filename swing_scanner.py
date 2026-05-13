@@ -169,7 +169,7 @@ class AlpacaClient:
                 r.raise_for_status()
                 return r.json()
             except requests.HTTPError as e:
-                log.warning(f"HTTP {r.status_code} on {url}: {e}")
+                log.debug(f"HTTP {r.status_code} on {url}: {e}")
                 return {}
             except Exception as e:
                 log.warning(f"Request failed ({url}): {e}")
@@ -177,7 +177,7 @@ class AlpacaClient:
         return {}
 
     def get_stock_price(self, ticker: str) -> Optional[float]:
-        for feed in ("sip", "iex", None):
+        for feed in ("iex", "sip", None):
             params = {"feed": feed} if feed else {}
             data  = self._get(f"{self.data_url}/v2/stocks/{ticker}/trades/latest", params=params)
             price = (data.get("trade") or {}).get("p")
@@ -189,6 +189,16 @@ class AlpacaClient:
             bid  = q.get("bp", 0)
             if ask > bid > 0:
                 return round((ask + bid) / 2, 2)
+        # Last resort: yfinance (no auth required)
+        try:
+            import yfinance as yf
+            t = yf.Ticker(ticker)
+            price = t.fast_info.get("last_price") or t.fast_info.get("regularMarketPrice")
+            if price and price > 0:
+                log.debug(f"{ticker}: price via yfinance fallback")
+                return round(float(price), 2)
+        except Exception:
+            pass
         return None
 
     def get_contracts(self, ticker: str, opt_type: str,
@@ -235,9 +245,13 @@ class AlpacaClient:
         return result
 
     def get_gex_chain(self, ticker: str, spot: float) -> tuple[list, dict]:
-        """Fetch 0-30 DTE contracts (calls + puts) for GEX computation."""
+        """Fetch options chain for GEX computation.
+        During market hours include 0DTE (today); after hours start from tomorrow
+        so expired same-day contracts don't skew the gamma levels.
+        """
         today   = date.today()
-        exp_min = today.strftime("%Y-%m-%d")
+        exp_start = today if _market_open() else today + timedelta(days=1)
+        exp_min = exp_start.strftime("%Y-%m-%d")
         exp_max = (today + timedelta(days=CONFIG["GEX_CHAIN_DTE"])).strftime("%Y-%m-%d")
         rng     = CONFIG["GEX_CHAIN_RANGE"]
         s_min   = round(spot * (1 - rng), 0)
