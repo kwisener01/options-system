@@ -783,20 +783,21 @@ def _send_slack_alerts(ranked: list, spy_gex) -> None:
             )
 
     payload = {"text": "\n".join(lines)}
-    try:
-        import certifi
-        slack_verify = certifi.where()
-    except Exception:
-        slack_verify = False
 
-    try:
-        r = requests.post(webhook, json=payload, verify=slack_verify, timeout=10)
-        if r.status_code == 200:
-            log.info(f"Slack alert sent ({len(ranked)} setup(s))")
-        else:
-            log.warning(f"Slack returned {r.status_code}: {r.text}")
-    except Exception as e:
-        log.warning(f"Slack alert failed: {e}")
+    for verify in (_SSL_VERIFY, True, False):
+        try:
+            r = requests.post(webhook, json=payload, verify=verify, timeout=10)
+            if r.status_code == 200:
+                log.info(f"Slack alert sent ({len(ranked)} setup(s))")
+            else:
+                log.warning(f"Slack returned {r.status_code}: {r.text}")
+            return
+        except requests.exceptions.SSLError:
+            continue
+        except Exception as e:
+            log.warning(f"Slack alert failed: {e}")
+            return
+    log.warning("Slack alert failed: SSL verification failed with all cert stores")
 
 
 if __name__ == "__main__":
