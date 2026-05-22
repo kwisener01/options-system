@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>GEX Dashboard</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: 'Courier New', monospace; }
+    .price-ladder { position: relative; height: 180px; }
+    .ladder-row {
+      position: absolute; left: 0; right: 0;
+      display: flex; align-items: center; gap: 8px;
+      font-size: 11px; transform: translateY(-50%);
+    }
+    .ladder-line { flex: 1; border-top-style: dashed; border-top-width: 1px; opacity: 0.4; }
+    .pulse { animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+    .bar-fill { transition: width 0.6s ease; }
+    #slack-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .fade-in { animation: fadeIn 0.4s ease; }
+    @keyframes fadeIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:translateY(0)} }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen">
+
+<!-- ── Header ── -->
+<header class="bg-gray-900 border-b border-gray-800 px-4 py-3 flex items-center justify-between">
+  <div class="flex items-center gap-3">
+    <span class="text-amber-400 font-bold text-lg">GEX</span>
+    <span class="text-gray-500 text-sm">Dealer Exposure Dashboard</span>
+  </div>
+  <div id="price-strip" class="flex items-center gap-4 text-sm">
+    <span class="text-gray-600">Loading...</span>
+  </div>
+  <div class="flex items-center gap-2">
+    <span id="last-updated" class="text-gray-600 text-xs"></span>
+    <button onclick="refreshData()" class="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 rounded border border-gray-700 transition-colors">
+      ↻ Refresh
+    </button>
+    <button id="slack-btn" onclick="sendSlack()" class="px-3 py-1 text-xs bg-indigo-700 hover:bg-indigo-600 rounded border border-indigo-500 transition-colors font-semibold">
+      → Slack
+    </button>
+  </div>
+</header>
+
+<!-- ── Main ── -->
+<main class="p-4">
+
+  <!-- Loading / error state -->
+  <div id="loading" class="text-center py-20 text-gray-500">
+    <div class="text-2xl mb-2 pulse">⟳</div>
+    <div class="text-sm">Running GEX scan…</div>
+  </div>
+  <div id="error-msg" class="hidden text-center py-10 text-red-400 text-sm"></div>
+
+  <!-- Dashboard content -->
+  <div id="content" class="hidden fade-in">
+
+    <!-- VIX bar -->
+    <div id="vix-bar" class="mb-4 bg-gray-900 rounded-lg border border-gray-800 px-4 py-2 flex items-center gap-6 text-sm"></div>
+
+    <!-- SPY + QQQ grid -->
+    <div class="grid grid-cols-1 xl:grid-cols-2 gap-4 mb-4">
+      <div id="spy-panel"></div>
+      <div id="qqq-panel"></div>
+    </div>
+
+    <!-- Trade idea -->
+    <div id="trade-panel"></div>
+
+  </div>
+</main>
+
+<!-- ── Slack toast ── -->
+<div id="toast" class="hidden fixed bottom-6 right-6 px-4 py-2 rounded-lg text-sm font-semibold shadow-lg transition-all"></div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────────
+let gexData = null;
+const POLL_MS = 5 * 60 * 1000; // 5 minutes
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const $ = id => document.getElementById(id);
+
+function fmt(n, digits = 2) {
+  return n != null ? n.toFixed(digits) : '—';
+}
+
+function chgClass(n) {
+  return n >= 0 ? 'text-green-400' : 'text-red-400';
+}
+
+function regimeBadge(regime) {
+  if (!regime) return '';
+  const neg = regime.includes('NEGATIVE');
+  return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-bold
+    ${neg ? 'bg-red-900/60 text-red-300 border border-red-700' : 'bg-green-900/60 text-green-300 border border-green-700'}">
+    ${neg ? '▼ NEG γ' : '▲ POS γ'}
+  </span>`;
+}
+
+function signalBadge(label, val) {
+  if (!val) return '';
+  const colors = {
+    BULLISH: 'text-green-400', BEARISH: 'text-red-400', NEUTRAL: 'text-gray-400',
+    BUYING_PRESSURE: 'text-green-400', SELLING_PRESSURE: 'text-red-400',
+  };
+  return `<span class="${colors[val] || 'text-gray-400'} text-xs">${label}: ${val.replace(/_/g,' ')}</span>`;
+}
+
+// ── Price Ladder ──────────────────────────────────────────────────────────────
+function renderLadder(containerId, r, spot) {
+  const el = $(containerId);
+  if (!el || !r) return;
+
+  const levels = [
+    { price: r.call_wall,  label: 'Call Wall',  color: '#f87171' },
+    { price: r.gamma_wall, label: 'Gamma Wall', color: '#fbbf24' },
+    { price: r.flip_level, label: 'Flip',       color: '#e2e8f0' },
+    { price: spot,         label: '● ' + spot.toFixed(2), color: '#60a5fa', isSpot: true },
+    { price: r.put_wall,   label: 'Put Wall',   color: '#4ade80' },
+  ];
+
+  // Deduplicate (merge labels if within $1)
+  const deduped = [];
+  for (const lv of levels) {
+    const existing = deduped.find(d => Math.abs(d.price - lv.price) < 1.5);
+    if (existing) {
+      existing.label += ' / ' + lv.label;
+      if (lv.isSpot) existing.color = '#60a5fa';
+    } else {
+      deduped.push({...lv});
+    }
+  }
+
+  const prices = deduped.map(d => d.price);
+  const minP = Math.min(...prices) - 5;
+  const maxP = Math.max(...prices) + 5;
+  const range = maxP - minP;
+
+  el.innerHTML = '';
+  deduped.forEach(lv => {
+    const pct = 100 - ((lv.price - minP) / range * 100);
+    const row = document.createElement('div');
+    row.className = 'ladder-row';
+    row.style.top = `${pct}%`;
+    row.innerHTML = `
+      <span style="color:${lv.color};min-width:90px;font-weight:${lv.isSpot?'bold':'normal'}">${lv.label}</span>
+      <div class="ladder-line" style="border-color:${lv.color}"></div>
+      <span style="color:${lv.color};min-width:50px;text-align:right;font-weight:bold">$${lv.price.toFixed(0)}</span>
+    `;
+    el.appendChild(row);
+  });
+}
+
+// ── GEX Strike Bars ───────────────────────────────────────────────────────────
+function renderBars(containerId, topLevels, spot) {
+  const el = $(containerId);
+  if (!el || !topLevels?.length) return;
+
+  const maxAbs = Math.max(...topLevels.map(([, g]) => Math.abs(g)));
+  const sorted = [...topLevels].sort(([a], [b]) => b - a);
+
+  el.innerHTML = sorted.map(([strike, gex]) => {
+    const pct   = (Math.abs(gex) / maxAbs * 100).toFixed(1);
+    const color = gex >= 0 ? '#4ade80' : '#f87171';
+    const bg    = gex >= 0 ? '#14532d' : '#450a0a';
+    const here  = Math.abs(strike - spot) <= 1;
+    return `
+      <div class="flex items-center gap-2 mb-1 text-xs ${here ? 'font-bold' : ''}">
+        <span class="w-12 text-right ${here ? 'text-blue-400' : 'text-gray-500'}">${here ? '●' : ''} $${strike}</span>
+        <div class="flex-1 relative h-3.5 bg-gray-800 rounded overflow-hidden">
+          <div class="bar-fill h-full rounded" style="width:${pct}%;background:${color}30;border-right:2px solid ${color}"></div>
+        </div>
+        <span style="color:${color}" class="w-16 text-right">${gex > 0 ? '+' : ''}${gex.toFixed(2)}B</span>
+      </div>`;
+  }).join('');
+}
+
+// ── Level Card ────────────────────────────────────────────────────────────────
+function levelCard(label, r, spot, ladderId, barsId) {
+  if (!r) return `<div class="text-gray-600 text-xs p-4">No ${label} data</div>`;
+  return `
+    <div class="bg-gray-900/60 rounded border border-gray-800 p-3">
+      <div class="flex items-center justify-between mb-3">
+        <span class="text-gray-400 text-xs font-semibold uppercase tracking-wider">${label}</span>
+        ${regimeBadge(r.regime)}
+        <span class="text-gray-500 text-xs">GEX: <span class="text-red-400 font-bold">${fmt(r.gex, 0)}B</span></span>
+      </div>
+
+      <!-- Price ladder -->
+      <div class="price-ladder mb-3" id="${ladderId}"></div>
+
+      <!-- Key levels grid -->
+      <div class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs mb-3 border-t border-gray-800 pt-3">
+        <div class="flex justify-between"><span class="text-gray-500">Flip / γ Wall</span><span class="text-amber-400 font-bold">$${fmt(r.flip_level, 0)}</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Call Wall</span><span class="text-red-400 font-bold">$${fmt(r.call_wall, 0)}</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">Put Wall</span><span class="text-green-400 font-bold">$${fmt(r.put_wall, 0)}</span></div>
+        <div class="flex justify-between"><span class="text-gray-500">DTE</span><span class="text-gray-300">${r.dte_nearest}d</span></div>
+      </div>
+
+      <!-- Signals -->
+      <div class="flex flex-wrap gap-3 text-xs border-t border-gray-800 pt-2">
+        ${signalBadge('Vanna', r.vanna_signal)}
+        ${signalBadge('Charm', r.charm_signal)}
+      </div>
+
+      <!-- Top strike bars -->
+      <div class="mt-3 border-t border-gray-800 pt-2">
+        <div class="text-gray-600 text-xs mb-2 uppercase tracking-wider">Top γ Levels</div>
+        <div id="${barsId}"></div>
+      </div>
+    </div>`;
+}
+
+// ── Ticker Panel ─────────────────────────────────────────────────────────────
+function renderTickerPanel(panelId, name, data) {
+  const el = $(panelId);
+  if (!el) return;
+  const chgCls = chgClass(data.change);
+  const pct    = data.change_pct >= 0 ? `+${fmt(data.change_pct)}` : fmt(data.change_pct);
+
+  el.innerHTML = `
+    <div class="bg-gray-900 rounded-lg border border-gray-800 overflow-hidden">
+      <!-- ticker header -->
+      <div class="px-4 py-3 bg-gray-800/50 flex items-center gap-4">
+        <span class="text-white font-bold text-xl">${name}</span>
+        <span class="text-white font-bold text-2xl">$${fmt(data.spot)}</span>
+        <span class="${chgCls} text-sm">${data.change >= 0 ? '+' : ''}${fmt(data.change)} (${pct}%)</span>
+      </div>
+      <!-- level cards -->
+      <div class="p-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+        <div>
+          <div class="text-xs text-gray-600 mb-2 uppercase tracking-wider font-semibold">Today</div>
+          ${levelCard('Today (0DTE)', data.today, data.spot, `${panelId}-today-ladder`, `${panelId}-today-bars`)}
+        </div>
+        <div>
+          <div class="text-xs text-gray-600 mb-2 uppercase tracking-wider font-semibold">Tomorrow</div>
+          ${levelCard('Tomorrow (1DTE)', data.tomorrow, data.spot, `${panelId}-tmrw-ladder`, `${panelId}-tmrw-bars`)}
+        </div>
+      </div>
+    </div>`;
+
+  // Now render the dynamic parts (ladders + bars need the elements to exist)
+  renderLadder(`${panelId}-today-ladder`, data.today, data.spot);
+  renderLadder(`${panelId}-tmrw-ladder`, data.tomorrow, data.spot);
+  renderBars(`${panelId}-today-bars`, data.today?.top_levels, data.spot);
+  renderBars(`${panelId}-tmrw-bars`, data.tomorrow?.top_levels, data.spot);
+}
+
+// ── VIX Bar ───────────────────────────────────────────────────────────────────
+function renderVixBar(vix) {
+  const el = $('vix-bar');
+  if (!el) return;
+  const chg    = vix.change;
+  const cls    = chg >= 0 ? 'text-red-400' : 'text-green-400';
+  const regime = vix.now > 25 ? 'FEAR' : vix.now < 15 ? 'CALM' : 'MODERATE';
+  const regCls = vix.now > 25 ? 'text-red-400' : vix.now < 15 ? 'text-green-400' : 'text-amber-400';
+
+  el.innerHTML = `
+    <span class="text-gray-500 font-semibold text-xs uppercase tracking-wider">VIX</span>
+    <span class="text-white font-bold text-lg">${fmt(vix.now)}</span>
+    <span class="${cls} text-sm">${chg >= 0 ? '+' : ''}${fmt(chg)}</span>
+    <span class="${regCls} text-xs font-semibold ml-2">${regime}</span>
+    <div class="flex-1"></div>
+    <span class="text-gray-600 text-xs">VIX prev close: ${fmt(vix.prev)}</span>`;
+}
+
+// ── Trade Idea Panel ──────────────────────────────────────────────────────────
+function renderTrade(t) {
+  const el = $('trade-panel');
+  if (!el || !t || !t.type) { if (el) el.innerHTML = ''; return; }
+
+  const bearish = t.direction === 'BEARISH';
+  const dirCls  = bearish ? 'text-red-400 border-red-800 bg-red-950/30' : 'text-green-400 border-green-800 bg-green-950/30';
+  const badgeCls= bearish ? 'bg-red-900/60 text-red-300 border-red-700' : 'bg-green-900/60 text-green-300 border-green-700';
+  const arrow   = bearish ? '↓' : '↑';
+
+  el.innerHTML = `
+    <div class="bg-gray-900 rounded-lg border ${dirCls} p-4">
+      <div class="flex items-center gap-3 mb-4">
+        <span class="text-gray-400 text-xs font-semibold uppercase tracking-wider">Trade Idea</span>
+        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-bold border ${badgeCls}">
+          ${arrow} ${t.direction}
+        </span>
+        <span class="text-white font-bold">${t.type}</span>
+        <span class="text-gray-500 text-sm">${t.expiry}</span>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+        <!-- Legs -->
+        <div class="bg-gray-800/60 rounded p-3">
+          <div class="text-gray-500 text-xs mb-2 uppercase tracking-wider">Legs</div>
+          <div class="text-green-400 font-semibold text-sm">${t.long_leg}</div>
+          <div class="text-red-400 font-semibold text-sm">${t.short_leg}</div>
+          <div class="text-gray-500 text-xs mt-1">Width: $${t.width}</div>
+        </div>
+        <!-- Risk levels -->
+        <div class="bg-gray-800/60 rounded p-3">
+          <div class="text-gray-500 text-xs mb-2 uppercase tracking-wider">Risk Levels</div>
+          <div class="flex justify-between text-xs mb-1">
+            <span class="text-gray-500">Stop (exit)</span>
+            <span class="text-red-400 font-bold">SPY &gt; $${t.stop_level}</span>
+          </div>
+          ${t.target_level ? `
+          <div class="flex justify-between text-xs">
+            <span class="text-gray-500">Target</span>
+            <span class="text-green-400 font-bold">$${t.target_level}</span>
+          </div>` : `
+          <div class="text-xs text-gray-500">Target: full premium</div>`}
+        </div>
+        <!-- Thesis -->
+        <div class="bg-gray-800/60 rounded p-3">
+          <div class="text-gray-500 text-xs mb-2 uppercase tracking-wider">Thesis</div>
+          ${(t.thesis || []).map(pt => `
+            <div class="text-xs text-gray-300 mb-1">• ${pt}</div>`).join('')}
+        </div>
+      </div>
+
+      <div class="text-xs text-gray-600 border-t border-gray-800 pt-3">
+        ⚠ Do not hold 1DTE spreads past 3:30 PM ET — gamma pinning can whipsaw into the close.
+      </div>
+    </div>`;
+}
+
+// ── Price Strip (header) ──────────────────────────────────────────────────────
+function renderPriceStrip(d) {
+  const el = $('price-strip');
+  if (!el) return;
+  const chips = [
+    { name: 'SPY', data: d.spy },
+    { name: 'QQQ', data: d.qqq },
+  ].map(({ name, data }) => {
+    const cls = chgClass(data.change);
+    return `
+      <span class="flex items-center gap-1.5">
+        <span class="text-gray-400 text-xs">${name}</span>
+        <span class="text-white font-semibold">$${fmt(data.spot)}</span>
+        <span class="${cls} text-xs">${data.change >= 0 ? '+' : ''}${fmt(data.change)}</span>
+      </span>`;
+  });
+  const vixCls = d.vix.change >= 0 ? 'text-red-400' : 'text-green-400';
+  chips.push(`
+    <span class="flex items-center gap-1.5">
+      <span class="text-gray-400 text-xs">VIX</span>
+      <span class="text-white font-semibold">${fmt(d.vix.now)}</span>
+      <span class="${vixCls} text-xs">${d.vix.change >= 0 ? '+' : ''}${fmt(d.vix.change)}</span>
+    </span>`);
+  el.innerHTML = chips.join('<span class="text-gray-700">|</span>');
+}
+
+// ── Render all ────────────────────────────────────────────────────────────────
+function render(d) {
+  gexData = d;
+  $('loading').classList.add('hidden');
+  $('error-msg').classList.add('hidden');
+  $('content').classList.remove('hidden');
+
+  renderPriceStrip(d);
+  renderVixBar(d.vix);
+  renderTickerPanel('spy-panel', 'SPY', d.spy);
+  renderTickerPanel('qqq-panel', 'QQQ', d.qqq);
+  renderTrade(d.trade_idea);
+
+  const ts = $('last-updated');
+  if (ts) ts.textContent = `Updated: ${d.timestamp}`;
+}
+
+// ── Data fetching ─────────────────────────────────────────────────────────────
+async function fetchData(force = false) {
+  try {
+    const url  = force ? '/api/gex?force=true' : '/api/gex';
+    const resp = await fetch(url);
+    const json = await resp.json();
+    if (!json.ok) throw new Error(json.error || 'Scan failed');
+    render(json.data);
+  } catch (err) {
+    $('loading').classList.add('hidden');
+    const e = $('error-msg');
+    e.textContent = 'Error: ' + err.message;
+    e.classList.remove('hidden');
+    console.error(err);
+  }
+}
+
+function refreshData() {
+  $('content').classList.add('hidden');
+  $('loading').classList.remove('hidden');
+  fetchData(true);
+}
+
+// ── Slack ─────────────────────────────────────────────────────────────────────
+async function sendSlack() {
+  const btn = $('slack-btn');
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
+  try {
+    const resp = await fetch('/api/slack', { method: 'POST' });
+    const json = await resp.json();
+    showToast(json.ok ? '✓ Sent to Slack' : '✗ Slack failed: ' + json.error, json.ok);
+  } catch (err) {
+    showToast('✗ ' + err.message, false);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '→ Slack';
+  }
+}
+
+function showToast(msg, ok) {
+  const t = $('toast');
+  t.textContent = msg;
+  t.className = `fixed bottom-6 right-6 px-4 py-2 rounded-lg text-sm font-semibold shadow-lg
+    ${ok ? 'bg-green-800 text-green-100 border border-green-600'
+         : 'bg-red-900 text-red-100 border border-red-700'}`;
+  t.classList.remove('hidden');
+  setTimeout(() => t.classList.add('hidden'), 4000);
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────────
+fetchData();
+setInterval(() => fetchData(), POLL_MS);
+</script>
+</body>
+</html>

@@ -154,14 +154,30 @@ def _fetch_chain(spot: float, n_expiries: int = 3,
                  as_of: date | None = None) -> list[dict]:
     """
     Return SPY option chain contracts, using today's disk cache when available.
-    First call of the day hits yfinance and saves; all subsequent calls are instant.
-    Pass as_of for historical replay (backtesting).
+    Live fetches try Alpaca first (real-time), fall back to yfinance.
+    Pass as_of for historical replay (backtesting — yfinance only).
     """
     as_of = as_of or date.today()
     cached = load_chain(as_of)
     if cached is not None:
         return cached
-    rows = _fetch_chain_from_api(spot, n_expiries)
+
+    # Try Alpaca for live data (real-time quotes + IV)
+    rows = []
+    try:
+        from src.live.alpaca_options import fetch_chain_for_gex
+        rows = fetch_chain_for_gex("SPY", spot=spot, n_expiries=n_expiries)
+        if rows:
+            logger.info("Using Alpaca chain data (%d contracts)", len(rows))
+    except Exception as e:
+        logger.warning("Alpaca chain unavailable, falling back to yfinance: %s", e)
+
+    # Fall back to yfinance
+    if not rows:
+        rows = _fetch_chain_from_api(spot, n_expiries)
+        if rows:
+            logger.info("Using yfinance chain data (%d contracts)", len(rows))
+
     if rows:
         save_chain(rows, as_of)
     return rows
@@ -325,10 +341,12 @@ def scan(as_of: date | None = None,
 
 # ── Slack message formatter ───────────────────────────────────────────────────
 
-def format_gex_message(result: GEXResult, session: str = "morning") -> str:
+def format_gex_message(result: GEXResult, session: str = "morning",
+                       ticker: str = "SPY") -> str:
     """
     Build a Slack message summarising dealer Greek exposures.
     session: 'morning' | 'afternoon'
+    ticker: underlying symbol displayed in the header and level labels
     """
     session_label = "Morning Scan" if session == "morning" else "Afternoon Scan"
     vix_chg  = result.vix - result.vix_prev
@@ -354,9 +372,9 @@ def format_gex_message(result: GEXResult, session: str = "morning") -> str:
     }[result.charm_signal]
 
     lines = [
-        f":bar_chart: *SPY Greeks — {session_label}* | {datetime.now().strftime('%Y-%m-%d %H:%M')} ET",
+        f":bar_chart: *{ticker} Greeks — {session_label}* | {datetime.now().strftime('%Y-%m-%d %H:%M')} ET",
         f"",
-        f"*SPY:* ${result.spot:.2f}  |  *VIX:* {result.vix:.1f} {vix_arrow} ({vix_chg:+.1f})",
+        f"*{ticker}:* ${result.spot:.2f}  |  *VIX:* {result.vix:.1f} {vix_arrow} ({vix_chg:+.1f})",
         f"",
         f"{gex_arrow} *Gamma Exposure (GEX)*",
         f">  Net GEX     : `{result.net_gex_bn:+.2f}B`  ({gex_desc})",
@@ -375,7 +393,7 @@ def format_gex_message(result: GEXResult, session: str = "morning") -> str:
     ]
 
     for strike, gex in result.top_levels[:5]:
-        marker = " <- SPY" if abs(strike - result.spot) / result.spot < 0.005 else ""
+        marker = f" <- {ticker}" if abs(strike - result.spot) / result.spot < 0.005 else ""
         bar = (":green_square:" if gex > 0 else ":red_square:") * min(int(abs(gex) * 3), 5)
         lines.append(f">  `${strike:.1f}` : `{gex:+.3f}B` {bar}{marker}")
 

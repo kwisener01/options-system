@@ -3,10 +3,16 @@ Simulated options paper trader.
 
 Tracks open spreads in data/options_paper_state.json using real SPY/VIX prices.
 No actual option orders are placed — P&L is computed via Black-Scholes against
-live market data, which is accurate enough for weekly spreads.
+live market data, which is accurate enough for short-dated spreads.
 
-Workflow
-────────
+Workflow (daily rolling)
+────────────────────────
+Mon-Fri 9:45 AM : daily_cycle() — close yesterday's position (or TP), then open new 3DTE spread
+Any time        : check_tp()   — close early if 50% profit captured
+Fri 3:45 PM     : settle_expiry() — settle any position expiring today
+
+Workflow (weekly, legacy)
+────────────────────────
 Friday AM  : open_weekly()   — select strategy, price spread, record position
 Any day    : check_tp()      — close early if 50% profit captured
 Friday 3:45: settle_expiry() — settle any position expiring today
@@ -23,11 +29,13 @@ import yfinance as yf
 
 from config.settings import DATA_DIR
 from src.analysis.macro_scanner import get_macro_snapshot
+from src.analysis.gex_scanner import scan as gex_scan, GEXResult
 from src.backtest.wheel_engine import bs_put, bs_call
 from src.backtest.multi_strategy_engine import (
     MultiStrategyEngine,
     STRATEGY_CASH, STRATEGY_BULL_PUT, STRATEGY_BEAR_CALL,
-    STRATEGY_IRON_CONDOR, STRATEGY_BULL_CALL_DEBIT,
+    STRATEGY_IRON_CONDOR, STRATEGY_IRON_BUTTERFLY, STRATEGY_BULL_CALL_DEBIT,
+    STRATEGY_PUT_RATIO, STRATEGY_BREAKOUT_STRANGLE,
 )
 from src.notifications.slack_notifier import send_message
 
@@ -36,6 +44,25 @@ logger = logging.getLogger(__name__)
 STATE_PATH = os.path.join(DATA_DIR, "options_paper_state.json")
 _SHARES    = 100
 _RF        = 0.045
+
+
+def _nearest_spy_expiry(min_dte: int = 1) -> date:
+    """
+    Return the nearest SPY expiry that is at least min_dte calendar days away.
+    SPY has daily expirations Mon-Fri. Falls back to min_dte days from today on error.
+    """
+    today = date.today()
+    target = today + timedelta(days=min_dte)
+    try:
+        t = yf.Ticker("SPY")
+        expirations = t.options  # tuple of "YYYY-MM-DD" strings
+        for exp_str in expirations:
+            exp = date.fromisoformat(exp_str)
+            if exp >= target:
+                return exp
+    except Exception as e:
+        logger.warning("Could not fetch SPY expirations: %s — using %dd fallback", e, min_dte)
+    return target
 
 
 # ── state I/O ─────────────────────────────────────────────────────────────────
@@ -112,8 +139,17 @@ def _spread_value(pos: dict, spot: float, vix: float, today: date) -> float:
         put_v  = bs_put(spot,  pos["put_short"],  T, sig) - bs_put(spot,  pos["put_long"],  T, sig)
         call_v = bs_call(spot, pos["call_short"], T, sig) - bs_call(spot, pos["call_long"], T, sig)
         return put_v + call_v
+    if s == STRATEGY_IRON_BUTTERFLY:
+        # put_short = call_short = ATM strike (the body)
+        put_v  = bs_put(spot,  pos["put_short"],  T, sig) - bs_put(spot,  pos["put_long"],  T, sig)
+        call_v = bs_call(spot, pos["call_short"], T, sig) - bs_call(spot, pos["call_long"], T, sig)
+        return put_v + call_v
     if s == STRATEGY_BULL_CALL_DEBIT:
         return bs_call(spot, K1, T, sig) - bs_call(spot, K2, T, sig)
+    if s == STRATEGY_PUT_RATIO:
+        return 2*bs_put(spot, pos["put_short"], T, sig) - bs_put(spot, pos["put_long"], T, sig)
+    if s == STRATEGY_BREAKOUT_STRANGLE:
+        return bs_call(spot, pos["call_long"], T, sig) + bs_put(spot, pos["put_long"], T, sig)
     return 0.0
 
 
@@ -131,28 +167,76 @@ def _settle_pnl_ps(pos: dict, spot: float) -> float:
         put_pnl  = pos["put_credit"]  - max(0.0, pos["put_short"]  - spot) + max(0.0, pos["put_long"]  - spot)
         call_pnl = pos["call_credit"] - max(0.0, spot - pos["call_short"]) + max(0.0, spot - pos["call_long"])
         return put_pnl + call_pnl
+    if s == STRATEGY_IRON_BUTTERFLY:
+        # put_short = call_short = ATM body strike
+        put_pnl  = pos["put_credit"]  - max(0.0, pos["put_short"]  - spot) + max(0.0, pos["put_long"]  - spot)
+        call_pnl = pos["call_credit"] - max(0.0, spot - pos["call_short"]) + max(0.0, spot - pos["call_long"])
+        return put_pnl + call_pnl
     if s == STRATEGY_BULL_CALL_DEBIT:
-        return max(0.0, spot - K1) - max(0.0, spot - K2) + cr   # cr is negative (debit)
+        return max(0.0, spot - K1) - max(0.0, spot - K2) + cr
+    if s == STRATEGY_PUT_RATIO:
+        return cr - 2*max(0.0, pos["put_short"] - spot) + max(0.0, pos["put_long"] - spot)
+    if s == STRATEGY_BREAKOUT_STRANGLE:
+        debit = abs(cr)
+        return max(0.0, spot - pos["call_long"]) + max(0.0, pos["put_long"] - spot) - debit
     return 0.0
+
+
+# ── GEX-guided strike selection ───────────────────────────────────────────────
+
+def _gex_strikes(gex: GEXResult, spot: float, engine: MultiStrategyEngine):
+    """
+    Return (put_strike, call_strike) anchored to GEX walls.
+    Falls back to mechanical OTM% if a wall is outside the usable range
+    (too close or too far from spot).
+    """
+    def rs(p):
+        return round(p / 0.5) * 0.5
+
+    min_put  = spot * (1 - 0.03)
+    max_put  = spot * (1 - 0.005)
+    min_call = spot * (1 + 0.005)
+    max_call = spot * (1 + 0.03)
+
+    put_strike  = rs(gex.put_wall)  if min_put  <= gex.put_wall  <= max_put  else rs(spot * (1 - engine.short_otm_pct))
+    call_strike = rs(gex.call_wall) if min_call <= gex.call_wall <= max_call else rs(spot * (1 + engine.call_otm_pct))
+
+    return put_strike, call_strike
 
 
 # ── strategy builder ──────────────────────────────────────────────────────────
 
 def _build_position(strategy: str, spot: float, vix: float,
                     engine: MultiStrategyEngine, today: date,
-                    account: float) -> Optional[dict]:
+                    account: float,
+                    gex: Optional[GEXResult] = None,
+                    expiry_date: Optional[date] = None) -> Optional[dict]:
     sig = _sigma(vix, engine.iv_premium)
-    T   = engine.dte / 365 if engine.dte > 0 else (1 / 252)
+
+    if expiry_date is None:
+        expiry_date = today + timedelta(days=7)   # legacy weekly default
+    expiry = expiry_date
+    T = max((expiry - today).days, 1) / 365
 
     def rs(p):
         t = 0.5
         return round(p / t) * t
 
-    width = max(rs(spot * engine.spread_width_pct), 1.0)
-    expiry = today + timedelta(days=7)   # next Friday (approximate)
+    pct_width = rs(spot * engine.spread_width_pct)
+    if engine.max_dollar_risk is not None:
+        cap_width = rs(engine.max_dollar_risk / 100)
+        pct_width = min(pct_width, cap_width)
+    width = max(pct_width, 1.0)
+
+    # Resolve GEX-guided strikes (falls back to mechanical OTM% if no GEX)
+    if gex is not None:
+        gex_put, gex_call = _gex_strikes(gex, spot, engine)
+    else:
+        gex_put  = rs(spot * (1 - engine.short_otm_pct))
+        gex_call = rs(spot * (1 + engine.call_otm_pct))
 
     if strategy == STRATEGY_BULL_PUT:
-        K1  = rs(spot * (1 - engine.short_otm_pct))
+        K1  = gex_put
         K2  = K1 - width
         cr  = max(bs_put(spot, K1, T, sig) - bs_put(spot, K2, T, sig), 0.01)
         mr  = width - cr
@@ -162,7 +246,7 @@ def _build_position(strategy: str, spot: float, vix: float,
                    put_credit=cr, call_credit=0.0)
 
     elif strategy == STRATEGY_BEAR_CALL:
-        K1  = rs(spot * (1 + engine.call_otm_pct))
+        K1  = gex_call
         K2  = K1 + width
         cr  = max(bs_call(spot, K1, T, sig) - bs_call(spot, K2, T, sig), 0.01)
         mr  = width - cr
@@ -172,8 +256,8 @@ def _build_position(strategy: str, spot: float, vix: float,
                    put_credit=0.0, call_credit=cr)
 
     elif strategy == STRATEGY_IRON_CONDOR:
-        Kp1 = rs(spot * (1 - engine.short_otm_pct));  Kp2 = Kp1 - width
-        Kc1 = rs(spot * (1 + engine.call_otm_pct));   Kc2 = Kc1 + width
+        Kp1 = gex_put;   Kp2 = Kp1 - width
+        Kc1 = gex_call;  Kc2 = Kc1 + width
         pc  = max(bs_put(spot,  Kp1, T, sig) - bs_put(spot,  Kp2, T, sig), 0.005)
         cc  = max(bs_call(spot, Kc1, T, sig) - bs_call(spot, Kc2, T, sig), 0.005)
         cr  = pc + cc
@@ -182,6 +266,47 @@ def _build_position(strategy: str, spot: float, vix: float,
                    net_credit=cr, spread_width=width, max_risk=mr,
                    put_short=Kp1, put_long=Kp2, call_short=Kc1, call_long=Kc2,
                    put_credit=pc, call_credit=cc)
+
+    elif strategy == STRATEGY_IRON_BUTTERFLY:
+        # Body: sell ATM put + ATM call at same strike; wings protect each side
+        K_atm      = rs(spot)
+        wing_width = max(rs(spot * engine.butterfly_wing_pct), 1.0)
+        K_put_long  = K_atm - wing_width
+        K_call_long = K_atm + wing_width
+        pc  = max(bs_put(spot,  K_atm, T, sig) - bs_put(spot,  K_put_long,  T, sig), 0.005)
+        cc  = max(bs_call(spot, K_atm, T, sig) - bs_call(spot, K_call_long, T, sig), 0.005)
+        cr  = pc + cc
+        mr  = wing_width - cr   # max loss = one full wing minus total credit
+        pos = dict(strategy=strategy, short_strike=K_atm, long_strike=K_atm,
+                   net_credit=cr, spread_width=wing_width, max_risk=mr,
+                   put_short=K_atm, put_long=K_put_long,
+                   call_short=K_atm, call_long=K_call_long,
+                   put_credit=pc, call_credit=cc,
+                   atm_strike=K_atm, wing_width=wing_width)
+
+    elif strategy == STRATEGY_PUT_RATIO:
+        K_short = rs(spot * (1 - engine.short_otm_pct))
+        K_long  = rs(spot * (1 - engine.ratio_long_otm_pct))
+        if K_long >= K_short:
+            K_long = K_short - width
+        cr  = max(2*bs_put(spot, K_short, T, sig) - bs_put(spot, K_long, T, sig), 0.005)
+        mr  = max(2*(K_short - K_long) - cr, 0.10)
+        pos = dict(strategy=strategy, short_strike=K_short, long_strike=K_long,
+                   net_credit=cr, spread_width=K_short-K_long, max_risk=mr,
+                   put_short=K_short, put_long=K_long,
+                   call_short=None, call_long=None,
+                   put_credit=cr, call_credit=0.0, ratio=2)
+
+    elif strategy == STRATEGY_BREAKOUT_STRANGLE:
+        K_call = rs(spot * (1 + engine.breakout_otm_pct))
+        K_put  = rs(spot * (1 - engine.breakout_otm_pct))
+        debit  = max(bs_call(spot, K_call, T, sig) + bs_put(spot, K_put, T, sig), 0.01)
+        mr     = debit
+        pos = dict(strategy=strategy, short_strike=K_call, long_strike=K_put,
+                   net_credit=-debit, spread_width=debit*4, max_risk=mr,
+                   call_long=K_call, put_long=K_put,
+                   call_short=None, put_short=None,
+                   call_credit=0.0, put_credit=0.0)
 
     elif strategy == STRATEGY_BULL_CALL_DEBIT:
         K1  = rs(spot * (1 + engine.debit_long_otm_pct))
@@ -322,6 +447,29 @@ def _try_alpaca_close(pos: dict) -> None:
         logger.error("Alpaca close failed (%s): %s", strategy, e)
 
 
+# ── event calendar guard ──────────────────────────────────────────────────────
+
+# Known high-impact dates — add FOMC/CPI/NFP dates here as they are announced.
+# Format: "YYYY-MM-DD"
+_HIGH_IMPACT_DATES: set[str] = {
+    "2026-05-07",   # FOMC rate decision
+    "2026-06-10",   # FOMC
+    "2026-07-29",   # FOMC
+    "2026-09-16",   # FOMC
+    "2026-10-28",   # FOMC
+    "2026-12-09",   # FOMC
+}
+
+
+def _is_near_event(today: date) -> bool:
+    """Return True if today or tomorrow is a high-impact macro event day."""
+    for d in (_HIGH_IMPACT_DATES):
+        event = date.fromisoformat(d)
+        if 0 <= (event - today).days <= 1:
+            return True
+    return False
+
+
 # ── public API ────────────────────────────────────────────────────────────────
 
 def preview_weekly(engine: Optional[MultiStrategyEngine] = None) -> dict:
@@ -344,8 +492,22 @@ def preview_weekly(engine: Optional[MultiStrategyEngine] = None) -> dict:
     if state["closed_trades"]:
         prev_vix = state["closed_trades"][-1].get("vix_at_entry")
 
-    strategy = engine._select(vix, is_bull, is_bear, spy_tr, prev_vix)
-    today    = date.today()
+    today  = date.today()
+
+    gex = None
+    try:
+        gex = gex_scan()
+    except Exception as e:
+        logger.warning("GEX scan failed in preview — using mechanical strikes: %s", e)
+
+    gex_regime   = gex.gex_regime    if gex else "UNKNOWN"
+    vanna_signal = gex.vanna_signal  if gex else "NEUTRAL"
+    near_flip    = (abs(spot - gex.flip_level) / spot < 0.005) if gex else False
+    near_event   = _is_near_event(today)
+
+    strategy = engine._select(vix, is_bull, is_bear, spy_tr, prev_vix,
+                               gex_regime=gex_regime, vanna_signal=vanna_signal,
+                               near_event=near_event, near_flip=near_flip)
 
     result = {
         "strategy":  strategy,
@@ -354,11 +516,17 @@ def preview_weekly(engine: Optional[MultiStrategyEngine] = None) -> dict:
         "regime":    macro.regime,
         "spy_trend": macro.spy_trend,
         "macro_summary": macro.summary,
+        "gex_put_wall":  round(gex.put_wall,  2) if gex else None,
+        "gex_call_wall": round(gex.call_wall, 2) if gex else None,
+        "gex_regime":    gex_regime,
+        "vanna_signal":  vanna_signal,
+        "near_event":    near_event,
+        "near_flip":     near_flip,
         "position":  None,
     }
 
     if strategy != STRATEGY_CASH:
-        pos = _build_position(strategy, spot, vix, engine, today, state["account_value"])
+        pos = _build_position(strategy, spot, vix, engine, today, state["account_value"], gex=gex)
         result["position"] = pos
 
     return result
@@ -389,8 +557,24 @@ def open_weekly(engine: Optional[MultiStrategyEngine] = None) -> Optional[dict]:
     if state["closed_trades"]:
         prev_vix = state["closed_trades"][-1].get("vix_at_entry")
 
-    strategy = engine._select(vix, is_bull, is_bear, spy_tr, prev_vix)
+    gex = None
+    try:
+        gex = gex_scan()
+        logger.info("GEX scan: put_wall=%.2f call_wall=%.2f regime=%s",
+                    gex.put_wall, gex.call_wall, gex.gex_regime)
+    except Exception as e:
+        logger.warning("GEX scan failed — using mechanical strikes: %s", e)
+
     today    = date.today()
+
+    gex_regime   = gex.gex_regime   if gex else "UNKNOWN"
+    vanna_signal = gex.vanna_signal if gex else "NEUTRAL"
+    near_flip    = (abs(spot - gex.flip_level) / spot < 0.005) if gex else False
+    near_event   = _is_near_event(today)
+
+    strategy = engine._select(vix, is_bull, is_bear, spy_tr, prev_vix,
+                               gex_regime=gex_regime, vanna_signal=vanna_signal,
+                               near_event=near_event, near_flip=near_flip)
 
     logger.info("Live signal: SPY=%.2f VIX=%.1f regime=%s -> %s",
                 spot, vix, macro.regime, strategy)
@@ -400,7 +584,7 @@ def open_weekly(engine: Optional[MultiStrategyEngine] = None) -> Optional[dict]:
         send_message(msg)
         return None
 
-    pos = _build_position(strategy, spot, vix, engine, today, state["account_value"])
+    pos = _build_position(strategy, spot, vix, engine, today, state["account_value"], gex=gex)
     if pos is None:
         logger.warning("Could not price spread — skipping")
         return None
@@ -411,11 +595,15 @@ def open_weekly(engine: Optional[MultiStrategyEngine] = None) -> Optional[dict]:
 
     # Slack notification
     nc = pos["net_credit"];  c = pos["contracts"];  mr = pos["max_risk"]
-    if strategy == STRATEGY_IRON_CONDOR:
+    if strategy in (STRATEGY_IRON_CONDOR, STRATEGY_IRON_BUTTERFLY):
         legs = (f"Put {pos['put_short']:.1f}/{pos['put_long']:.1f} + "
                 f"Call {pos['call_short']:.1f}/{pos['call_long']:.1f}")
     elif strategy == STRATEGY_BULL_CALL_DEBIT:
         legs = f"Call debit {pos['short_strike']:.1f}/{pos['long_strike']:.1f}"
+    elif strategy == STRATEGY_PUT_RATIO:
+        legs = f"2x short ${pos['short_strike']:.1f} put / 1x long ${pos['long_strike']:.1f} put"
+    elif strategy == STRATEGY_BREAKOUT_STRANGLE:
+        legs = f"Buy ${pos['put_long']:.1f}p + ${pos['call_long']:.1f}c"
     else:
         legs = f"{pos['short_strike']:.1f}/{pos['long_strike']:.1f}"
 
@@ -431,6 +619,141 @@ def open_weekly(engine: Optional[MultiStrategyEngine] = None) -> Optional[dict]:
     send_message(msg)
     logger.info("Opened: %s", strategy)
     return pos
+
+
+def open_daily(engine: Optional[MultiStrategyEngine] = None,
+               dte: int = 1) -> Optional[dict]:
+    """
+    Open a short-dated spread using the nearest SPY expiry >= dte days away.
+    For PDT-safe compounding: open today, close tomorrow = overnight hold, not a day trade.
+    Default dte=1 = tomorrow's expiry: maximum theta capture, daily capital recycling.
+    Higher dte (2-3) adds gamma buffer at the cost of slower compounding.
+    """
+    if engine is None:
+        engine = MultiStrategyEngine()
+
+    state = _load()
+    if state["open_position"] is not None:
+        logger.info("Position already open — skipping daily entry")
+        return None
+
+    spot   = _spy_price()
+    vix    = _vix()
+    macro  = get_macro_snapshot()
+    is_bull = macro.regime == "BULL"
+    is_bear = macro.regime == "BEAR"
+    spy_tr  = {"UP": 1, "FLAT": 0, "DOWN": -1}.get(macro.spy_trend, 0)
+
+    prev_vix = None
+    if state["closed_trades"]:
+        prev_vix = state["closed_trades"][-1].get("vix_at_entry")
+
+    today  = date.today()
+    expiry = _nearest_spy_expiry(min_dte=dte)
+
+    gex = None
+    try:
+        gex = gex_scan()
+        logger.info("GEX scan: put_wall=%.2f call_wall=%.2f regime=%s",
+                    gex.put_wall, gex.call_wall, gex.gex_regime)
+    except Exception as e:
+        logger.warning("GEX scan failed — using mechanical strikes: %s", e)
+
+    gex_regime   = gex.gex_regime   if gex else "UNKNOWN"
+    vanna_signal = gex.vanna_signal if gex else "NEUTRAL"
+    near_flip    = (abs(spot - gex.flip_level) / spot < 0.005) if gex else False
+    near_event   = _is_near_event(today)
+
+    strategy = engine._select(vix, is_bull, is_bear, spy_tr, prev_vix,
+                               gex_regime=gex_regime, vanna_signal=vanna_signal,
+                               near_event=near_event, near_flip=near_flip)
+
+    logger.info("Daily open: SPY=%.2f VIX=%.1f regime=%s expiry=%s -> %s",
+                spot, vix, macro.regime, expiry, strategy)
+
+    if strategy == STRATEGY_CASH:
+        msg = (f":no_entry: *Daily Options — CASH* | {today}\n"
+               f"> VIX={vix:.1f}  {macro.regime}  |  No trade today")
+        send_message(msg)
+        return None
+
+    pos = _build_position(strategy, spot, vix, engine, today,
+                          state["account_value"], gex=gex, expiry_date=expiry)
+    if pos is None:
+        logger.warning("Could not price daily spread — skipping")
+        return None
+
+    state["open_position"] = pos
+    _try_alpaca_open(pos)
+    _save(state)
+
+    nc = pos["net_credit"];  c = pos["contracts"];  mr = pos["max_risk"]
+    dte_actual = (expiry - today).days
+    if strategy in (STRATEGY_IRON_CONDOR, STRATEGY_IRON_BUTTERFLY):
+        legs = (f"Put {pos['put_short']:.1f}/{pos['put_long']:.1f} + "
+                f"Call {pos['call_short']:.1f}/{pos['call_long']:.1f}")
+    elif strategy == STRATEGY_BULL_CALL_DEBIT:
+        legs = f"Call debit {pos['short_strike']:.1f}/{pos['long_strike']:.1f}"
+    elif strategy == STRATEGY_PUT_RATIO:
+        legs = f"2x short ${pos['short_strike']:.1f} put / 1x long ${pos['long_strike']:.1f} put"
+    elif strategy == STRATEGY_BREAKOUT_STRANGLE:
+        legs = f"Buy ${pos['put_long']:.1f}p + ${pos['call_long']:.1f}c"
+    else:
+        legs = f"{pos['short_strike']:.1f}/{pos['long_strike']:.1f}"
+
+    msg = (
+        f":green_circle: *Daily Options — OPEN* | {today}  ({dte_actual}DTE)\n"
+        f"> Strategy : `{strategy}`\n"
+        f"> SPY      : ${spot:.2f}  |  VIX: {vix:.1f}\n"
+        f"> Strikes  : {legs}\n"
+        f"> Credit   : ${nc:.3f}/share × {c} contracts = ${nc*_SHARES*c:,.2f}\n"
+        f"> Max risk : ${mr*_SHARES*c:,.2f}  |  Expiry: {expiry}\n"
+        f"> Account  : ${state['account_value']:,.2f}"
+    )
+    send_message(msg)
+    logger.info("Daily opened: %s  expiry=%s  credit=%.3f", strategy, expiry, nc)
+    return pos
+
+
+def daily_cycle(engine: Optional[MultiStrategyEngine] = None,
+                dte: int = 1, tp_pct: float = 0.50) -> dict:
+    """
+    Full daily cycle: check TP → force-close any position from a prior day → open fresh spread.
+    Designed to run at 9:45 AM ET Mon-Fri. PDT-safe: overnight hold = not a day trade.
+    Returns a summary dict with keys 'closed' and 'opened'.
+    """
+    if engine is None:
+        engine = MultiStrategyEngine()
+
+    result = {"closed": None, "opened": None}
+
+    # 1. Try take-profit first (position held at least since yesterday)
+    tp = check_tp(tp_pct=tp_pct)
+    if tp:
+        result["closed"] = tp
+        logger.info("daily_cycle: TP triggered — P&L=%.2f", tp["pnl"])
+    else:
+        # 2. Force-close any open position from a prior day (max hold = 1 overnight)
+        state = _load()
+        pos   = state.get("open_position")
+        if pos and pos.get("entry_date") != str(date.today()):
+            spot  = _spy_price()
+            today = date.today()
+            cur   = _spread_value(pos, spot, _vix(), today)
+            nc    = pos["net_credit"]
+            c     = pos["contracts"]
+            if nc > 0:
+                pnl = (nc - cur) * _SHARES * c
+            else:
+                pnl = (cur - abs(nc)) * _SHARES * c
+            closed = _record_close(state, pos, spot, pnl, "DAILY_CLOSE", today)
+            result["closed"] = closed
+            logger.info("daily_cycle: force-closed %s  P&L=%.2f", pos["strategy"], pnl)
+
+    # 3. Open a fresh spread for today
+    opened = open_daily(engine=engine, dte=dte)
+    result["opened"] = opened
+    return result
 
 
 def check_tp(engine: Optional[MultiStrategyEngine] = None,

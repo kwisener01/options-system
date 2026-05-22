@@ -17,7 +17,7 @@ from src.analysis.gex_trader import generate_signal, format_signal_message
 from src.live.spy_gex_trader import open_trade, sync_state, close_trade, get_status as gex_status
 from config.settings import GEX_RISK_PCT, ALLOW_SHORT_GEX
 from src.backtest.multi_strategy_engine import MultiStrategyEngine
-from src.live.options_paper_trader import open_weekly, check_tp, settle_expiry
+from src.live.options_paper_trader import open_weekly, check_tp, settle_expiry, daily_cycle
 from src.analysis.futures_levels import build_battle_plan, format_battle_plan, check_proximity_alerts
 from config.settings import MONITOR_INTERVAL_MINUTES, TIMEZONE, ML_TOP_N, ACCOUNT_RISK_PCT
 
@@ -29,13 +29,16 @@ trades_today: list = []
 
 # Shared options engine (settings can be tuned here)
 _options_engine = MultiStrategyEngine(
-    short_otm_pct=0.02,
+    short_otm_pct=0.015,       # put side: 1.5% OTM
+    call_otm_pct=0.010,        # call side: 1.0% OTM (skew-adjusted — calls trade cheap)
     spread_width_pct=0.01,
-    call_otm_pct=0.02,
     max_risk_pct=0.10,
     max_vix_entry=25.0,
     low_vol_threshold=18.0,
     take_profit_pct=0.50,
+    max_dollar_risk=200,       # cap 1 contract risk at $200 for $2k account
+    ratio_long_otm_pct=0.030,  # ratio spread long protection 3% OTM
+    breakout_otm_pct=0.010,    # strangle legs 1% OTM when GEX flip near
 )
 
 
@@ -175,8 +178,21 @@ def gex_force_close_job():
         send_message(f":rotating_light: GEX force-close error: {e}")
 
 
+def options_daily_cycle_job():
+    """Mon-Fri 9:45 AM ET — close yesterday's spread (or TP), open new 3DTE spread."""
+    try:
+        r = daily_cycle(engine=_options_engine, dte=1, tp_pct=0.50)
+        if r["closed"]:
+            logger.info("Daily cycle closed: P&L=%.2f", r["closed"].get("pnl", 0))
+        if r["opened"]:
+            logger.info("Daily cycle opened: %s", r["opened"].get("strategy"))
+    except Exception as e:
+        logger.error("options_daily_cycle_job error: %s", e)
+        send_message(f":rotating_light: Daily cycle error: {e}")
+
+
 def options_open_job():
-    """Friday 9:45 AM ET — open this week's options spread."""
+    """Friday 9:45 AM ET — open this week's options spread (weekly mode, not used in daily cycle)."""
     try:
         open_weekly(_options_engine)
     except Exception as e:
@@ -247,10 +263,9 @@ def main():
     scheduler.add_job(gex_afternoon_job,      "cron", day_of_week="mon-fri", hour=15, minute=15)
     scheduler.add_job(gex_force_close_job,    "cron", day_of_week="mon-fri", hour=15, minute=45)
 
-    # Options paper trading
-    scheduler.add_job(options_open_job,   "cron", day_of_week="fri",     hour=9,  minute=45)
-    scheduler.add_job(options_tp_job,     "cron", day_of_week="mon-thu", hour=15, minute=45)
-    scheduler.add_job(options_settle_job, "cron", day_of_week="fri",     hour=15, minute=45)
+    # Options paper trading — daily rolling (3DTE, PDT-safe overnight holds)
+    scheduler.add_job(options_daily_cycle_job, "cron", day_of_week="mon-fri", hour=9, minute=45)
+    scheduler.add_job(options_settle_job,      "cron", day_of_week="fri",     hour=15, minute=45)
 
     # /ES futures prop-firm signals
     scheduler.add_job(futures_battle_plan_job, "cron", day_of_week="mon-fri", hour=9, minute=30)

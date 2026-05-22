@@ -62,6 +62,19 @@ def _data():
         except ImportError:
             from alpaca.data.historical import OptionHistoricalDataClient
             _data_client = OptionHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        # Probe for best SSL config: certifi → system → disabled
+        import requests as _req
+        for _verify in (
+            __import__("certifi").where(),
+            True,
+            False,
+        ):
+            try:
+                _req.get("https://data.alpaca.markets", verify=_verify, timeout=5)
+                _data_client._session.verify = _verify
+                break
+            except Exception:
+                pass
     return _data_client
 
 
@@ -206,6 +219,117 @@ def close_spread(short_symbol: str, long_symbol: str, qty: int,
 
     results["success"] = results["short_order_id"] is not None
     return results
+
+
+def fetch_chain_for_gex(underlying: str = "SPY",
+                        spot: float = 0.0,
+                        n_expiries: int = 3) -> list[dict]:
+    """
+    Pull the live options chain from Alpaca and return it in the format
+    expected by gex_scanner.compute_exposures():
+        [{"strike": float, "oi": int, "iv": float, "T": float, "is_call": bool}, ...]
+
+    Falls back gracefully — returns [] on any error so caller can use yfinance.
+    """
+    from datetime import date, timedelta
+    import math
+
+    try:
+        from alpaca.data.requests import OptionChainRequest
+    except ImportError:
+        logger.warning("OptionChainRequest not available in this alpaca-py version")
+        return []
+
+    today = date.today()
+    rows: list[dict] = []
+
+    try:
+        req = OptionChainRequest(
+            underlying_symbol=underlying,
+            feed="indicative",
+        )
+        chain: dict = _data().get_option_chain(req)   # symbol -> OptionSnapshot
+    except Exception as e:
+        logger.warning("Alpaca option chain fetch failed: %s", e)
+        return []
+
+    for symbol, snap in chain.items():
+        try:
+            greeks   = getattr(snap, "greeks", None)
+            quote    = getattr(snap, "latest_quote", None)
+            contract = getattr(snap, "contract_details", None) or getattr(snap, "details", None)
+
+            # strike
+            strike = None
+            if contract:
+                strike = float(getattr(contract, "strike_price", 0) or 0)
+            if not strike:
+                # parse from OCC symbol: SPY YYMMDD C/P XXXXXXXX
+                try:
+                    strike = int(symbol[-8:]) / 1000.0
+                except Exception:
+                    continue
+
+            # filter to ±8% of spot
+            if spot and not (spot * 0.92 <= strike <= spot * 1.08):
+                continue
+
+            # is_call
+            option_type = None
+            if contract:
+                option_type = getattr(contract, "type", None) or getattr(contract, "option_type", None)
+            if not option_type:
+                # parse from OCC symbol
+                option_type = "call" if len(symbol) > 15 and symbol[12] == "C" else "put"
+            is_call = str(option_type).lower() in ("call", "c")
+
+            # expiry / T
+            expiry_str = None
+            if contract:
+                expiry_str = str(getattr(contract, "expiration_date", "") or "")
+            if not expiry_str:
+                try:
+                    expiry_str = f"20{symbol[3:5]}-{symbol[5:7]}-{symbol[7:9]}"
+                except Exception:
+                    continue
+            try:
+                expiry_date = date.fromisoformat(expiry_str[:10])
+                T = max((expiry_date - today).days, 0) / 365
+            except Exception:
+                continue
+
+            # only take the n nearest expirations
+            dte = (expiry_date - today).days
+            if dte < 0 or dte > 60:
+                continue
+
+            # implied vol — prefer snap-level IV, fall back to greeks
+            iv = float(getattr(snap, "implied_volatility", 0) or 0)
+            if not iv and greeks:
+                iv = float(getattr(greeks, "implied_volatility", 0) or 0)
+            if iv < 0.01:
+                continue
+
+            # open interest — use contract OI when available; otherwise use
+            # quote bid+ask size as a liquidity proxy (indicative feed has no OI)
+            oi = 0
+            if contract:
+                oi = int(getattr(contract, "open_interest", 0) or 0)
+            if oi < 10 and quote:
+                bid_sz = int(getattr(quote, "bid_size", 0) or 0)
+                ask_sz = int(getattr(quote, "ask_size", 0) or 0)
+                oi = bid_sz + ask_sz
+            if oi < 5:
+                continue
+
+            rows.append(dict(strike=strike, oi=oi, iv=iv, T=T, is_call=is_call))
+
+        except Exception as e:
+            logger.debug("Skipping contract %s: %s", symbol, e)
+            continue
+
+    logger.info("Alpaca chain: %d contracts for %s", len(rows), underlying)
+    return rows
 
 
 def get_option_positions() -> list:

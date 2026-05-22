@@ -3,15 +3,17 @@ Options paper trading — manual control script.
 
 Usage:
     python run_options_paper.py status         # show current P&L and open position
-    python run_options_paper.py open           # open a new spread now (runs strategy selector)
+    python run_options_paper.py open           # open a new weekly spread now
+    python run_options_paper.py open --dry-run # preview without opening
+    python run_options_paper.py daily          # full daily cycle: close yesterday + open 3DTE spread
+    python run_options_paper.py daily --dte 2  # same but use 2DTE expiry
     python run_options_paper.py check          # check take-profit on open position
     python run_options_paper.py settle         # settle expired position (run Friday PM)
     python run_options_paper.py reset          # wipe state and start fresh (prompts)
 
-The scheduler in main.py runs these automatically:
-  Friday 9:45 AM ET  → open
-  Mon-Thu 3:45 PM ET → check
-  Friday 3:45 PM ET  → check + settle
+The scheduler in main.py runs these automatically (daily rolling mode):
+  Mon-Fri 9:45 AM ET → daily_cycle (close prior + open 3DTE)
+  Friday 3:45 PM ET  → settle
 """
 import argparse
 import logging
@@ -23,14 +25,14 @@ sys.path.insert(0, os.path.dirname(__file__))
 from src.logger import setup_logging
 from src.backtest.multi_strategy_engine import MultiStrategyEngine
 from src.live.options_paper_trader import (
-    open_weekly, preview_weekly, check_tp, settle_expiry, status,
+    open_weekly, preview_weekly, check_tp, settle_expiry, status, daily_cycle,
     _load, _save, STATE_PATH, _try_alpaca_open,
 )
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Options paper trading control")
-    p.add_argument("action", choices=["status", "open", "check", "settle", "reset", "backfill-alpaca"],
+    p.add_argument("action", choices=["status", "open", "check", "settle", "reset", "backfill-alpaca", "daily"],
                    nargs="?", default="status")
     p.add_argument("--capital",     type=float, default=None,  help="Override starting capital for reset")
     p.add_argument("--otm",         type=float, default=0.02)
@@ -41,6 +43,8 @@ def parse_args():
     p.add_argument("--take-profit", type=float, default=0.50)
     p.add_argument("--dry-run", action="store_true",
                    help="Preview strategy/strikes without saving state or placing orders")
+    p.add_argument("--dte",    type=int, default=1,
+                   help="Min days-to-expiry for daily rolling spreads (default: 1 = tomorrow)")
     return p.parse_args()
 
 
@@ -98,7 +102,9 @@ def fmt_status(s: dict):
 
 
 def fmt_preview(r: dict):
-    from src.backtest.multi_strategy_engine import STRATEGY_IRON_CONDOR, STRATEGY_BULL_CALL_DEBIT
+    from src.backtest.multi_strategy_engine import (
+        STRATEGY_IRON_CONDOR, STRATEGY_IRON_BUTTERFLY, STRATEGY_BULL_CALL_DEBIT,
+    )
     print()
     print("=" * 56)
     print("  OPTIONS DRY-RUN — THIS WEEK'S CANDIDATE")
@@ -108,15 +114,21 @@ def fmt_preview(r: dict):
     print(f"  Regime     : {r['regime']}  |  Trend: {r['spy_trend']}")
     print(f"  Macro      : {r['macro_summary']}")
     print(f"  Strategy   : {r['strategy']}")
+    if r.get("gex_put_wall"):
+        print(f"  GEX walls  : Put {r['gex_put_wall']:.1f}  |  Call {r['gex_call_wall']:.1f}")
 
     pos = r.get("position")
     if pos:
         print()
-        if r["strategy"] == STRATEGY_IRON_CONDOR:
+        if r["strategy"] in (STRATEGY_IRON_CONDOR, STRATEGY_IRON_BUTTERFLY):
             print(f"  Put spread : {pos['put_short']:.1f} / {pos['put_long']:.1f}  "
                   f"(credit ${pos['put_credit']:.3f}/sh)")
             print(f"  Call spread: {pos['call_short']:.1f} / {pos['call_long']:.1f}  "
                   f"(credit ${pos['call_credit']:.3f}/sh)")
+            if r["strategy"] == STRATEGY_IRON_BUTTERFLY:
+                be_lo = pos["put_short"]  - pos["net_credit"]
+                be_hi = pos["call_short"] + pos["net_credit"]
+                print(f"  Break-evens: ${be_lo:.2f} / ${be_hi:.2f}")
         elif r["strategy"] == STRATEGY_BULL_CALL_DEBIT:
             print(f"  Call debit : {pos['short_strike']:.1f} / {pos['long_strike']:.1f}")
         else:
@@ -174,6 +186,26 @@ def main():
             print(f"\nSettled — P&L=${result['pnl']:+,.2f}  outcome={result['outcome']}\n")
         else:
             print("\nNothing to settle.\n")
+
+    elif args.action == "daily":
+        engine = _make_engine(args)
+        if args.dry_run:
+            r = preview_weekly(engine)
+            fmt_preview(r)
+        else:
+            r = daily_cycle(engine=engine, dte=args.dte, tp_pct=args.take_profit)
+            if r["closed"]:
+                c = r["closed"]
+                print(f"\nClosed {c['strategy']}  P&L=${c['pnl']:+,.2f}  ({c['outcome']})\n")
+            else:
+                print("\nNo position closed.\n")
+            if r["opened"]:
+                p = r["opened"]
+                print(f"Opened {p['strategy']}  "
+                      f"strikes={p.get('short_strike', '')}/{p.get('long_strike', '')}  "
+                      f"credit=${p['net_credit']:.3f}  expiry={p['expiry_date']}\n")
+            else:
+                print("No new position opened (CASH or conditions not met).\n")
 
     elif args.action == "backfill-alpaca":
         state = _load()

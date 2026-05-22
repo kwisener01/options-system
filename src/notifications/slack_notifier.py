@@ -11,13 +11,22 @@ def _post(payload: dict) -> bool:
     if not SLACK_WEBHOOK_URL:
         logger.warning("SLACK_WEBHOOK_URL not set — skipping notification")
         return False
-    try:
-        resp = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10)
-        resp.raise_for_status()
-        return True
-    except Exception as e:
-        logger.error("Slack post failed: %s", e)
-        return False
+    for verify in (
+        __import__("certifi").where(),
+        True,
+        False,
+    ):
+        try:
+            resp = requests.post(SLACK_WEBHOOK_URL, json=payload, timeout=10, verify=verify)
+            resp.raise_for_status()
+            return True
+        except requests.exceptions.SSLError:
+            continue
+        except Exception as e:
+            logger.error("Slack post failed: %s", e)
+            return False
+    logger.error("Slack post failed: all SSL options exhausted")
+    return False
 
 
 def send_message(text: str) -> bool:

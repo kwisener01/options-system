@@ -31,11 +31,14 @@ logger = logging.getLogger(__name__)
 _RF     = 0.045
 _SHARES = 100
 
-STRATEGY_CASH            = "CASH"
-STRATEGY_BULL_PUT        = "BULL_PUT_SPREAD"
-STRATEGY_BEAR_CALL       = "BEAR_CALL_SPREAD"
-STRATEGY_IRON_CONDOR     = "IRON_CONDOR"
-STRATEGY_BULL_CALL_DEBIT = "BULL_CALL_DEBIT"
+STRATEGY_CASH               = "CASH"
+STRATEGY_BULL_PUT           = "BULL_PUT_SPREAD"
+STRATEGY_BEAR_CALL          = "BEAR_CALL_SPREAD"
+STRATEGY_IRON_CONDOR        = "IRON_CONDOR"
+STRATEGY_IRON_BUTTERFLY     = "IRON_BUTTERFLY"
+STRATEGY_BULL_CALL_DEBIT    = "BULL_CALL_DEBIT"
+STRATEGY_PUT_RATIO          = "PUT_RATIO_SPREAD"
+STRATEGY_BREAKOUT_STRANGLE  = "BREAKOUT_STRANGLE"
 
 
 # ── data classes ─────────────────────────────────────────────────────────────
@@ -91,9 +94,15 @@ class MultiStrategyEngine:
         debit_short_otm_pct:float = 0.05,     # debit call: short strike (cap upside)
         max_risk_pct:       float = 0.10,     # max capital at risk per trade
         iv_premium:         float = 1.20,     # VIX × this = estimated IV
-        max_vix_entry:      float = 25.0,     # hard skip above this VIX
-        low_vol_threshold:  float = 18.0,     # below this VIX, prefer iron condor
-        vol_crush_threshold:float = 30.0,     # prev-week VIX above this triggers debit play
+        max_vix_entry:           float = 25.0,  # hard skip above this VIX
+        low_vol_threshold:       float = 18.0,  # below this VIX, prefer iron condor
+        iron_butterfly_threshold:float = 16.0,  # below this VIX + POSITIVE_GAMMA → iron butterfly
+        butterfly_wing_pct:      float = 0.02,  # wing width each side as % of spot
+        vol_crush_threshold:     float = 30.0,  # prev-week VIX above this triggers debit play
+        max_dollar_risk:      Optional[float] = None,  # cap spread width so 1 contract <= this $
+        ratio_long_otm_pct:   float = 0.030,  # long put protection for ratio spread (3% OTM)
+        ratio_min_dte:        int   = 5,      # ratio spread only triggers if engine.dte >= this
+        breakout_otm_pct:     float = 0.010,  # strangle leg OTM% for GEX flip breakout play
         vol_window:         int   = 20,
         dte:                int   = 7,
         take_profit_pct:    Optional[float] = 0.50,
@@ -106,9 +115,15 @@ class MultiStrategyEngine:
         self.debit_short_otm_pct = debit_short_otm_pct
         self.max_risk_pct        = max_risk_pct
         self.iv_premium          = iv_premium
-        self.max_vix_entry       = max_vix_entry
-        self.low_vol_threshold   = low_vol_threshold
-        self.vol_crush_threshold = vol_crush_threshold
+        self.max_vix_entry            = max_vix_entry
+        self.low_vol_threshold        = low_vol_threshold
+        self.iron_butterfly_threshold = iron_butterfly_threshold
+        self.butterfly_wing_pct       = butterfly_wing_pct
+        self.vol_crush_threshold      = vol_crush_threshold
+        self.max_dollar_risk          = max_dollar_risk
+        self.ratio_long_otm_pct       = ratio_long_otm_pct
+        self.ratio_min_dte            = ratio_min_dte
+        self.breakout_otm_pct         = breakout_otm_pct
         self.vol_window          = vol_window
         self.dte                 = dte
         self.take_profit_pct     = take_profit_pct
@@ -139,32 +154,86 @@ class MultiStrategyEngine:
         return round(price / t) * t
 
     def _width(self, spot):
-        return max(self._rs(spot * self.spread_width_pct, spot), 1.0)
+        pct_width = self._rs(spot * self.spread_width_pct, spot)
+        if self.max_dollar_risk is not None:
+            # Clamp width so 1 contract max loss <= max_dollar_risk
+            # max_loss ≈ width * 100 (conservative: ignore credit)
+            cap_width = self._rs(self.max_dollar_risk / 100, spot)
+            pct_width = min(pct_width, cap_width)
+        return max(pct_width, 1.0)
 
     # ── strategy selector ─────────────────────────────────────────────────────
+    #
+    # RULES (in priority order):
+    #
+    # HARD STOPS
+    #   VIX > 30                          → CASH  (black-swan protection)
+    #   BEAR + VIX > max_vix_entry        → CASH
+    #   BULL + VIX > max_vix_entry        → CASH
+    #   near_event (FOMC/CPI day)         → CASH  (too much gap risk)
+    #   near_flip  (price within 0.5% of GEX flip level) → CASH (regime change imminent)
+    #
+    # VOL CRUSH
+    #   prev_vix > 30 and vix < 25        → BULL_CALL_DEBIT  (buy cheap vol after spike)
+    #
+    # NEGATIVE GAMMA (dealers chase moves — trending market)
+    #   BULL                              → BULL_PUT_SPREAD   (trend continues up)
+    #   BEAR                              → BEAR_CALL_SPREAD  (trend continues down)
+    #   NEUTRAL                           → CASH              (no edge, wait for direction)
+    #
+    # POSITIVE GAMMA (dealers mean-revert — range-bound market)
+    #   BEAR + vanna BEARISH              → BEAR_CALL_SPREAD
+    #   BEAR                              → BULL_PUT_SPREAD   (oversold bounce expected)
+    #   BULL + vanna BEARISH              → IRON_CONDOR       (dealer selling caps upside)
+    #   BULL                              → BULL_PUT_SPREAD   (strong trend + pinned = ideal)
+    #   NEUTRAL + VIX < iron_butterfly_threshold → IRON_BUTTERFLY (sell ATM body, max premium)
+    #   NEUTRAL + VIX < low_vol_threshold → IRON_CONDOR       (collect both sides)
+    #   NEUTRAL                           → BULL_PUT_SPREAD   (slight bullish bias)
 
-    def _select(self, vix, is_bull, is_bear, spy_trend, prev_vix) -> str:
-        # Hard stops
+    def _select(self, vix, is_bull, is_bear, spy_trend, prev_vix,
+                gex_regime="UNKNOWN", vanna_signal="NEUTRAL",
+                near_event=False, near_flip=False) -> str:
+
+        # ── Hard stops ────────────────────────────────────────────────────────
         if vix > 30:
             return STRATEGY_CASH
         if is_bear and vix > self.max_vix_entry:
             return STRATEGY_CASH
         if is_bull and vix > self.max_vix_entry:
             return STRATEGY_CASH
+        if near_event:
+            return STRATEGY_CASH
+        if near_flip:
+            return STRATEGY_BREAKOUT_STRANGLE   # buy vol — GEX regime about to change
 
-        # Vol-crush recovery: VIX was spiking last week, now normalizing
+        # ── Vol-crush recovery ────────────────────────────────────────────────
         if prev_vix is not None and prev_vix > self.vol_crush_threshold and vix < 25:
             return STRATEGY_BULL_CALL_DEBIT
 
-        # Bearish regime: sell OTM calls
-        if is_bear:
-            return STRATEGY_BEAR_CALL
+        # ── Negative gamma: market is trending, dealers chase ─────────────────
+        if gex_regime == "NEGATIVE_GAMMA":
+            if is_bull:
+                return STRATEGY_BULL_PUT
+            if is_bear:
+                return STRATEGY_BEAR_CALL
+            return STRATEGY_CASH   # neutral + trending = no edge
 
-        # Bullish: sell OTM puts (standard high-probability trade)
+        # ── Positive gamma: market is range-bound, dealers mean-revert ────────
+        if is_bear:
+            if vanna_signal == "BEARISH":
+                return STRATEGY_BEAR_CALL
+            return STRATEGY_BULL_PUT   # oversold in positive gamma = bounce likely
+
         if is_bull:
+            if vanna_signal == "BEARISH":
+                return STRATEGY_IRON_CONDOR
+            if self.dte >= self.ratio_min_dte:
+                return STRATEGY_PUT_RATIO     # more premium, defined danger zone, needs time
             return STRATEGY_BULL_PUT
 
-        # Neutral: iron condor if vol is low, else slight bull bias
+        # Neutral regime
+        if vix < self.iron_butterfly_threshold:
+            return STRATEGY_IRON_BUTTERFLY   # sell ATM body for max premium
         if vix < self.low_vol_threshold:
             return STRATEGY_IRON_CONDOR
         return STRATEGY_BULL_PUT
@@ -195,6 +264,51 @@ class MultiStrategyEngine:
         max_risk  = w - min(put_cr, call_cr)   # can only lose one side at once
         return K1, K2, K3, K4, w, put_cr, call_cr, total_cr, max_risk
 
+    def _iron_butterfly(self, spot, sigma, T):
+        """
+        Sell ATM put + ATM call (same strike), buy OTM put and OTM call as wings.
+        Collects maximum premium when market is pinned; profit zone = ±credit from ATM.
+        Returns: K_atm, K_put_long, K_call_long, wing_width, put_cr, call_cr, total_cr, max_risk
+        """
+        K_atm      = self._rs(spot, spot)          # nearest $0.50 to spot
+        wing_width = max(self._rs(spot * self.butterfly_wing_pct, spot), 1.0)
+        K_put_long  = K_atm - wing_width
+        K_call_long = K_atm + wing_width
+
+        put_cr  = max(bs_put(spot, K_atm, T, sigma)  - bs_put(spot, K_put_long, T, sigma),  0.005)
+        call_cr = max(bs_call(spot, K_atm, T, sigma) - bs_call(spot, K_call_long, T, sigma), 0.005)
+        total_cr = put_cr + call_cr
+        max_risk = wing_width - total_cr   # max loss = one full wing minus total credit received
+        return K_atm, K_put_long, K_call_long, wing_width, put_cr, call_cr, total_cr, max_risk
+
+    def _put_ratio(self, spot, sigma, T):
+        """
+        Short 2x OTM puts / Long 1x further OTM put.
+        Collects more credit than a single spread; break-even is width below the shorts.
+        Use only when dte >= ratio_min_dte — credit is too thin at 1DTE.
+        Returns: K_short, K_long, credit, max_risk_per_share (at K_long)
+        """
+        K_short = self._rs(spot * (1 - self.short_otm_pct), spot)
+        K_long  = self._rs(spot * (1 - self.ratio_long_otm_pct), spot)
+        if K_long >= K_short:
+            K_long = K_short - self._width(spot)
+        cr = max(2 * bs_put(spot, K_short, T, sigma) - bs_put(spot, K_long, T, sigma), 0.005)
+        # max loss occurs at K_long (where long put barely ITM, shorts fully ITM)
+        mr = max(2 * (K_short - K_long) - cr, 0.10)
+        return K_short, K_long, cr, mr
+
+    def _breakout_strangle(self, spot, sigma, T):
+        """
+        Buy OTM call + OTM put — profits from big move in either direction.
+        Triggered when GEX flip level is near spot (regime change imminent).
+        Returns: K_call, K_put, debit (cost), max_risk (= debit)
+        """
+        K_call = self._rs(spot * (1 + self.breakout_otm_pct), spot)
+        K_put  = self._rs(spot * (1 - self.breakout_otm_pct), spot)
+        debit  = bs_call(spot, K_call, T, sigma) + bs_put(spot, K_put, T, sigma)
+        debit  = max(debit, 0.01)
+        return K_call, K_put, debit, debit   # max_risk = debit paid
+
     def _bull_call_debit(self, spot, sigma, T):
         """Returns (K_long, K_short, debit_per_share, max_profit_per_share)."""
         K1 = self._rs(spot * (1 + self.debit_long_otm_pct), spot)
@@ -220,6 +334,20 @@ class MultiStrategyEngine:
         call_pnl = call_cr - max(0.0, spot_exp - K3) + max(0.0, spot_exp - K4)
         return (put_pnl + call_pnl) * _SHARES * contracts
 
+    def _pnl_iron_butterfly(self, spot_exp, K_atm, K_put_long, K_call_long,
+                             put_cr, call_cr, contracts):
+        put_pnl  = put_cr  - max(0.0, K_atm - spot_exp)      + max(0.0, K_put_long  - spot_exp)
+        call_pnl = call_cr - max(0.0, spot_exp - K_atm)      + max(0.0, spot_exp    - K_call_long)
+        return (put_pnl + call_pnl) * _SHARES * contracts
+
+    def _pnl_put_ratio(self, spot_exp, K_short, K_long, credit, contracts):
+        pnl_ps = credit - 2*max(K_short - spot_exp, 0) + max(K_long - spot_exp, 0)
+        return pnl_ps * _SHARES * contracts
+
+    def _pnl_breakout_strangle(self, spot_exp, K_call, K_put, debit, contracts):
+        pnl_ps = max(spot_exp - K_call, 0) + max(K_put - spot_exp, 0) - debit
+        return pnl_ps * _SHARES * contracts
+
     def _pnl_bull_call_debit(self, spot_exp, K1, K2, debit, contracts):
         pnl_ps = max(0.0, spot_exp - K1) - max(0.0, spot_exp - K2) - debit
         return pnl_ps * _SHARES * contracts
@@ -237,8 +365,19 @@ class MultiStrategyEngine:
             put_v  = bs_put(spot, K1, T_rem, sigma)  - bs_put(spot, K2, T_rem, sigma)
             call_v = bs_call(spot, K3, T_rem, sigma) - bs_call(spot, K4, T_rem, sigma)
             return put_v + call_v
+        if strategy == STRATEGY_IRON_BUTTERFLY:
+            # K1=K_atm (body), K2=K_put_long, K3=K_call_long stored in legs
+            put_v  = bs_put(spot,  K1, T_rem, sigma) - bs_put(spot,  K2, T_rem, sigma)
+            call_v = bs_call(spot, K1, T_rem, sigma) - bs_call(spot, K3, T_rem, sigma)
+            return put_v + call_v
         if strategy == STRATEGY_BULL_CALL_DEBIT:
             return bs_call(spot, K1, T_rem, sigma) - bs_call(spot, K2, T_rem, sigma)
+        if strategy == STRATEGY_PUT_RATIO:
+            # K1=K_short (2x short), K2=K_long (1x protection)
+            return 2*bs_put(spot, K1, T_rem, sigma) - bs_put(spot, K2, T_rem, sigma)
+        if strategy == STRATEGY_BREAKOUT_STRANGLE:
+            # K1=K_call, K2=K_put stored in legs
+            return bs_call(spot, K1, T_rem, sigma) + bs_put(spot, K2, T_rem, sigma)
         return 0.0
 
     # ── main simulation ───────────────────────────────────────────────────────
@@ -254,7 +393,8 @@ class MultiStrategyEngine:
         prev_vix     = None
         strategy_counts = {s: 0 for s in [
             STRATEGY_CASH, STRATEGY_BULL_PUT, STRATEGY_BEAR_CALL,
-            STRATEGY_IRON_CONDOR, STRATEGY_BULL_CALL_DEBIT,
+            STRATEGY_IRON_CONDOR, STRATEGY_IRON_BUTTERFLY, STRATEGY_BULL_CALL_DEBIT,
+            STRATEGY_PUT_RATIO, STRATEGY_BREAKOUT_STRANGLE,
         ]}
 
         for date in dates:
@@ -312,8 +452,17 @@ class MultiStrategyEngine:
                     elif s == STRATEGY_IRON_CONDOR:
                         pnl = self._pnl_iron_condor(spot, K1, K2, K3, K4,
                                                      legs[0].premium, legs[2].premium, c)
+                    elif s == STRATEGY_IRON_BUTTERFLY:
+                        pnl = self._pnl_iron_butterfly(spot, K1, K2, K3,
+                                                        legs[0].premium, legs[2].premium, c)
                     elif s == STRATEGY_BULL_CALL_DEBIT:
                         pnl = self._pnl_bull_call_debit(spot, K1, K2, abs(cr), c)
+                    elif s == STRATEGY_PUT_RATIO:
+                        # K1=K_short (2x), K2=K_long (1x)
+                        pnl = self._pnl_put_ratio(spot, K1, K2, cr, c)
+                    elif s == STRATEGY_BREAKOUT_STRANGLE:
+                        # K1=K_call, K2=K_put; nc is negative (debit)
+                        pnl = self._pnl_breakout_strangle(spot, K1, K2, abs(cr), c)
                     else:
                         pnl = 0.0
 
@@ -395,10 +544,40 @@ class MultiStrategyEngine:
                     ]
                     net_credit, max_risk, spread_width = total_cr, mr, w
 
+                elif strategy == STRATEGY_IRON_BUTTERFLY:
+                    K1, K2, K3, w, put_cr, call_cr, total_cr, mr = \
+                        self._iron_butterfly(entry_spot, sigma, T)
+                    # K1=K_atm (body), K2=K_put_long, K3=K_call_long
+                    legs = [
+                        SpreadLeg("put",  True,  K1, put_cr),   # short ATM put
+                        SpreadLeg("put",  False, K2, -put_cr),  # long  OTM put
+                        SpreadLeg("call", True,  K1, call_cr),  # short ATM call
+                        SpreadLeg("call", False, K3, -call_cr), # long  OTM call
+                    ]
+                    net_credit, max_risk, spread_width = total_cr, mr, w
+                    K4 = K3  # so _current_value gets K3=K_call_long as its 3rd arg
+
                 elif strategy == STRATEGY_BULL_CALL_DEBIT:
                     K1, K2, w, db, mp = self._bull_call_debit(entry_spot, sigma, T)
                     legs = [SpreadLeg("call", False, K1, -db), SpreadLeg("call", True, K2, db)]
                     net_credit, max_risk, spread_width = -db, db, w
+
+                elif strategy == STRATEGY_PUT_RATIO:
+                    K1, K2, cr, mr = self._put_ratio(entry_spot, sigma, T)
+                    # K1=K_short (2x short), K2=K_long (1x protection)
+                    legs = [
+                        SpreadLeg("put", True,  K1,  cr),
+                        SpreadLeg("put", True,  K1,  cr),    # 2x short
+                        SpreadLeg("put", False, K2, -cr),    # 1x long
+                    ]
+                    net_credit, max_risk, spread_width = cr, mr, K1 - K2
+
+                elif strategy == STRATEGY_BREAKOUT_STRANGLE:
+                    K1, K2, db, mr = self._breakout_strangle(entry_spot, sigma, T)
+                    # K1=K_call (long), K2=K_put (long)
+                    legs = [SpreadLeg("call", False, K1, -db/2),
+                            SpreadLeg("put",  False, K2, -db/2)]
+                    net_credit, max_risk, spread_width = -db, db, db * 4
 
                 if max_risk <= 0:
                     equity[date] = account
@@ -441,8 +620,15 @@ class MultiStrategyEngine:
                     elif s == STRATEGY_IRON_CONDOR:
                         pnl = self._pnl_iron_condor(spot, K1, K2, K3, K4,
                                                      legs[0].premium, legs[2].premium, c)
+                    elif s == STRATEGY_IRON_BUTTERFLY:
+                        pnl = self._pnl_iron_butterfly(spot, K1, K2, K3,
+                                                        legs[0].premium, legs[2].premium, c)
                     elif s == STRATEGY_BULL_CALL_DEBIT:
                         pnl = self._pnl_bull_call_debit(spot, K1, K2, abs(cr), c)
+                    elif s == STRATEGY_PUT_RATIO:
+                        pnl = self._pnl_put_ratio(spot, K1, K2, cr, c)
+                    elif s == STRATEGY_BREAKOUT_STRANGLE:
+                        pnl = self._pnl_breakout_strangle(spot, K1, K2, abs(cr), c)
                     else:
                         pnl = 0.0
 
