@@ -520,56 +520,108 @@ function renderVixBar(vix) {
 // ── Trade Idea Panel ──────────────────────────────────────────────────────────
 function renderTrade(t) {
   const el = $('trade-panel');
-  if (!el || !t || !t.type) { if (el) el.innerHTML = ''; return; }
+  if (!el) return;
+  if (!t || (!t.cs && !t.bwb)) { el.innerHTML = ''; return; }
 
-  const bearish = t.direction === 'BEARISH';
-  const dirCls  = bearish ? 'text-red-400 border-red-800 bg-red-950/30' : 'text-green-400 border-green-800 bg-green-950/30';
-  const badgeCls= bearish ? 'bg-red-900/60 text-red-300 border-red-700' : 'bg-green-900/60 text-green-300 border-green-700';
-  const arrow   = bearish ? '↓' : '↑';
+  const bearish  = t.direction === 'BEARISH';
+  const dirCls   = bearish ? 'border-red-800' : 'border-green-800';
+  const badgeCls = bearish ? 'bg-red-900/60 text-red-300 border-red-700'
+                           : 'bg-green-900/60 text-green-300 border-green-700';
+  const arrow    = bearish ? '↓' : '↑';
+  const rec      = t.recommended || 'cs';
+  const live     = t.prices_live ? '<span class="text-blue-400 text-xs ml-1">● live</span>' : '';
+
+  function recBadge(key) {
+    return rec === key
+      ? '<span class="ml-2 px-1.5 py-0.5 rounded text-xs font-bold bg-yellow-500/20 text-yellow-300 border border-yellow-600">★ RECOMMENDED</span>'
+      : '';
+  }
+
+  function row(label, val, cls='text-white') {
+    return `<div class="flex justify-between text-xs py-0.5">
+      <span class="text-gray-500">${label}</span>
+      <span class="${cls} font-semibold">${val}</span></div>`;
+  }
+
+  // Credit spread card
+  const cs = t.cs || {};
+  const csType = cs.type || 'Credit Spread';
+  const csDir  = csType.startsWith('Bear') ? 'Debit' : 'Credit';
+  const csCredit = cs.credit != null ? (cs.credit >= 0 ? `+$${cs.credit.toFixed(2)}` : `-$${Math.abs(cs.credit).toFixed(2)}`) : '—';
+  const csCard = `
+    <div class="bg-gray-800/60 rounded-lg border ${rec==='cs' ? 'border-yellow-600' : 'border-gray-700'} p-3 flex flex-col gap-1">
+      <div class="flex items-center gap-2 mb-1">
+        <span class="text-gray-300 font-bold text-sm">${csType}</span>
+        ${recBadge('cs')}
+      </div>
+      ${row('Expiry', `${t.expiry || '—'} (${t.dte || '?'}DTE)`)}
+      ${row('Long leg',  `$${cs.long_strike  || '?'}P @ $${cs.long_mid  != null ? cs.long_mid.toFixed(2)  : '?'}`, 'text-green-400')}
+      ${row('Short leg', `$${cs.short_strike || '?'}P @ $${cs.short_mid != null ? cs.short_mid.toFixed(2) : '?'}`, 'text-red-400')}
+      ${row('Width', `$${cs.width || '?'}`)}
+      ${row(csDir, csCredit, cs.credit >= 0 ? 'text-green-400' : 'text-red-400')}
+      ${row('Max Profit', `$${cs.max_profit_usd != null ? cs.max_profit_usd : '?'}`, 'text-green-400')}
+      ${row('Max Risk',   `$${cs.max_risk_usd  != null ? cs.max_risk_usd  : '?'}`, 'text-red-400')}
+      ${cs.rr_ratio != null ? row('R:R', `${cs.rr_ratio}×`) : ''}
+    </div>`;
+
+  // BWB card (or placeholder)
+  let bwbCard = '';
+  if (t.bwb) {
+    const b = t.bwb;
+    const ratingCls = b.rating === 'A+' ? 'text-green-400'
+                    : b.rating === 'Acceptable' ? 'text-blue-400'
+                    : 'text-red-400';
+    bwbCard = `
+      <div class="bg-gray-800/60 rounded-lg border ${rec==='bwb' ? 'border-yellow-600' : 'border-gray-700'} p-3 flex flex-col gap-1">
+        <div class="flex items-center gap-2 mb-1">
+          <span class="text-gray-300 font-bold text-sm">Bull BWB</span>
+          ${recBadge('bwb')}
+        </div>
+        ${row('Expiry', `${t.expiry || '—'} (${t.dte || '?'}DTE)`)}
+        ${row('Upper buy', `$${b.long_upper   || '?'}P @ $${b.upper_mid != null ? b.upper_mid.toFixed(2) : '?'}`, 'text-green-400')}
+        ${row('Short (×2)', `$${b.short_strike || '?'}P @ $${b.short_mid != null ? b.short_mid.toFixed(2) : '?'}`, 'text-red-400')}
+        ${row('Lower buy', `$${b.long_lower   || '?'}P @ $${b.lower_mid != null ? b.lower_mid.toFixed(2) : '?'}`, 'text-green-400')}
+        ${row('Credit', `+$${b.credit != null ? b.credit.toFixed(2) : '?'}`, 'text-green-400')}
+        ${row('Max Profit', `$${b.max_profit_usd != null ? Math.round(b.max_profit_usd) : '?'}`, 'text-green-400')}
+        ${row('Max Risk',   `$${b.max_loss_usd  != null ? Math.round(b.max_loss_usd)  : '?'}`, 'text-red-400')}
+        ${b.lower_breakeven != null ? row('Lower B/E', `$${b.lower_breakeven}`) : ''}
+        ${b.rr_ratio != null ? row('R:R', `${b.rr_ratio}×`) : ''}
+        <div class="flex justify-between text-xs py-0.5 mt-1 border-t border-gray-700">
+          <span class="text-gray-500">Rating</span>
+          <span class="${ratingCls} font-bold">${b.rating || '?'}  (${b.score || 0}/10)</span>
+        </div>
+        ${b.exit_plan ? `<div class="text-xs text-gray-500 mt-1 italic">${b.exit_plan}</div>` : ''}
+      </div>`;
+  } else if (!bearish) {
+    bwbCard = `
+      <div class="bg-gray-800/60 rounded-lg border border-gray-700 p-3 flex items-center justify-center text-gray-600 text-xs">
+        BWB not viable — no liquid structure found
+      </div>`;
+  }
 
   el.innerHTML = `
     <div class="bg-gray-900 rounded-lg border ${dirCls} p-4">
-      <div class="flex items-center gap-3 mb-4">
-        <span class="text-gray-400 text-xs font-semibold uppercase tracking-wider">Trade Idea</span>
+      <div class="flex items-center gap-3 mb-3">
+        <span class="text-gray-400 text-xs font-semibold uppercase tracking-wider">Trade Idea — SPY</span>
         <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-bold border ${badgeCls}">
           ${arrow} ${t.direction}
         </span>
-        <span class="text-white font-bold">${t.type}</span>
-        <span class="text-gray-500 text-sm">${t.expiry}</span>
+        ${live}
+        <span class="text-gray-500 text-xs ml-auto">${t.bearish_signals != null ? t.bearish_signals + ' bearish signal' + (t.bearish_signals !== 1 ? 's' : '') : ''}</span>
       </div>
 
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
-        <!-- Legs -->
-        <div class="bg-gray-800/60 rounded p-3">
-          <div class="text-gray-500 text-xs mb-2 uppercase tracking-wider">Legs</div>
-          <div class="text-green-400 font-semibold text-sm">${t.long_leg}</div>
-          <div class="text-red-400 font-semibold text-sm">${t.short_leg}</div>
-          <div class="text-gray-500 text-xs mt-1">Width: $${t.width}</div>
-        </div>
-        <!-- Risk levels -->
-        <div class="bg-gray-800/60 rounded p-3">
-          <div class="text-gray-500 text-xs mb-2 uppercase tracking-wider">Risk Levels</div>
-          <div class="flex justify-between text-xs mb-1">
-            <span class="text-gray-500">Stop (exit)</span>
-            <span class="text-red-400 font-bold">SPY &gt; $${t.stop_level}</span>
-          </div>
-          ${t.target_level ? `
-          <div class="flex justify-between text-xs">
-            <span class="text-gray-500">Target</span>
-            <span class="text-green-400 font-bold">$${t.target_level}</span>
-          </div>` : `
-          <div class="text-xs text-gray-500">Target: full premium</div>`}
-        </div>
-        <!-- Thesis -->
-        <div class="bg-gray-800/60 rounded p-3">
-          <div class="text-gray-500 text-xs mb-2 uppercase tracking-wider">Thesis</div>
-          ${(t.thesis || []).map(pt => `
-            <div class="text-xs text-gray-300 mb-1">• ${pt}</div>`).join('')}
-        </div>
+      <div class="grid grid-cols-1 md:grid-cols-${t.bwb || (!bearish) ? 2 : 1} gap-3 mb-3">
+        ${csCard}
+        ${bwbCard}
       </div>
 
-      <div class="text-xs text-gray-600 border-t border-gray-800 pt-3">
-        ⚠ Do not hold 1DTE spreads past 3:30 PM ET — gamma pinning can whipsaw into the close.
+      <div class="bg-gray-800/40 rounded p-3 mb-3">
+        <div class="text-gray-500 text-xs mb-1 uppercase tracking-wider">Thesis</div>
+        ${(t.thesis || []).map(pt => `<div class="text-xs text-gray-300 mb-0.5">• ${pt}</div>`).join('')}
+      </div>
+
+      <div class="text-xs text-gray-600 border-t border-gray-800 pt-2">
+        ⚠ Do not hold 1–2DTE spreads past 3:30 PM ET — gamma pinning can whipsaw into the close.
       </div>
     </div>`;
 }

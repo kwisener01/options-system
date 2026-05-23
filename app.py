@@ -118,6 +118,182 @@ def _scan_ticker(ticker: str, spot: float, prev: float,
     }
 
 
+def _build_live_trade_idea(spy: dict, vix_now: float, vix_prev: float) -> dict:
+    """
+    Real-priced trade idea: fetches actual Alpaca mid-prices for each leg,
+    runs BWB analyzer + credit spread math, recommends the better structure.
+    Falls back to heuristic on any error.
+    """
+    try:
+        return _live_trade_impl(spy, vix_now, vix_prev)
+    except Exception as e:
+        logger.warning("Live trade idea failed (%s) — using heuristic fallback", e)
+        return _build_trade_idea(spy, vix_now, vix_prev)
+
+
+def _live_trade_impl(spy: dict, vix_now: float, vix_prev: float) -> dict:
+    from src.live.alpaca_options import fetch_chain_combined
+    from src.analysis.bwb_analyzer import BWBInputs, analyze
+
+    r        = spy.get("full_chain") or spy.get("tomorrow") or spy.get("today") or {}
+    spot     = spy["spot"]
+    flip     = r.get("flip_level") or spot - 10
+    put_wall = r.get("put_wall")   or spot - 15
+    regime   = r.get("regime", "UNKNOWN")
+    vix_chg  = vix_now - vix_prev
+
+    bearish_signals = sum([
+        "NEGATIVE" in regime,
+        r.get("vanna_signal") == "BEARISH",
+        vix_chg > 0.3,
+        spot < flip,
+    ])
+    bearish = bearish_signals >= 2
+
+    # Fetch 0–3 DTE SPY puts with live bid/ask
+    chain = fetch_chain_combined("SPY", spot, dte_min=0, dte_max=3)
+    puts  = chain.get("puts_liquid", [])
+
+    # Group by expiry; prefer soonest with DTE ≥ 1
+    by_exp: dict[str, list] = {}
+    for p in puts:
+        by_exp.setdefault(p["expiry"], []).append(p)
+
+    target_exp, target_dte = None, 1
+    for exp in sorted(by_exp.keys()):
+        dte = by_exp[exp][0]["dte"]
+        if dte >= 1:
+            target_exp, target_dte = exp, dte
+            break
+
+    # Build {strike: mid} price map for the chosen expiry
+    mids: dict[float, float] = {}
+    if target_exp:
+        for p in by_exp[target_exp]:
+            mids[p["strike"]] = round((p["bid"] + p["ask"]) / 2, 2)
+
+    def nearest(target: float) -> tuple[float, float]:
+        """Closest available strike and its mid-price."""
+        if not mids:
+            return round(target), 0.0
+        s = min(mids, key=lambda x: abs(x - target))
+        return s, mids[s]
+
+    thesis = [
+        f"Put wall ${put_wall:.0f} — GEX-defined support"
+        if not bearish else
+        f"Negative gamma ({r.get('gex', 0):.0f}B) — dealer amplification",
+        f"Regime: {regime.replace('_', ' ').title()}  |  VIX {vix_chg:+.2f}",
+        f"Vanna: {r.get('vanna_signal','—')}  |  Charm: {r.get('charm_signal','—')}",
+    ]
+
+    # ── BULLISH: credit spread + BWB, both evaluated ──────────────────────────
+    if not bearish:
+        short_s, short_mid = nearest(round(put_wall))
+        h_s,     h_mid     = nearest(short_s + 5)
+        cs_l_s,  cs_l_mid  = nearest(short_s - 5)
+        bwb_l_s, bwb_l_mid = nearest(short_s - 10)
+
+        # Credit spread (sell short, buy cs_long)
+        cs_credit = short_mid - cs_l_mid
+        cs_width  = short_s - cs_l_s
+        cs_profit = round(cs_credit * 100)
+        cs_risk   = round((cs_width - cs_credit) * 100)
+
+        # BWB (buy H, sell 2×M, buy L)
+        bwb_credit = round(short_mid * 2 - h_mid - bwb_l_mid, 2)
+        bwb_inp = BWBInputs(
+            ticker="SPY", spot=spot, dte=target_dte,
+            long_upper=h_s, short_strike=short_s, long_lower=bwb_l_s,
+            credit=bwb_credit,
+            regime=regime, vix_now=vix_now, vix_prev=vix_prev,
+            flip_level=flip, put_wall=put_wall,
+            call_wall=r.get("call_wall", 0), major_news=False,
+        )
+        bwb = analyze(bwb_inp)
+
+        # Prefer BWB if it's rated well and credit is meaningful
+        rec_bwb = (bwb.rating in ("A+", "Acceptable")
+                   and bwb_credit >= 0.15
+                   and bwb.max_loss_usd <= 700)
+
+        return {
+            "direction":       "BULLISH",
+            "bearish_signals": bearish_signals,
+            "expiry":          target_exp or "1DTE",
+            "dte":             target_dte,
+            "spot":            spot,
+            "prices_live":     bool(mids),
+            "cs": {
+                "type":           "Bull Put Spread",
+                "long_strike":    cs_l_s,
+                "short_strike":   short_s,
+                "width":          cs_width,
+                "credit":         round(cs_credit, 2),
+                "long_mid":       cs_l_mid,
+                "short_mid":      short_mid,
+                "max_profit_usd": cs_profit,
+                "max_risk_usd":   cs_risk,
+                "rr_ratio":       round(cs_profit / cs_risk, 2) if cs_risk > 0 else 0,
+            },
+            "bwb": {
+                "type":            "Bull BWB",
+                "long_upper":      h_s,
+                "short_strike":    short_s,
+                "long_lower":      bwb_l_s,
+                "credit":          bwb_credit,
+                "upper_mid":       h_mid,
+                "short_mid":       short_mid,
+                "lower_mid":       bwb_l_mid,
+                "max_profit_usd":  round(bwb.max_profit_usd),
+                "max_loss_usd":    round(bwb.max_loss_usd),
+                "lower_breakeven": round(bwb.lower_breakeven, 2),
+                "rr_ratio":        round(bwb.rr_ratio, 2),
+                "rating":          bwb.rating,
+                "score":           bwb.setup_score,
+                "exit_plan":       bwb.exit_plan,
+                "overnight_ok":    bwb.overnight_ok,
+            },
+            "recommended": "bwb" if rec_bwb else "cs",
+            "thesis": thesis,
+        }
+
+    # ── BEARISH: bear put spread (BWB is a bullish-only structure) ────────────
+    long_s,  long_mid  = nearest(round(flip))
+    short_s, short_mid = nearest(max(round(put_wall), round(flip) - 10))
+    if long_s - short_s < 3:
+        short_s, short_mid = nearest(long_s - 5)
+
+    width      = long_s - short_s
+    net_debit  = round(long_mid - short_mid, 2)
+    bear_profit = round((width - net_debit) * 100)
+    bear_risk   = round(net_debit * 100)
+
+    return {
+        "direction":       "BEARISH",
+        "bearish_signals": bearish_signals,
+        "expiry":          target_exp or "1DTE",
+        "dte":             target_dte,
+        "spot":            spot,
+        "prices_live":     bool(mids),
+        "cs": {
+            "type":           "Bear Put Spread",
+            "long_strike":    long_s,
+            "short_strike":   short_s,
+            "width":          width,
+            "credit":         -net_debit,
+            "long_mid":       long_mid,
+            "short_mid":      short_mid,
+            "max_profit_usd": bear_profit,
+            "max_risk_usd":   bear_risk,
+            "rr_ratio":       round(bear_profit / bear_risk, 2) if bear_risk > 0 else 0,
+        },
+        "bwb":         None,
+        "recommended": "cs",
+        "thesis":      thesis,
+    }
+
+
 def _build_trade_idea(spy: dict, vix_now: float, vix_prev: float) -> dict:
     r = spy.get("full_chain") or spy.get("tomorrow") or spy.get("today")
     if not r:
@@ -180,7 +356,7 @@ def _build_data() -> dict:
     spy_spot, spy_prev, qqq_spot, qqq_prev, vix_now, vix_prev = _fetch_prices()
     spy   = _scan_ticker("SPY", spy_spot, spy_prev, vix_now, vix_prev)
     qqq   = _scan_ticker("QQQ", qqq_spot, qqq_prev, vix_now, vix_prev)
-    trade = _build_trade_idea(spy, vix_now, vix_prev)
+    trade = _build_live_trade_idea(spy, vix_now, vix_prev)
     return {
         "timestamp":  datetime.now(ET).strftime("%Y-%m-%d %H:%M ET"),
         "spy":        spy,
@@ -427,14 +603,35 @@ def _fmt_slack(d: dict) -> str:
 
     trade_block = ""
     if t:
-        color = ":red_circle:" if t.get("direction") == "BEARISH" else ":green_circle:"
+        direction = t.get("direction", "")
+        color     = ":red_circle:" if direction == "BEARISH" else ":green_circle:"
+        rec       = t.get("recommended", "cs")
+        cs        = t.get("cs") or {}
+        bwb       = t.get("bwb")
+        rec_label = ("BWB" if rec == "bwb" else cs.get("type", "CS"))
+        live_tag  = " _(live prices)_" if t.get("prices_live") else ""
+
+        cs_line = (
+            f"CS: {cs.get('type','')}  "
+            f"${cs.get('long_strike','?')}/{cs.get('short_strike','?')}  "
+            f"Credit ${cs.get('credit',0):.2f}  "
+            f"Risk ${cs.get('max_risk_usd',0):.0f}"
+        ) if cs else ""
+
+        bwb_line = ""
+        if bwb:
+            bwb_line = (
+                f"BWB: {bwb.get('long_upper','?')}/{bwb.get('short_strike','?')}/{bwb.get('long_lower','?')}  "
+                f"Credit ${bwb.get('credit',0):.2f}  "
+                f"Rating {bwb.get('rating','?')}  MaxLoss ${bwb.get('max_loss_usd',0):.0f}"
+            )
+
         trade_block = (
-            f"\n{color} *Trade Idea: {t.get('type', '')} ({t.get('expiry', '')})*\n"
-            f">  {t.get('long_leg', '')}  /  {t.get('short_leg', '')}  "
-            f"(${t.get('width', 0)} wide)\n"
+            f"\n{color} *Trade Idea — {direction}  |  Recommended: {rec_label}"
+            f"  |  Expiry {t.get('expiry','')} ({t.get('dte','')}DTE){live_tag}*\n"
+            + (f">  {cs_line}\n" if cs_line else "")
+            + (f">  {bwb_line}\n" if bwb_line else "")
             + "\n".join(f">  - {pt}" for pt in t.get("thesis", []))
-            + f"\n>  Stop: SPY through ${t.get('stop_level', '?')}"
-            + (f"  |  Target: ${t.get('target_level')}" if t.get("target_level") else "")
         )
 
     return (

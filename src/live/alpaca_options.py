@@ -423,7 +423,7 @@ def fetch_chain_combined(underlying: str, spot: float,
             gex_rows.append(dict(strike=strike, oi=oi, iv=iv, T=T, is_call=is_call))
 
             if (is_put and dte_min <= dte <= dte_max
-                    and spot * 0.84 <= strike <= spot * 0.995
+                    and spot * 0.84 <= strike <= spot * 1.02
                     and quote):
                 bid = float(getattr(quote, "bid_price", 0) or 0)
                 ask = float(getattr(quote, "ask_price", 0) or 0)
