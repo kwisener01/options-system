@@ -1115,13 +1115,14 @@ async function sendWatchlistSlack() {
 
 function signalBadgeWL(signal, score) {
   const cfg = {
-    STRONG: 'bg-green-900/70 text-green-300 border-green-700',
-    WATCH:  'bg-amber-900/70 text-amber-300 border-amber-700',
-    NONE:   'bg-gray-800 text-gray-500 border-gray-700',
+    STRONG: { cls: 'bg-green-900/70 text-green-300 border-green-700',  icon: '★', label: 'BUY NOW'    },
+    WATCH:  { cls: 'bg-amber-900/70 text-amber-300 border-amber-700',  icon: '◎', label: 'ACCUMULATE' },
+    SELL:   { cls: 'bg-red-900/70 text-red-300 border-red-700',        icon: '▼', label: 'SELL'       },
+    NONE:   { cls: 'bg-gray-800 text-gray-500 border-gray-700',        icon: '—', label: 'HOLD'       },
   };
-  const icon = signal === 'STRONG' ? '★' : signal === 'WATCH' ? '👀' : '—';
-  return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-bold border ${cfg[signal] || cfg.NONE}">
-    ${icon} ${signal} ${score}/9
+  const c = cfg[signal] || cfg.NONE;
+  return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-bold border ${c.cls}">
+    ${c.icon} ${c.label} ${score}/9
   </span>`;
 }
 
@@ -1172,8 +1173,12 @@ function renderWatchlist(signals) {
     const labelCls = s.label === 'own_now' ? 'text-emerald-400' : 'text-sky-400';
     const labelStr = s.label === 'own_now' ? 'Own Now' : 'Own Lower';
 
-    // Tooltip: reasons + blockers
-    const tipLines = [...(s.reasons||[]).map(r=>`✓ ${r}`), ...(s.blockers||[]).map(b=>`✗ ${b}`)];
+    // Tooltip: sell triggers, reasons, blockers
+    const tipLines = [
+      ...(s.sell_triggers||[]).map(t=>`⚠ ${t}`),
+      ...(s.reasons||[]).map(r=>`✓ ${r}`),
+      ...(s.blockers||[]).map(b=>`✗ ${b}`),
+    ];
     const tip = tipLines.join('\n');
 
     return `

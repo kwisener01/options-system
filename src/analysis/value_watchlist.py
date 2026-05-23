@@ -33,6 +33,11 @@ STRONG_THRESHOLD = {"own_now": 6, "own_lower": 7}
 WATCH_THRESHOLD  = {"own_now": 4, "own_lower": 5}
 EARNINGS_AVOID_DAYS = 14
 
+# Sell signal thresholds
+SELL_RSI_HIGH      = 72      # overbought
+SELL_MA200_EXT_PCT = 25.0    # too far above 200MA — take profits
+SELL_EARNINGS_DAYS = 7       # earnings too close — take profits before binary event
+
 
 # ── Data classes ──────────────────────────────────────────────────────────────
 
@@ -53,9 +58,10 @@ class StockSignal:
     earnings_days_out: Optional[int]
     earnings_clear:    bool
     score:             int
-    signal:            str             # STRONG | WATCH | NONE
+    signal:            str             # STRONG | WATCH | NONE | SELL
     reasons:           list = field(default_factory=list)
     blockers:          list = field(default_factory=list)
+    sell_triggers:     list = field(default_factory=list)
 
 
 # ── Data fetchers ─────────────────────────────────────────────────────────────
@@ -216,6 +222,43 @@ def _score_ticker(label: str, spot: float, ma200: Optional[float],
     return score, signal, reasons, blockers, clear
 
 
+def _sell_check(spot: float, ma200: Optional[float], rsi: Optional[float],
+                gex: dict, spy_regime: str, earn_days: Optional[int]) -> tuple[bool, list[str]]:
+    """
+    Returns (should_sell, sell_reasons).
+    Fires when 2+ exit conditions are met — one alone is noise, two together
+    is a signal to roll into something with better risk/reward.
+    """
+    triggers: list[str] = []
+
+    # 1. RSI overbought
+    if rsi is not None and rsi >= SELL_RSI_HIGH:
+        triggers.append(f"RSI {rsi} — overbought, momentum fading")
+
+    # 2. Significantly extended above 200MA
+    if ma200 is not None and spot > ma200:
+        pct = (spot - ma200) / ma200 * 100
+        if pct >= SELL_MA200_EXT_PCT:
+            triggers.append(f"{pct:.1f}% above 200MA — stretched, take profits")
+
+    # 3. SPY negative gamma (macro headwind)
+    if spy_regime and "NEGATIVE" in spy_regime:
+        triggers.append("SPY negative gamma — dealer amplification risk")
+
+    # 4. Below own put wall (structural support breached)
+    pw = gex.get("put_wall")
+    if pw and pw > 0 and spot < pw:
+        pct_below = (pw - spot) / pw * 100
+        triggers.append(f"Below put wall ${pw:.0f} by {pct_below:.1f}% — support broken")
+
+    # 5. Earnings approaching — take profits before binary event
+    if earn_days is not None and 0 <= earn_days <= SELL_EARNINGS_DAYS:
+        triggers.append(f"Earnings in {earn_days}d — take profits before report")
+
+    should_sell = len(triggers) >= 2
+    return should_sell, triggers
+
+
 # ── Per-ticker scan ───────────────────────────────────────────────────────────
 
 def _scan_one(ticker: str, label: str,
@@ -257,6 +300,13 @@ def _scan_one(ticker: str, label: str,
             label, spot, ma200_val, rsi_val, gex, spy_regime, earn_days
         )
 
+        # Sell check overrides buy signal — exit takes priority
+        should_sell, sell_triggers = _sell_check(
+            spot, ma200_val, rsi_val, gex, spy_regime, earn_days
+        )
+        if should_sell:
+            signal = "SELL"
+
         return StockSignal(
             ticker=ticker, label=label,
             spot=round(spot, 2), change_pct=chg_pct,
@@ -268,6 +318,7 @@ def _scan_one(ticker: str, label: str,
             earnings_date=earn_date, earnings_days_out=earn_days,
             earnings_clear=earn_clear,
             score=score, signal=signal, reasons=reasons, blockers=blockers,
+            sell_triggers=sell_triggers,
         )
     except Exception as e:
         logger.warning("Scan failed for %s: %s", ticker, e)
@@ -349,6 +400,7 @@ def _as_dict(s: StockSignal) -> dict:
         "signal":            s.signal,
         "reasons":           s.reasons,
         "blockers":          s.blockers,
+        "sell_triggers":     s.sell_triggers,
     }
 
 
@@ -362,8 +414,20 @@ def fmt_slack(signals: list[dict], spy_regime: str, vix_now: float,
         "",
     ]
 
+    sell   = [s for s in signals if s["signal"] == "SELL"]
     strong = [s for s in signals if s["signal"] == "STRONG"]
     watch  = [s for s in signals if s["signal"] == "WATCH"]
+
+    if sell:
+        lines.append(":rotating_light: *SELL / ROLL ALERTS*")
+        for s in sell:
+            lines += [
+                f":red_circle: *{s['ticker']} ${s['spot']:.2f}*"
+                f"  ({s['label'].replace('_',' ').title()})  ▼ SELL  {s['score']}/9",
+            ]
+            for t in s.get("sell_triggers", []):
+                lines.append(f"  ⚠ {t}")
+            lines.append("")
 
     if not strong and not watch:
         lines.append("_No buy signals today — conditions not met across watchlist._")
@@ -374,7 +438,7 @@ def fmt_slack(signals: list[dict], spy_regime: str, vix_now: float,
                     if s["earnings_date"] else "")
         lines += [
             f":white_check_mark: *{s['ticker']} ${s['spot']:.2f}*"
-            f"  ({s['label'].replace('_',' ').title()})  ★ STRONG  {s['score']}/9",
+            f"  ({s['label'].replace('_',' ').title()})  ★ BUY NOW  {s['score']}/9",
         ]
         for r in s["reasons"]:
             lines.append(f"  ✓ {r}")
@@ -387,11 +451,11 @@ def fmt_slack(signals: list[dict], spy_regime: str, vix_now: float,
     for s in watch:
         lines += [
             f":eyes: *{s['ticker']} ${s['spot']:.2f}*"
-            f"  ({s['label'].replace('_',' ').title()})  WATCH  {s['score']}/9",
+            f"  ({s['label'].replace('_',' ').title()})  ◎ ACCUMULATE  {s['score']}/9",
         ]
         for r in s["reasons"]:
             lines.append(f"  ✓ {r}")
-        for b in s["blockers"][:2]:  # keep Slack concise
+        for b in s["blockers"][:2]:
             lines.append(f"  ✗ {b}")
         lines.append("")
 
