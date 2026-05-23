@@ -332,6 +332,105 @@ def fetch_chain_for_gex(underlying: str = "SPY",
     return rows
 
 
+def fetch_puts_liquid(underlying: str, spot: float,
+                      dte_min: int = 7, dte_max: int = 35) -> list[dict]:
+    """
+    Fetch put options with bid/ask data for BWB screening.
+    Returns: [{strike, expiry, dte, bid, ask, spread, oi_proxy, iv}, ...]
+    Type position is derived from symbol length (robust for any root length).
+    """
+    from datetime import date as _date
+
+    try:
+        from alpaca.data.requests import OptionChainRequest
+    except ImportError:
+        logger.warning("OptionChainRequest not available")
+        return []
+
+    today = _date.today()
+    rows: list[dict] = []
+
+    try:
+        req = OptionChainRequest(underlying_symbol=underlying, feed="indicative")
+        chain: dict = _data().get_option_chain(req)
+    except Exception as e:
+        logger.warning("Chain fetch failed for %s: %s", underlying, e)
+        return []
+
+    for symbol, snap in chain.items():
+        try:
+            # Type is always at len(symbol) - 9 in OCC format
+            type_pos = len(symbol) - 9
+            if type_pos < 0 or symbol[type_pos] not in ("C", "P"):
+                continue
+            if symbol[type_pos] != "P":  # puts only
+                continue
+
+            # Strike from last 8 digits
+            try:
+                strike = int(symbol[-8:]) / 1000.0
+            except Exception:
+                continue
+
+            # Filter to ±15% OTM (puts below spot)
+            if spot and not (spot * 0.84 <= strike <= spot * 0.995):
+                continue
+
+            # Expiry from contract details or symbol (6 chars before type)
+            contract = getattr(snap, "contract_details", None) or getattr(snap, "details", None)
+            expiry_str = ""
+            if contract:
+                expiry_str = str(getattr(contract, "expiration_date", "") or "")
+            if not expiry_str:
+                # OCC: ROOT + YYMMDD + TYPE + STRIKE; date starts at type_pos-6
+                try:
+                    d_start = type_pos - 6
+                    raw = symbol[d_start:type_pos]  # 6 digit YYMMDD
+                    expiry_str = f"20{raw[0:2]}-{raw[2:4]}-{raw[4:6]}"
+                except Exception:
+                    continue
+
+            try:
+                expiry_date = _date.fromisoformat(expiry_str[:10])
+                dte = (expiry_date - today).days
+            except Exception:
+                continue
+
+            if not (dte_min <= dte <= dte_max):
+                continue
+
+            # Bid/ask
+            quote = getattr(snap, "latest_quote", None)
+            if not quote:
+                continue
+            bid = float(getattr(quote, "bid_price", 0) or 0)
+            ask = float(getattr(quote, "ask_price", 0) or 0)
+            if bid <= 0 or ask <= 0:
+                continue
+
+            bid_sz  = int(getattr(quote, "bid_size", 0) or 0)
+            ask_sz  = int(getattr(quote, "ask_size", 0) or 0)
+            iv      = float(getattr(snap, "implied_volatility", 0) or 0)
+
+            rows.append({
+                "strike":   strike,
+                "expiry":   expiry_str[:10],
+                "dte":      dte,
+                "bid":      round(bid, 3),
+                "ask":      round(ask, 3),
+                "spread":   round(ask - bid, 3),
+                "oi_proxy": bid_sz + ask_sz,
+                "iv":       round(iv, 4),
+            })
+        except Exception as e:
+            logger.debug("Skip %s: %s", symbol, e)
+            continue
+
+    logger.info("Liquid puts for %s: %d contracts (DTE %d-%d)",
+                underlying, len(rows), dte_min, dte_max)
+    return rows
+
+
 def get_option_positions() -> list:
     """Return all open option positions from Alpaca."""
     try:

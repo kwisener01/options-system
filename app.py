@@ -34,6 +34,10 @@ _lock = threading.Lock()
 _cache: dict = {"data": None, "ts": 0.0}
 CACHE_TTL = 300  # 5 minutes
 
+_scan_lock = threading.Lock()
+_scan_cache: dict = {"data": None, "ts": 0.0, "tier": None}
+SCAN_CACHE_TTL = 900  # 15 minutes
+
 
 # ── data fetching ──────────────────────────────────────────────────────────────
 
@@ -222,6 +226,97 @@ def api_slack():
         return jsonify({"ok": ok})
     except Exception as e:
         logger.exception("Slack post failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/bwb", methods=["POST"])
+def api_bwb():
+    try:
+        body = request.get_json(force=True)
+        from src.analysis.bwb_analyzer import BWBInputs, analyze
+
+        # Pull live GEX context so the user doesn't have to type it in
+        d  = get_data()
+        fc = d["spy"].get("full_chain") or {}
+
+        # Use explicitly supplied spot (for non-SPY tickers) or fall back to SPY
+        ticker = body.get("ticker", "SPY")
+        if "spot" in body and body["spot"]:
+            spot_price = float(body["spot"])
+        elif ticker.upper() in ("SPY", "XSP", "QQQ"):
+            spot_price = d[ticker.lower()]["spot"] if ticker.lower() in d else d["spy"]["spot"]
+        else:
+            spot_price = d["spy"]["spot"]  # use SPY as market proxy for individual stocks
+
+        inp = BWBInputs(
+            ticker       = ticker,
+            spot         = spot_price,
+            dte          = int(body["dte"]),
+            long_upper   = float(body["long_upper"]),
+            short_strike = float(body["short_strike"]),
+            long_lower   = float(body["long_lower"]),
+            credit       = float(body["credit"]),
+            regime       = fc.get("regime", "UNKNOWN"),
+            vix_now      = d["vix"]["now"],
+            vix_prev     = d["vix"]["prev"],
+            flip_level   = fc.get("flip_level", 0.0),
+            put_wall     = fc.get("put_wall", 0.0),
+            call_wall    = fc.get("call_wall", 0.0),
+            major_news   = bool(body.get("major_news", False)),
+        )
+        r = analyze(inp)
+
+        return jsonify({"ok": True, "result": {
+            "upper_wing":     r.upper_wing,
+            "lower_wing":     r.lower_wing,
+            "extra_risk":     r.extra_risk,
+            "max_profit_usd": r.max_profit_usd,
+            "max_loss_usd":   r.max_loss_usd,
+            "lower_breakeven":r.lower_breakeven,
+            "rr_ratio":       round(r.rr_ratio, 2),
+            "checks":         r.checks,
+            "setup_score":    r.setup_score,
+            "cs_max_risk_usd":r.cs_max_risk_usd,
+            "cs_credit_est":  r.cs_credit_est,
+            "bwb_vs_cs":      r.bwb_vs_cs,
+            "rating":         r.rating,
+            "main_risk":      r.main_risk,
+            "exit_plan":      r.exit_plan,
+            "overnight_ok":   r.overnight_ok,
+            "overnight_reason":r.overnight_reason,
+            "summary":        r.summary,
+            # echo back context used
+            "context": {
+                "spot":       d["spy"]["spot"],
+                "regime":     fc.get("regime"),
+                "flip_level": fc.get("flip_level"),
+                "put_wall":   fc.get("put_wall"),
+                "vix":        d["vix"]["now"],
+            },
+        }})
+    except KeyError as e:
+        return jsonify({"ok": False, "error": f"Missing field: {e}"}), 400
+    except Exception as e:
+        logger.exception("BWB analysis failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/bwb/scan", methods=["GET"])
+def api_bwb_scan():
+    tier  = request.args.get("tier", "low_risk")
+    force = request.args.get("force", "false").lower() == "true"
+    try:
+        with _scan_lock:
+            age = time.time() - _scan_cache["ts"]
+            if force or _scan_cache["data"] is None or age > SCAN_CACHE_TTL or _scan_cache["tier"] != tier:
+                logger.info("Running BWB scan tier=%s (force=%s age=%.0fs)", tier, force, age)
+                from src.analysis.bwb_scanner import scan
+                _scan_cache["data"] = scan(tier=tier)
+                _scan_cache["ts"]   = time.time()
+                _scan_cache["tier"] = tier
+        return jsonify({"ok": True, "tier": tier, "results": _scan_cache["data"]})
+    except Exception as e:
+        logger.exception("BWB scan failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
