@@ -38,6 +38,10 @@ _scan_lock = threading.Lock()
 _scan_cache: dict = {"data": None, "ts": 0.0, "tier": None}
 SCAN_CACHE_TTL = 900  # 15 minutes
 
+_wl_lock = threading.Lock()
+_wl_cache: dict = {"data": None, "ts": 0.0}
+WL_CACHE_TTL = 1800  # 30 minutes
+
 
 # ── data fetching ──────────────────────────────────────────────────────────────
 
@@ -305,6 +309,56 @@ def api_bwb():
         return jsonify({"ok": False, "error": f"Missing field: {e}"}), 400
     except Exception as e:
         logger.exception("BWB analysis failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/watchlist", methods=["GET"])
+def api_watchlist():
+    force = request.args.get("force", "false").lower() == "true"
+    try:
+        with _wl_lock:
+            age = time.time() - _wl_cache["ts"]
+            if force or _wl_cache["data"] is None or age > WL_CACHE_TTL:
+                logger.info("Running value watchlist scan (force=%s age=%.0fs)", force, age)
+                d   = get_data()
+                fc  = d["spy"].get("full_chain") or {}
+                from src.analysis.value_watchlist import scan_watchlist
+                _wl_cache["data"] = scan_watchlist(
+                    spy_regime = fc.get("regime", "UNKNOWN"),
+                    vix_now    = d["vix"]["now"],
+                    vix_prev   = d["vix"]["prev"],
+                )
+                _wl_cache["ts"] = time.time()
+        return jsonify({"ok": True, "signals": _wl_cache["data"],
+                        "timestamp": datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")})
+    except Exception as e:
+        logger.exception("Watchlist scan failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/watchlist/alert", methods=["POST"])
+def api_watchlist_alert():
+    """Post STRONG + WATCH signals to Slack."""
+    try:
+        d   = get_data()
+        fc  = d["spy"].get("full_chain") or {}
+        with _wl_lock:
+            signals = _wl_cache["data"]
+        if not signals:
+            from src.analysis.value_watchlist import scan_watchlist
+            signals = scan_watchlist(
+                spy_regime = fc.get("regime", "UNKNOWN"),
+                vix_now    = d["vix"]["now"],
+                vix_prev   = d["vix"]["prev"],
+            )
+        from src.analysis.value_watchlist import fmt_slack
+        from src.notifications.slack_notifier import send_message
+        ts  = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
+        msg = fmt_slack(signals, fc.get("regime", "UNKNOWN"), d["vix"]["now"], ts)
+        ok  = send_message(msg)
+        return jsonify({"ok": ok})
+    except Exception as e:
+        logger.exception("Watchlist alert failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 

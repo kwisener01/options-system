@@ -38,6 +38,9 @@
     <button onclick="refreshData()" class="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 rounded border border-gray-700 transition-colors">
       ↻ Refresh
     </button>
+    <button onclick="runWatchlist()" class="px-3 py-1 text-xs bg-emerald-700 hover:bg-emerald-600 rounded border border-emerald-500 transition-colors font-semibold">
+      📈 Watchlist
+    </button>
     <button onclick="openBWB()" class="px-3 py-1 text-xs bg-amber-700 hover:bg-amber-600 rounded border border-amber-500 transition-colors font-semibold">
       🦋 BWB
     </button>
@@ -127,6 +130,54 @@
     </div>
 
 </main>
+
+<!-- ── Value Watchlist Panel ── -->
+<div class="mx-4 mb-4 bg-gray-900 rounded-lg border border-gray-800 overflow-hidden">
+  <div class="px-4 py-3 bg-gray-800/50 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <span class="text-emerald-400 font-bold text-sm">📈 Value Watchlist</span>
+      <span class="text-gray-600 text-xs">Own Now · Own Lower</span>
+    </div>
+    <div class="flex items-center gap-3">
+      <span id="wl-ts" class="text-gray-600 text-xs"></span>
+      <button onclick="runWatchlist(true)"
+        class="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 rounded border border-gray-700 transition-colors">
+        ↻ Re-scan
+      </button>
+      <button id="wl-slack-btn" onclick="sendWatchlistSlack()"
+        class="px-3 py-1 text-xs bg-indigo-700 hover:bg-indigo-600 rounded border border-indigo-500 transition-colors font-semibold">
+        → Slack
+      </button>
+    </div>
+  </div>
+
+  <div id="wl-loading" class="hidden text-center py-8 text-gray-500 text-sm">
+    <div class="pulse inline-block mr-2">⟳</div>Scanning watchlist…
+  </div>
+
+  <div id="wl-results" class="hidden overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="border-b border-gray-800 text-gray-500 text-xs uppercase tracking-wider">
+          <th class="text-left px-4 py-2">Ticker</th>
+          <th class="text-left px-3 py-2">Label</th>
+          <th class="text-right px-3 py-2">Price</th>
+          <th class="text-right px-3 py-2">Chg</th>
+          <th class="text-right px-3 py-2">vs 200MA</th>
+          <th class="text-center px-3 py-2">RSI</th>
+          <th class="text-center px-3 py-2">Put Wall</th>
+          <th class="text-center px-3 py-2">Earnings</th>
+          <th class="text-center px-3 py-2">Signal</th>
+        </tr>
+      </thead>
+      <tbody id="wl-tbody"></tbody>
+    </table>
+  </div>
+
+  <div id="wl-empty" class="text-center py-6 text-gray-600 text-xs">
+    Click <strong class="text-emerald-500">📈 Watchlist</strong> to scan for buy signals.
+  </div>
+</div>
 
 <!-- ── Slack toast ── -->
 <div id="toast" class="hidden fixed bottom-6 right-6 px-4 py-2 rounded-lg text-sm font-semibold shadow-lg transition-all"></div>
@@ -939,6 +990,121 @@ function prefillBWB(r) {
 
   $('bwb-modal').classList.remove('hidden');
   $('bwb-results').classList.add('hidden');
+}
+
+// ── Value Watchlist ───────────────────────────────────────────────────────────
+
+async function runWatchlist(force = false) {
+  $('wl-loading').classList.remove('hidden');
+  $('wl-results').classList.add('hidden');
+  $('wl-empty').classList.add('hidden');
+  try {
+    const url  = `/api/watchlist${force ? '?force=true' : ''}`;
+    const resp = await fetch(url);
+    const json = await resp.json();
+    if (!json.ok) throw new Error(json.error || 'Scan failed');
+    renderWatchlist(json.signals);
+    const ts = $('wl-ts');
+    if (ts) ts.textContent = `Updated: ${new Date().toLocaleTimeString()}`;
+  } catch(err) {
+    showToast('Watchlist error: ' + err.message, false);
+    $('wl-empty').classList.remove('hidden');
+    $('wl-empty').textContent = 'Scan failed: ' + err.message;
+  } finally {
+    $('wl-loading').classList.add('hidden');
+  }
+}
+
+async function sendWatchlistSlack() {
+  const btn = $('wl-slack-btn');
+  btn.disabled = true; btn.textContent = 'Sending…';
+  try {
+    const resp = await fetch('/api/watchlist/alert', { method: 'POST' });
+    const json = await resp.json();
+    showToast(json.ok ? '✓ Watchlist sent to Slack' : '✗ ' + json.error, json.ok);
+  } catch(err) {
+    showToast('✗ ' + err.message, false);
+  } finally {
+    btn.disabled = false; btn.textContent = '→ Slack';
+  }
+}
+
+function signalBadgeWL(signal, score) {
+  const cfg = {
+    STRONG: 'bg-green-900/70 text-green-300 border-green-700',
+    WATCH:  'bg-amber-900/70 text-amber-300 border-amber-700',
+    NONE:   'bg-gray-800 text-gray-500 border-gray-700',
+  };
+  const icon = signal === 'STRONG' ? '★' : signal === 'WATCH' ? '👀' : '—';
+  return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-bold border ${cfg[signal] || cfg.NONE}">
+    ${icon} ${signal} ${score}/9
+  </span>`;
+}
+
+function rsiColor(rsi) {
+  if (rsi === null || rsi === undefined) return 'text-gray-600';
+  if (rsi < 35)  return 'text-green-400 font-bold';
+  if (rsi < 50)  return 'text-green-300';
+  if (rsi < 65)  return 'text-gray-300';
+  return 'text-red-400';
+}
+
+function maColor(pct) {
+  if (pct === null || pct === undefined) return 'text-gray-600';
+  if (pct < 0)   return 'text-red-400';
+  if (pct <= 5)  return 'text-green-400';
+  if (pct <= 12) return 'text-green-300';
+  return 'text-amber-400';  // extended
+}
+
+function wlEarningsBadge(s) {
+  if (!s.earnings_date) return '<span class="text-gray-700 text-xs">—</span>';
+  if (!s.earnings_clear) {
+    return `<span class="text-red-400 text-xs font-bold" title="${s.earnings_date}">
+      ⚠ ${s.earnings_days_out}d
+    </span>`;
+  }
+  return `<span class="text-gray-500 text-xs" title="${s.earnings_date}">${s.earnings_days_out}d</span>`;
+}
+
+function renderWatchlist(signals) {
+  const tbody = $('wl-tbody');
+  if (!tbody || !signals?.length) {
+    $('wl-empty').classList.remove('hidden');
+    return;
+  }
+  $('wl-results').classList.remove('hidden');
+
+  tbody.innerHTML = signals.map(s => {
+    const chgCls  = s.change_pct >= 0 ? 'text-green-400' : 'text-red-400';
+    const chgStr  = (s.change_pct >= 0 ? '+' : '') + fmt(s.change_pct) + '%';
+    const pwStr   = s.put_wall ? `$${fmt(s.put_wall, 0)}` : '—';
+    const maPct   = s.pct_above_ma200;
+    const maPctStr = maPct !== null && maPct !== undefined
+      ? `<span class="${maColor(maPct)}">${maPct >= 0 ? '+' : ''}${fmt(maPct)}%</span>`
+      : '<span class="text-gray-600">—</span>';
+    const rsiStr  = s.rsi !== null && s.rsi !== undefined
+      ? `<span class="${rsiColor(s.rsi)}">${s.rsi}</span>` : '<span class="text-gray-600">—</span>';
+    const labelCls = s.label === 'own_now' ? 'text-emerald-400' : 'text-sky-400';
+    const labelStr = s.label === 'own_now' ? 'Own Now' : 'Own Lower';
+
+    // Tooltip: reasons + blockers
+    const tipLines = [...(s.reasons||[]).map(r=>`✓ ${r}`), ...(s.blockers||[]).map(b=>`✗ ${b}`)];
+    const tip = tipLines.join('\n');
+
+    return `
+      <tr class="border-b border-gray-800/50 hover:bg-gray-800/20 cursor-default" title="${tip.replace(/"/g,"'")}">
+        <td class="px-4 py-2.5 font-bold text-white">${s.ticker}</td>
+        <td class="px-3 py-2.5 text-xs ${labelCls}">${labelStr}</td>
+        <td class="px-3 py-2.5 text-right font-semibold text-white">$${fmt(s.spot)}</td>
+        <td class="px-3 py-2.5 text-right text-xs ${chgCls}">${chgStr}</td>
+        <td class="px-3 py-2.5 text-right text-xs">${maPctStr}</td>
+        <td class="px-3 py-2.5 text-center text-xs">${rsiStr}</td>
+        <td class="px-3 py-2.5 text-center text-xs text-gray-400">${pwStr}</td>
+        <td class="px-3 py-2.5 text-center">${wlEarningsBadge(s)}</td>
+        <td class="px-3 py-2.5 text-center">${signalBadgeWL(s.signal, s.score)}</td>
+      </tr>`;
+  }).join('');
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
