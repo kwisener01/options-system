@@ -14,6 +14,7 @@ Liquidity criteria (per user spec):
 """
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import date, datetime
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,44 @@ def _fetch_spots(tickers: list[str]) -> dict[str, tuple[float, float]]:
                       float(meta["chartPreviousClose"]))
         except Exception as e:
             logger.warning("Spot fetch failed for %s: %s", t, e)
+    return out
+
+
+def _fetch_earnings_dates(tickers: list[str]) -> dict[str, Optional[date]]:
+    """
+    Return {ticker: next_earnings_date | None} via Yahoo Finance v10 calendarEvents.
+    Runs tickers in parallel. Returns None for ETFs or fetch failures.
+    """
+    import urllib3
+    import requests as _req
+    urllib3.disable_warnings()
+
+    def _one(ticker: str) -> tuple[str, Optional[date]]:
+        try:
+            url = (f"https://query1.finance.yahoo.com/v10/finance/quoteSummary/{ticker}"
+                   f"?modules=calendarEvents")
+            resp = _req.get(url, headers={"User-Agent": "Mozilla/5.0"},
+                            timeout=12, verify=False).json()
+            result = (resp.get("quoteSummary", {}).get("result") or [])
+            if not result:
+                return ticker, None
+            dates = (result[0].get("calendarEvents", {})
+                               .get("earnings", {})
+                               .get("earningsDate", []))
+            # Yahoo returns a range; take the first timestamp (earliest estimate)
+            if dates:
+                ts = dates[0].get("raw")
+                if ts:
+                    return ticker, datetime.utcfromtimestamp(ts).date()
+            return ticker, None
+        except Exception as e:
+            logger.debug("Earnings fetch failed for %s: %s", ticker, e)
+            return ticker, None
+
+    out: dict[str, Optional[date]] = {}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        for ticker, dt in ex.map(_one, tickers):
+            out[ticker] = dt
     return out
 
 
@@ -157,7 +196,8 @@ def _compute_gex_context(spot: float, vix_now: float, vix_prev: float,
 
 
 def _scan_one(ticker: str, spot: float, prev: float, tier: str,
-              vix_now: float = 0.0, vix_prev: float = 0.0) -> dict:
+              vix_now: float = 0.0, vix_prev: float = 0.0,
+              earnings_date: Optional[date] = None) -> dict:
     """Full BWB screen + per-stock GEX for a single ticker."""
     result: dict = {
         "ticker":      ticker,
@@ -197,13 +237,31 @@ def _scan_one(ticker: str, spot: float, prev: float, tier: str,
         result["candidate"]   = candidate
         result["gex_context"] = gex_ctx
 
+        # Earnings check: flag if earnings fall within the option's DTE window
+        today = date.today()
+        if earnings_date is not None:
+            days_to_earnings = (earnings_date - today).days
+            earnings_within_dte = 0 <= days_to_earnings <= candidate["dte"]
+            candidate["earnings_date"]    = str(earnings_date)
+            candidate["earnings_days_out"] = days_to_earnings
+            candidate["earnings_warning"] = earnings_within_dte
+        else:
+            candidate["earnings_date"]     = None
+            candidate["earnings_days_out"] = None
+            candidate["earnings_warning"]  = None  # unknown — treat as caution
+
         h, m, l = (candidate["long_upper"], candidate["short_strike"],
                    candidate["long_lower"])
         regime_str = (f"  [{gex_ctx['regime'].replace('_GAMMA','').lower()} γ]"
                       if gex_ctx else "  [no GEX]")
+        earn_str   = ""
+        if candidate["earnings_warning"] is True:
+            earn_str = f"  ⚠ EARNS {earnings_date}"
+        elif candidate["earnings_warning"] is None:
+            earn_str = "  [earns?]"
         result["note"] = (
             f"{h:.0f}/{m:.0f}/{l:.0f}  DTE {candidate['dte']}  "
-            f"liq {candidate['liq_score']}/10{regime_str}"
+            f"liq {candidate['liq_score']}/10{regime_str}{earn_str}"
         )
 
     except Exception as e:
@@ -234,7 +292,14 @@ def scan(tickers: list[str] = None, tier: str = "low_risk",
     tier_map = {t: k for k, ts in BWB_UNIVERSE.items() for t in ts}
 
     logger.info("BWB scan: %d tickers (%s)  VIX %.2f", len(tickers), tier, vix_now)
-    spots = _fetch_spots(tickers)
+
+    # Fetch spots and earnings dates in parallel before launching chain scans
+    with ThreadPoolExecutor(max_workers=2) as pre:
+        spots_future    = pre.submit(_fetch_spots, tickers)
+        earnings_future = pre.submit(_fetch_earnings_dates, tickers)
+    spots         = spots_future.result()
+    earnings_dates = earnings_future.result()
+    logger.info("Earnings dates: %s", {t: str(d) for t, d in earnings_dates.items() if d})
 
     results: list[dict] = []
     with ThreadPoolExecutor(max_workers=4) as ex:
@@ -247,6 +312,7 @@ def scan(tickers: list[str] = None, tier: str = "low_risk",
                 tier_map.get(ticker, tier),
                 vix_now,
                 vix_prev,
+                earnings_dates.get(ticker),
             ): ticker
             for ticker in tickers
             if ticker in spots
@@ -264,6 +330,7 @@ def scan(tickers: list[str] = None, tier: str = "low_risk",
                 "change_pct": 0.0, "tier": tier_map.get(t, tier),
                 "price_ok": False, "candidate": None, "gex_context": None,
                 "note": "Price fetch failed", "error": "no price data",
+                "earnings_date": str(earnings_dates.get(t)) if earnings_dates.get(t) else None,
             })
 
     results.sort(key=lambda r: (r["candidate"] is None, r["ticker"]))

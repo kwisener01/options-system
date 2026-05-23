@@ -817,6 +817,23 @@ async function runScan(tier = 'low_risk', force = false) {
   }
 }
 
+function earningsBadge(c) {
+  if (!c) return '';
+  if (c.earnings_warning === true) {
+    return `<span class="ml-2 px-1.5 py-0.5 rounded text-xs font-bold bg-red-900/60 text-red-300 border border-red-700"
+      title="Earnings ${c.earnings_date} — ${c.earnings_days_out}d away, within DTE window">
+      ⚠ EARNS ${c.earnings_date || ''}
+    </span>`;
+  }
+  if (c.earnings_warning === false) {
+    return `<span class="ml-2 text-xs text-gray-600" title="Next earnings: ${c.earnings_date} (${c.earnings_days_out}d — outside DTE window)">
+      earns ${c.earnings_date}
+    </span>`;
+  }
+  // null = unknown
+  return `<span class="ml-2 text-xs text-gray-700" title="Earnings date unknown">earns?</span>`;
+}
+
 function liqDots(score) {
   const n = Math.min(Math.max(score || 0, 0), 10);
   const filled = Math.round(n / 2);  // out of 5 dots
@@ -878,6 +895,7 @@ function renderScanResults(results) {
           ${r.gex_context ? `<span class="ml-2 text-xs font-semibold ${r.gex_context.regime?.includes('NEGATIVE') ? 'text-red-400' : 'text-green-400'}">
             ${r.gex_context.regime?.includes('NEGATIVE') ? '▼γ' : '▲γ'}
           </span>` : ''}
+          ${earningsBadge(c)}
         </td>
         <td class="px-3 py-2.5 text-center">
           <span class="font-mono text-xs ${liqColor(c.liq_score)}" title="Liquidity score ${c.liq_score}/10">${liqDots(c.liq_score)}</span>
@@ -901,8 +919,9 @@ function prefillBWB(r) {
   $('bwb-long-upper').value  = c.long_upper;
   $('bwb-short').value       = c.short_strike;
   $('bwb-long-lower').value  = c.long_lower;
-  $('bwb-credit').value      = '';  // user must enter actual credit
-  $('bwb-news').checked      = false;
+  $('bwb-credit').value  = '';  // user must enter actual credit
+  // Auto-check major news if earnings fall within the DTE window
+  $('bwb-news').checked  = c.earnings_warning === true;
 
   // Update context strip with ticker's spot (not SPY)
   const fc = gexData?.spy?.full_chain || {};
