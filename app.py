@@ -248,6 +248,10 @@ def api_bwb():
         else:
             spot_price = d["spy"]["spot"]  # use SPY as market proxy for individual stocks
 
+        # Use per-stock GEX context if the scanner computed it; fall back to SPY
+        stock_gex = body.get("gex_context") or {}
+        gex_src   = stock_gex if stock_gex else fc  # fc = SPY full-chain GEX
+
         inp = BWBInputs(
             ticker       = ticker,
             spot         = spot_price,
@@ -256,12 +260,12 @@ def api_bwb():
             short_strike = float(body["short_strike"]),
             long_lower   = float(body["long_lower"]),
             credit       = float(body["credit"]),
-            regime       = fc.get("regime", "UNKNOWN"),
+            regime       = gex_src.get("regime", "UNKNOWN"),
             vix_now      = d["vix"]["now"],
             vix_prev     = d["vix"]["prev"],
-            flip_level   = fc.get("flip_level", 0.0),
-            put_wall     = fc.get("put_wall", 0.0),
-            call_wall    = fc.get("call_wall", 0.0),
+            flip_level   = gex_src.get("flip_level", 0.0),
+            put_wall     = gex_src.get("put_wall", 0.0),
+            call_wall    = gex_src.get("call_wall", 0.0),
             major_news   = bool(body.get("major_news", False)),
         )
         r = analyze(inp)
@@ -287,11 +291,14 @@ def api_bwb():
             "summary":        r.summary,
             # echo back context used
             "context": {
-                "spot":       d["spy"]["spot"],
-                "regime":     fc.get("regime"),
-                "flip_level": fc.get("flip_level"),
-                "put_wall":   fc.get("put_wall"),
+                "spot":       spot_price,
+                "regime":     gex_src.get("regime"),
+                "flip_level": gex_src.get("flip_level"),
+                "put_wall":   gex_src.get("put_wall"),
+                "vanna":      gex_src.get("vanna_signal"),
+                "charm":      gex_src.get("charm_signal"),
                 "vix":        d["vix"]["now"],
+                "gex_source": "stock" if stock_gex else "SPY",
             },
         }})
     except KeyError as e:
@@ -311,7 +318,10 @@ def api_bwb_scan():
             if force or _scan_cache["data"] is None or age > SCAN_CACHE_TTL or _scan_cache["tier"] != tier:
                 logger.info("Running BWB scan tier=%s (force=%s age=%.0fs)", tier, force, age)
                 from src.analysis.bwb_scanner import scan
-                _scan_cache["data"] = scan(tier=tier)
+                vix = get_data()["vix"]
+                _scan_cache["data"] = scan(tier=tier,
+                                           vix_now=vix["now"],
+                                           vix_prev=vix["prev"])
                 _scan_cache["ts"]   = time.time()
                 _scan_cache["tier"] = tier
         return jsonify({"ok": True, "tier": tier, "results": _scan_cache["data"]})

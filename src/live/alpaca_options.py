@@ -332,60 +332,60 @@ def fetch_chain_for_gex(underlying: str = "SPY",
     return rows
 
 
-def fetch_puts_liquid(underlying: str, spot: float,
-                      dte_min: int = 7, dte_max: int = 35) -> list[dict]:
+def fetch_chain_combined(underlying: str, spot: float,
+                         dte_min: int = 7, dte_max: int = 60) -> dict:
     """
-    Fetch put options with bid/ask data for BWB screening.
-    Returns: [{strike, expiry, dte, bid, ask, spread, oi_proxy, iv}, ...]
-    Type position is derived from symbol length (robust for any root length).
+    Single Alpaca chain fetch returning two views from one API call:
+      'gex_contracts': [{strike, oi, iv, T, is_call}]  — for compute_exposures()
+      'puts_liquid':   [{strike, expiry, dte, bid, ask, spread, oi_proxy, iv}]
+    Type position derived from len(symbol)-9; works for any root length.
     """
     from datetime import date as _date
 
+    empty: dict = {"gex_contracts": [], "puts_liquid": []}
     try:
         from alpaca.data.requests import OptionChainRequest
     except ImportError:
         logger.warning("OptionChainRequest not available")
-        return []
+        return empty
 
     today = _date.today()
-    rows: list[dict] = []
+    gex_rows: list[dict] = []
+    put_rows: list[dict] = []
 
     try:
         req = OptionChainRequest(underlying_symbol=underlying, feed="indicative")
         chain: dict = _data().get_option_chain(req)
     except Exception as e:
         logger.warning("Chain fetch failed for %s: %s", underlying, e)
-        return []
+        return empty
 
     for symbol, snap in chain.items():
         try:
-            # Type is always at len(symbol) - 9 in OCC format
             type_pos = len(symbol) - 9
             if type_pos < 0 or symbol[type_pos] not in ("C", "P"):
                 continue
-            if symbol[type_pos] != "P":  # puts only
-                continue
+            is_put  = symbol[type_pos] == "P"
+            is_call = not is_put
 
-            # Strike from last 8 digits
             try:
                 strike = int(symbol[-8:]) / 1000.0
             except Exception:
                 continue
 
-            # Filter to ±15% OTM (puts below spot)
-            if spot and not (spot * 0.84 <= strike <= spot * 0.995):
+            # GEX uses ±10%; scanner puts need 0.5–16% OTM below spot
+            if spot and not (spot * 0.90 <= strike <= spot * 1.10):
                 continue
 
-            # Expiry from contract details or symbol (6 chars before type)
-            contract = getattr(snap, "contract_details", None) or getattr(snap, "details", None)
+            contract = (getattr(snap, "contract_details", None)
+                        or getattr(snap, "details", None))
             expiry_str = ""
             if contract:
                 expiry_str = str(getattr(contract, "expiration_date", "") or "")
             if not expiry_str:
-                # OCC: ROOT + YYMMDD + TYPE + STRIKE; date starts at type_pos-6
                 try:
                     d_start = type_pos - 6
-                    raw = symbol[d_start:type_pos]  # 6 digit YYMMDD
+                    raw = symbol[d_start:type_pos]
                     expiry_str = f"20{raw[0:2]}-{raw[2:4]}-{raw[4:6]}"
                 except Exception:
                     continue
@@ -393,42 +393,58 @@ def fetch_puts_liquid(underlying: str, spot: float,
             try:
                 expiry_date = _date.fromisoformat(expiry_str[:10])
                 dte = (expiry_date - today).days
+                T   = max(dte, 0) / 365
             except Exception:
                 continue
 
-            if not (dte_min <= dte <= dte_max):
+            if dte < 0 or dte > 60:
                 continue
 
-            # Bid/ask
-            quote = getattr(snap, "latest_quote", None)
-            if not quote:
-                continue
-            bid = float(getattr(quote, "bid_price", 0) or 0)
-            ask = float(getattr(quote, "ask_price", 0) or 0)
-            if bid <= 0 or ask <= 0:
+            iv = float(getattr(snap, "implied_volatility", 0) or 0)
+            greeks = getattr(snap, "greeks", None)
+            if not iv and greeks:
+                iv = float(getattr(greeks, "implied_volatility", 0) or 0)
+            if iv < 0.01:
                 continue
 
-            bid_sz  = int(getattr(quote, "bid_size", 0) or 0)
-            ask_sz  = int(getattr(quote, "ask_size", 0) or 0)
-            iv      = float(getattr(snap, "implied_volatility", 0) or 0)
+            quote   = getattr(snap, "latest_quote", None)
+            oi      = 0
+            bid_sz  = ask_sz = 0
+            if contract:
+                oi = int(getattr(contract, "open_interest", 0) or 0)
+            if quote:
+                bid_sz = int(getattr(quote, "bid_size", 0) or 0)
+                ask_sz = int(getattr(quote, "ask_size", 0) or 0)
+                if oi < 10:
+                    oi = bid_sz + ask_sz
+            if oi < 5:
+                continue
 
-            rows.append({
-                "strike":   strike,
-                "expiry":   expiry_str[:10],
-                "dte":      dte,
-                "bid":      round(bid, 3),
-                "ask":      round(ask, 3),
-                "spread":   round(ask - bid, 3),
-                "oi_proxy": bid_sz + ask_sz,
-                "iv":       round(iv, 4),
-            })
+            gex_rows.append(dict(strike=strike, oi=oi, iv=iv, T=T, is_call=is_call))
+
+            if (is_put and dte_min <= dte <= dte_max
+                    and spot * 0.84 <= strike <= spot * 0.995
+                    and quote):
+                bid = float(getattr(quote, "bid_price", 0) or 0)
+                ask = float(getattr(quote, "ask_price", 0) or 0)
+                if bid > 0 and ask > 0:
+                    put_rows.append({
+                        "strike":   strike,
+                        "expiry":   expiry_str[:10],
+                        "dte":      dte,
+                        "bid":      round(bid, 3),
+                        "ask":      round(ask, 3),
+                        "spread":   round(ask - bid, 3),
+                        "oi_proxy": bid_sz + ask_sz,
+                        "iv":       round(iv, 4),
+                    })
         except Exception as e:
             logger.debug("Skip %s: %s", symbol, e)
             continue
 
-    logger.info("Liquid puts for %s: %d contracts (DTE %d-%d)",
-                underlying, len(rows), dte_min, dte_max)
-    return rows
+    logger.info("Combined chain %s: %d GEX contracts, %d liquid puts (DTE %d-%d)",
+                underlying, len(gex_rows), len(put_rows), dte_min, dte_max)
+    return {"gex_contracts": gex_rows, "puts_liquid": put_rows}
 
 
 def get_option_positions() -> list:

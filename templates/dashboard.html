@@ -620,7 +620,8 @@ function showToast(msg, ok) {
 function openBWB() {
   $('bwb-modal').classList.remove('hidden');
   $('bwb-results').classList.add('hidden');
-  delete $('bwb-modal').dataset.spot;  // clear any scanner-prefilled spot
+  delete $('bwb-modal').dataset.spot;       // clear any scanner-prefilled spot
+  delete $('bwb-modal').dataset.gexContext; // clear per-stock GEX (use SPY fallback)
   // populate context strip from live data
   if (gexData) {
     const fc  = gexData.spy?.full_chain || {};
@@ -652,10 +653,13 @@ $('bwb-modal').addEventListener('click', e => {
 });
 
 async function analyzeBWB() {
-  const storedSpot = parseFloat($('bwb-modal').dataset.spot || '0') || null;
+  const storedSpot   = parseFloat($('bwb-modal').dataset.spot || '0') || null;
+  const storedGex    = $('bwb-modal').dataset.gexContext || '';
+  const gexContextObj = storedGex ? JSON.parse(storedGex) : null;
   const payload = {
     ticker:      $('bwb-ticker').value.toUpperCase(),
     spot:        storedSpot,
+    gex_context: gexContextObj,
     dte:         parseInt($('bwb-dte').value),
     long_upper:  parseFloat($('bwb-long-upper').value),
     short_strike:parseFloat($('bwb-short').value),
@@ -723,13 +727,20 @@ function renderBWBResult(r) {
 
   // Context used
   const ctx = r.context || {};
+  const gexSrc  = ctx.gex_source === 'stock' ? ctx.regime?.split('_')[0] || 'stock' : 'SPY';
+  const srcBadge = ctx.gex_source === 'stock'
+    ? `<span class="text-green-400 text-xs font-semibold">★ stock GEX</span>`
+    : `<span class="text-gray-500 text-xs">SPY proxy</span>`;
   $('bwb-ctx-used').innerHTML = [
-    ['SPY spot',   `$${(ctx.spot||0).toFixed(2)}`],
+    ['Source',     srcBadge],
+    ['Spot used',  `$${(ctx.spot||0).toFixed(2)}`],
     ['Flip level', `$${(ctx.flip_level||0).toFixed(0)}`],
     ['Put wall',   `$${(ctx.put_wall||0).toFixed(0)}`],
-    ['VIX',        (ctx.vix||0).toFixed(2)],
     ['Regime',     ctx.regime || '—'],
-    ['vs CS est.', `CS max risk ~$${r.cs_max_risk_usd.toFixed(0)}`],
+    ['Vanna',      ctx.vanna || '—'],
+    ['Charm',      ctx.charm || '—'],
+    ['VIX',        (ctx.vix||0).toFixed(2)],
+    ['vs CS est.', `~$${r.cs_max_risk_usd.toFixed(0)} max risk`],
   ].map(([k, v]) =>
     `<div class="flex justify-between gap-4"><span class="text-gray-500">${k}</span><span class="text-gray-300">${v}</span></div>`
   ).join('');
@@ -864,6 +875,9 @@ function renderScanResults(results) {
             ${fmt(c.long_upper,0)}/${fmt(c.short_strike,0)}/${fmt(c.long_lower,0)}
           </span>
           <span class="text-gray-500 text-xs ml-2">${c.dte}DTE · wing ${c.upper_wing}/${c.lower_wing}</span>
+          ${r.gex_context ? `<span class="ml-2 text-xs font-semibold ${r.gex_context.regime?.includes('NEGATIVE') ? 'text-red-400' : 'text-green-400'}">
+            ${r.gex_context.regime?.includes('NEGATIVE') ? '▼γ' : '▲γ'}
+          </span>` : ''}
         </td>
         <td class="px-3 py-2.5 text-center">
           <span class="font-mono text-xs ${liqColor(c.liq_score)}" title="Liquidity score ${c.liq_score}/10">${liqDots(c.liq_score)}</span>
@@ -900,8 +914,9 @@ function prefillBWB(r) {
     <span class="${fc.regime?.includes('NEGATIVE') ? 'text-red-400' : 'text-green-400'}">${fc.regime || '—'}</span>
     <span class="text-gray-500">Enter credit/debit below</span>`;
 
-  // Store spot on the form so /api/bwb uses it
-  $('bwb-modal').dataset.spot = r.spot;
+  // Store spot + per-stock GEX on the form so /api/bwb uses them
+  $('bwb-modal').dataset.spot       = r.spot;
+  $('bwb-modal').dataset.gexContext = r.gex_context ? JSON.stringify(r.gex_context) : '';
 
   $('bwb-modal').classList.remove('hidden');
   $('bwb-results').classList.add('hidden');
