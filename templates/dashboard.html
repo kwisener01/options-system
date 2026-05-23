@@ -553,12 +553,10 @@ function renderTrade(t) {
                     : tr.rating === 'Acceptable' ? 'text-blue-400'
                     : tr.rating ? 'text-orange-400' : '';
 
-    // Side badge color
-    const sideCls = tr.side === 'call'
-      ? 'bg-blue-900/40 text-blue-300 border-blue-700'
-      : 'bg-purple-900/40 text-purple-300 border-purple-700';
+    const sideCls = tr.side === 'call' ? 'bg-blue-900/40 text-blue-300 border-blue-700'
+                  : tr.side === 'both' ? 'bg-violet-900/40 text-violet-300 border-violet-700'
+                  : 'bg-purple-900/40 text-purple-300 border-purple-700';
 
-    // Legs rows
     const legRows = (tr.legs || []).map(lg => {
       const qty    = lg.qty ? `×${lg.qty} ` : '';
       const isSell = lg.action === 'SELL';
@@ -570,6 +568,46 @@ function renderTrade(t) {
       </div>`;
     }).join('');
 
+    // ── Batman payoff strip (Double BWB only) ─────────────────────────────
+    let batmanStrip = '';
+    if (tr.type === 'Double BWB') {
+      const pl = tr.put_strikes || [];
+      const cl = tr.call_strikes || [];
+      const pLoss  = tr.put_flat_loss_usd  != null ? Math.round(tr.put_flat_loss_usd)  : '?';
+      const cLoss  = tr.call_flat_loss_usd != null ? Math.round(tr.call_flat_loss_usd) : '?';
+      const mid$   = tr.middle_profit_usd  != null ? Math.round(tr.middle_profit_usd)  : '?';
+      const pPeak  = tr.put_peak_profit_usd  != null ? Math.round(tr.put_peak_profit_usd)  : '?';
+      const cPeak  = tr.call_peak_profit_usd != null ? Math.round(tr.call_peak_profit_usd) : '?';
+      const pBE    = tr.put_lower_breakeven  != null ? tr.put_lower_breakeven  : '?';
+      const cBE    = tr.call_upper_breakeven != null ? tr.call_upper_breakeven : '?';
+      batmanStrip = `
+        <div class="mt-2 mb-1">
+          <div class="text-gray-500 text-xs mb-1 uppercase tracking-wider">Payoff zones at expiry</div>
+          <div class="flex text-xs font-mono rounded overflow-hidden border border-gray-700">
+            <div class="bg-red-950/60 text-red-400 px-1.5 py-1 text-center flex-none" style="min-width:3.5rem">
+              <div class="font-bold">${pLoss < 0 ? pLoss : '+'+pLoss}</div>
+              <div class="text-gray-600" style="font-size:0.6rem">below<br>${pl[0]||'?'}</div>
+            </div>
+            <div class="bg-amber-950/40 text-amber-300 px-1.5 py-1 text-center flex-none" style="min-width:3.5rem">
+              <div class="font-bold">+${pPeak}</div>
+              <div class="text-gray-600" style="font-size:0.6rem">put<br>peak ${pl[1]||'?'}</div>
+            </div>
+            <div class="bg-green-950/60 text-green-300 px-2 py-1 text-center flex-1 border-x border-green-800">
+              <div class="font-bold text-green-400">+${mid$}  ▒▒ MIDDLE ▒▒</div>
+              <div class="text-gray-500" style="font-size:0.6rem">${pl[2]||'?'} — ${cl[0]||'?'}  ·  BE ${pBE}–${cBE}</div>
+            </div>
+            <div class="bg-amber-950/40 text-amber-300 px-1.5 py-1 text-center flex-none" style="min-width:3.5rem">
+              <div class="font-bold">+${cPeak}</div>
+              <div class="text-gray-600" style="font-size:0.6rem">call<br>peak ${cl[1]||'?'}</div>
+            </div>
+            <div class="bg-red-950/60 text-red-400 px-1.5 py-1 text-center flex-none" style="min-width:3.5rem">
+              <div class="font-bold">${cLoss < 0 ? cLoss : '+'+cLoss}</div>
+              <div class="text-gray-600" style="font-size:0.6rem">above<br>${cl[2]||'?'}</div>
+            </div>
+          </div>
+        </div>`;
+    }
+
     return `
       <div class="bg-gray-800/50 rounded-lg border ${border} p-3 flex flex-col gap-0.5">
         <div class="flex items-center gap-2 mb-2 flex-wrap">
@@ -579,12 +617,14 @@ function renderTrade(t) {
           <span class="ml-auto text-gray-500 text-xs">${t.expiry || ''}  ${t.dte || '?'}DTE</span>
         </div>
         <div class="mb-1">${legRows}</div>
+        ${batmanStrip}
         <div class="border-t border-gray-700 pt-1 mt-0.5">
           ${row(crLabel, crStr, crCls)}
-          ${tr.max_profit_usd != null ? row('Max Profit', `$${Math.round(tr.max_profit_usd)}`, 'text-green-400') : ''}
+          ${tr.type === 'Double BWB' ? row('Middle profit', `$${Math.round(tr.middle_profit_usd||0)}  (${tr.middle_width||'?'}pt wide)`, 'text-green-400') : ''}
+          ${tr.max_profit_usd != null ? row(tr.type === 'Double BWB' ? 'Peak profit (at short)' : 'Max Profit', `$${Math.round(tr.max_profit_usd)}`, 'text-green-400') : ''}
           ${tr.max_risk_usd   != null ? row('Max Risk',   `$${Math.round(tr.max_risk_usd)}`,   'text-red-400')   : ''}
           ${tr.rr_ratio       != null ? row('R:R', `${tr.rr_ratio}×`) : ''}
-          ${tr.lower_breakeven != null ? row('Lower B/E', `$${tr.lower_breakeven}`) : ''}
+          ${tr.lower_breakeven != null && tr.type !== 'Double BWB' ? row('Lower B/E', `$${tr.lower_breakeven}`) : ''}
           ${tr.rating ? `<div class="flex justify-between text-xs py-0.5">
             <span class="text-gray-500">Rating</span>
             <span class="${ratingCls} font-bold">${tr.rating}${tr.score != null ? '  (' + tr.score + '/10)' : ''}</span>

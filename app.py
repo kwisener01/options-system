@@ -287,6 +287,70 @@ def _live_trade_impl(spy: dict, vix_now: float, vix_prev: float) -> dict:
                 "rating": None, "score": None, "lower_breakeven": None, "exit_plan": None,
             })
 
+    # ── DOUBLE BWB (Batman) — positive gamma, spot comfortably between walls ──
+
+    if not bearish and not breakout and put_mids and call_mids:
+        from src.analysis.bwb_analyzer import DoubleBWBInputs, analyze_double_bwb
+
+        # GEX-anchored strikes: put short at put wall, call short at call wall
+        mp_s, mp_mid = nearest_put(round(put_wall))
+        hp_s, hp_mid = nearest_put(mp_s + 5)
+        lp_s, lp_mid = nearest_put(mp_s - 10)
+        mc_s, mc_mid = nearest_call(round(call_wall))
+        lc_s, lc_mid = nearest_call(mc_s - 5)
+        hc_s, hc_mid = nearest_call(mc_s + 10)
+
+        dbwb_put_credit  = round(mp_mid * 2 - hp_mid - lp_mid, 2)
+        dbwb_call_credit = round(mc_mid * 2 - lc_mid - hc_mid, 2)
+        dbwb_total       = round(dbwb_put_credit + dbwb_call_credit, 2)
+        dbwb_mid_width   = lc_s - hp_s
+
+        if dbwb_put_credit > 0 and dbwb_call_credit > 0 and dbwb_total > 0 and dbwb_mid_width >= 8:
+            d = analyze_double_bwb(DoubleBWBInputs(
+                ticker="SPY", spot=spot, dte=target_dte,
+                put_upper=hp_s, put_short=mp_s, put_lower=lp_s,
+                put_credit=dbwb_put_credit,
+                call_lower=lc_s, call_short=mc_s, call_upper=hc_s,
+                call_credit=dbwb_call_credit,
+                put_upper_mid=hp_mid, put_short_mid=mp_mid, put_lower_mid=lp_mid,
+                call_lower_mid=lc_mid, call_short_mid=mc_mid, call_upper_mid=hc_mid,
+                regime=regime, vix_now=vix_now, vix_prev=vix_prev,
+                flip_level=flip, put_wall=put_wall, call_wall=call_wall,
+                major_news=False,
+            ))
+            trades.append({
+                "type": "Double BWB", "side": "both", "is_credit": True,
+                "legs": [
+                    {"action": "BUY",  "strike": hp_s, "opt": "P", "mid": hp_mid},
+                    {"action": "SELL", "strike": mp_s, "opt": "P", "mid": mp_mid, "qty": 2},
+                    {"action": "BUY",  "strike": lp_s, "opt": "P", "mid": lp_mid},
+                    {"action": "BUY",  "strike": lc_s, "opt": "C", "mid": lc_mid},
+                    {"action": "SELL", "strike": mc_s, "opt": "C", "mid": mc_mid, "qty": 2},
+                    {"action": "BUY",  "strike": hc_s, "opt": "C", "mid": hc_mid},
+                ],
+                "width":              dbwb_mid_width,
+                "credit":             dbwb_total,
+                "max_profit_usd":     round(max(d.put_peak_profit_usd, d.call_peak_profit_usd)),
+                "max_risk_usd":       round(max(abs(d.put_flat_loss_usd), abs(d.call_flat_loss_usd))),
+                "rr_ratio":           round(max(d.put_peak_profit_usd, d.call_peak_profit_usd)
+                                            / max(max(abs(d.put_flat_loss_usd), abs(d.call_flat_loss_usd)), 1), 2),
+                "rating":             d.rating,
+                "score":              d.setup_score,
+                "lower_breakeven":    d.put_lower_breakeven,
+                "exit_plan":          d.exit_plan,
+                # Batman-specific fields for the dashboard
+                "middle_width":       d.middle_width,
+                "middle_profit_usd":  d.middle_profit_usd,
+                "put_peak_profit_usd":  d.put_peak_profit_usd,
+                "call_peak_profit_usd": d.call_peak_profit_usd,
+                "put_lower_breakeven":  d.put_lower_breakeven,
+                "call_upper_breakeven": d.call_upper_breakeven,
+                "put_flat_loss_usd":    d.put_flat_loss_usd,
+                "call_flat_loss_usd":   d.call_flat_loss_usd,
+                "put_strikes":  [lp_s, mp_s, hp_s],
+                "call_strikes": [lc_s, mc_s, hc_s],
+            })
+
     # ── CALL-SIDE STRUCTURES ──────────────────────────────────────────────────
 
     if breakout and call_mids:
@@ -358,12 +422,12 @@ def _live_trade_impl(spy: dict, vix_now: float, vix_prev: float) -> dict:
     # ── Recommend the best structure ──────────────────────────────────────────
     def _priority(tr: dict) -> int:
         t = tr["type"]
-        if t == "Bull BWB" and tr["rating"] in ("A+", "Acceptable") and tr["credit"] >= 0.15:
-            return 0
-        if t == "Bull Put Spread"  and tr["credit"] >= 0.10: return 1
-        if t == "Bear Call Spread" and tr["credit"] >= 0.10: return 2
-        if t == "Bear Put Spread":                            return 3
-        if t in ("Bull Call Spread", "Call BWB"):             return 4
+        if t == "Double BWB"    and tr["rating"] in ("A+", "Acceptable") and tr["credit"] >= 0.20: return 0
+        if t == "Bull BWB"      and tr["rating"] in ("A+", "Acceptable") and tr["credit"] >= 0.15: return 1
+        if t == "Bull Put Spread"  and tr["credit"] >= 0.10: return 2
+        if t == "Bear Call Spread" and tr["credit"] >= 0.10: return 3
+        if t == "Bear Put Spread":                            return 4
+        if t in ("Bull Call Spread", "Call BWB"):             return 5
         return 9
 
     if trades:
