@@ -287,28 +287,86 @@ def _live_trade_impl(spy: dict, vix_now: float, vix_prev: float) -> dict:
                 "rating": None, "score": None, "lower_breakeven": None, "exit_plan": None,
             })
 
-    # ── DOUBLE BWB (Batman) — positive gamma, spot comfortably between walls ──
+    # ── DOUBLE BWB (Batman) — dedicated 7-21 DTE fetch; both sides must be credit
+    #
+    # Uses a SEPARATE chain fetch (dte_min=7, dte_max=21) so there is enough
+    # theta for both BWB sides to collect real premium.  Both sides share the
+    # same expiry.  Every leg mid is verified non-zero from Alpaca bid/ask
+    # before credits are computed.
 
-    if not bearish and not breakout and put_mids and call_mids:
-        from src.analysis.bwb_analyzer import DoubleBWBInputs, analyze_double_bwb
+    if not bearish and not breakout:
+        try:
+            from src.analysis.bwb_analyzer import DoubleBWBInputs, analyze_double_bwb
 
-        # GEX-anchored strikes: put short at put wall, call short at call wall
-        mp_s, mp_mid = nearest_put(round(put_wall))
-        hp_s, hp_mid = nearest_put(mp_s + 5)
-        lp_s, lp_mid = nearest_put(mp_s - 10)
-        mc_s, mc_mid = nearest_call(round(call_wall))
-        lc_s, lc_mid = nearest_call(mc_s - 5)
-        hc_s, hc_mid = nearest_call(mc_s + 10)
+            dbwb_raw = fetch_chain_combined("SPY", spot, dte_min=7, dte_max=21)
+            d_puts   = dbwb_raw.get("puts_liquid",  [])
+            d_calls  = dbwb_raw.get("calls_liquid", [])
 
-        dbwb_put_credit  = round(mp_mid * 2 - hp_mid - lp_mid, 2)
-        dbwb_call_credit = round(mc_mid * 2 - lc_mid - hc_mid, 2)
-        dbwb_total       = round(dbwb_put_credit + dbwb_call_credit, 2)
-        dbwb_mid_width   = lc_s - hp_s
+            # Find the nearest common expiry where both put and call sides have data
+            p_exps = sorted({p["expiry"] for p in d_puts})
+            c_exps = sorted({c["expiry"] for c in d_calls})
+            common = [e for e in p_exps if e in set(c_exps)]
+            if not common:
+                raise ValueError("No common put/call expiry found in 7-21 DTE chain")
 
-        if dbwb_put_credit > 0 and dbwb_call_credit > 0 and dbwb_total > 0 and dbwb_mid_width >= 8:
+            dbwb_exp = common[0]
+            dbwb_dte = next(p["dte"] for p in d_puts if p["expiry"] == dbwb_exp)
+
+            # Build price maps — only include strikes with real bid AND ask
+            dp_mids = {
+                p["strike"]: round((p["bid"] + p["ask"]) / 2, 2)
+                for p in d_puts
+                if p["expiry"] == dbwb_exp and p["bid"] > 0 and p["ask"] > 0
+            }
+            dc_mids = {
+                c["strike"]: round((c["bid"] + c["ask"]) / 2, 2)
+                for c in d_calls
+                if c["expiry"] == dbwb_exp and c["bid"] > 0 and c["ask"] > 0
+            }
+
+            if not dp_mids or not dc_mids:
+                raise ValueError("Insufficient liquid strikes for Double BWB")
+
+            def np_(target):
+                s = min(dp_mids, key=lambda x: abs(x - target))
+                return s, dp_mids[s]
+
+            def nc_(target):
+                s = min(dc_mids, key=lambda x: abs(x - target))
+                return s, dc_mids[s]
+
+            # GEX-anchored: short strikes at GEX walls
+            mp_s, mp_mid = np_(round(put_wall))
+            hp_s, hp_mid = np_(mp_s + 5)
+            lp_s, lp_mid = np_(mp_s - 10)
+            mc_s, mc_mid = nc_(round(call_wall))
+            lc_s, lc_mid = nc_(mc_s - 5)
+            hc_s, hc_mid = nc_(mc_s + 10)
+
+            # All six leg mids must be non-zero (real Alpaca prices)
+            leg_mids = [hp_mid, mp_mid, lp_mid, lc_mid, mc_mid, hc_mid]
+            if any(m == 0 for m in leg_mids):
+                raise ValueError("One or more leg mids are zero — strike not in chain")
+
+            # Compute credits from verified live mids
+            dbwb_put_credit  = round(mp_mid * 2 - hp_mid - lp_mid, 2)
+            dbwb_call_credit = round(mc_mid * 2 - lc_mid - hc_mid, 2)
+            dbwb_total       = round(dbwb_put_credit + dbwb_call_credit, 2)
+            dbwb_mid_width   = lc_s - hp_s
+
+            # Hard gate: both sides must independently be credits AND total must be credit
+            if dbwb_put_credit <= 0:
+                raise ValueError(f"Put BWB is a debit ({dbwb_put_credit:.2f}) — not viable")
+            if dbwb_call_credit <= 0:
+                raise ValueError(f"Call BWB is a debit ({dbwb_call_credit:.2f}) — not viable")
+            if dbwb_total <= 0.10:
+                raise ValueError(f"Total credit too thin ({dbwb_total:.2f})")
+            if dbwb_mid_width < 8:
+                raise ValueError(f"Middle zone only {dbwb_mid_width:.0f}pt — too narrow")
+
             d = analyze_double_bwb(DoubleBWBInputs(
-                ticker="SPY", spot=spot, dte=target_dte,
-                put_upper=hp_s, put_short=mp_s, put_lower=lp_s,
+                ticker="SPY", spot=spot, dte=dbwb_dte,
+                put_upper=hp_s,  put_short=mp_s,  put_lower=lp_s,
                 put_credit=dbwb_put_credit,
                 call_lower=lc_s, call_short=mc_s, call_upper=hc_s,
                 call_credit=dbwb_call_credit,
@@ -328,8 +386,12 @@ def _live_trade_impl(spy: dict, vix_now: float, vix_prev: float) -> dict:
                     {"action": "SELL", "strike": mc_s, "opt": "C", "mid": mc_mid, "qty": 2},
                     {"action": "BUY",  "strike": hc_s, "opt": "C", "mid": hc_mid},
                 ],
+                "expiry_dbwb":        dbwb_exp,
+                "dte_dbwb":           dbwb_dte,
                 "width":              dbwb_mid_width,
                 "credit":             dbwb_total,
+                "put_credit":         dbwb_put_credit,
+                "call_credit":        dbwb_call_credit,
                 "max_profit_usd":     round(max(d.put_peak_profit_usd, d.call_peak_profit_usd)),
                 "max_risk_usd":       round(max(abs(d.put_flat_loss_usd), abs(d.call_flat_loss_usd))),
                 "rr_ratio":           round(max(d.put_peak_profit_usd, d.call_peak_profit_usd)
@@ -338,7 +400,6 @@ def _live_trade_impl(spy: dict, vix_now: float, vix_prev: float) -> dict:
                 "score":              d.setup_score,
                 "lower_breakeven":    d.put_lower_breakeven,
                 "exit_plan":          d.exit_plan,
-                # Batman-specific fields for the dashboard
                 "middle_width":       d.middle_width,
                 "middle_profit_usd":  d.middle_profit_usd,
                 "put_peak_profit_usd":  d.put_peak_profit_usd,
@@ -350,6 +411,15 @@ def _live_trade_impl(spy: dict, vix_now: float, vix_prev: float) -> dict:
                 "put_strikes":  [lp_s, mp_s, hp_s],
                 "call_strikes": [lc_s, mc_s, hc_s],
             })
+            logger.info(
+                "Double BWB SPY %s/%s/%s P | %s/%s/%s C  "
+                "put_cr=%.2f  call_cr=%.2f  total=%.2f  mid=%dpt  DTE=%d  rating=%s",
+                hp_s, mp_s, lp_s, lc_s, mc_s, hc_s,
+                dbwb_put_credit, dbwb_call_credit, dbwb_total,
+                dbwb_mid_width, dbwb_dte, d.rating,
+            )
+        except Exception as e:
+            logger.info("Double BWB skipped: %s", e)
 
     # ── CALL-SIDE STRUCTURES ──────────────────────────────────────────────────
 

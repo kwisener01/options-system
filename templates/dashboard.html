@@ -614,12 +614,16 @@ function renderTrade(t) {
           ${isRec ? '<span class="px-1.5 py-0.5 rounded text-xs font-bold bg-yellow-500/20 text-yellow-300 border border-yellow-600">★ REC</span>' : ''}
           <span class="text-white font-bold text-sm">${tr.type}</span>
           <span class="px-1.5 py-0.5 rounded text-xs border ${sideCls}">${tr.side.toUpperCase()}</span>
-          <span class="ml-auto text-gray-500 text-xs">${t.expiry || ''}  ${t.dte || '?'}DTE</span>
+          <span class="ml-auto text-gray-500 text-xs">
+            ${tr.expiry_dbwb ? tr.expiry_dbwb + '  ' + tr.dte_dbwb + 'DTE' : (t.expiry || '') + '  ' + (t.dte || '?') + 'DTE'}
+          </span>
         </div>
         <div class="mb-1">${legRows}</div>
         ${batmanStrip}
         <div class="border-t border-gray-700 pt-1 mt-0.5">
           ${row(crLabel, crStr, crCls)}
+          ${tr.type === 'Double BWB' && tr.put_credit != null ? row('Put side credit',  `+$${tr.put_credit.toFixed(2)}  ✓ verified`, 'text-green-400') : ''}
+          ${tr.type === 'Double BWB' && tr.call_credit != null ? row('Call side credit', `+$${tr.call_credit.toFixed(2)}  ✓ verified`, 'text-green-400') : ''}
           ${tr.type === 'Double BWB' ? row('Middle profit', `$${Math.round(tr.middle_profit_usd||0)}  (${tr.middle_width||'?'}pt wide)`, 'text-green-400') : ''}
           ${tr.max_profit_usd != null ? row(tr.type === 'Double BWB' ? 'Peak profit (at short)' : 'Max Profit', `$${Math.round(tr.max_profit_usd)}`, 'text-green-400') : ''}
           ${tr.max_risk_usd   != null ? row('Max Risk',   `$${Math.round(tr.max_risk_usd)}`,   'text-red-400')   : ''}
