@@ -116,8 +116,9 @@
               <th class="text-right px-3 py-2">Price</th>
               <th class="text-right px-3 py-2">Chg</th>
               <th class="text-left px-4 py-2">Suggested Structure</th>
+              <th class="text-center px-3 py-2">Credit / Risk</th>
+              <th class="text-center px-3 py-2">Rating</th>
               <th class="text-center px-3 py-2">Liquidity</th>
-              <th class="text-center px-3 py-2">Spreads</th>
               <th class="text-center px-3 py-2 w-20">Action</th>
             </tr>
           </thead>
@@ -521,98 +522,94 @@ function renderVixBar(vix) {
 function renderTrade(t) {
   const el = $('trade-panel');
   if (!el) return;
-  if (!t || (!t.cs && !t.bwb)) { el.innerHTML = ''; return; }
+  const trades = t && t.trades;
+  if (!trades || !trades.length) { el.innerHTML = ''; return; }
 
   const bearish  = t.direction === 'BEARISH';
-  const dirCls   = bearish ? 'border-red-800' : 'border-green-800';
+  const breakout = t.direction === 'BREAKOUT';
+  const dirColor = bearish ? 'border-red-800' : breakout ? 'border-blue-700' : 'border-green-800';
   const badgeCls = bearish ? 'bg-red-900/60 text-red-300 border-red-700'
-                           : 'bg-green-900/60 text-green-300 border-green-700';
-  const arrow    = bearish ? '↓' : '↑';
-  const rec      = t.recommended || 'cs';
-  const live     = t.prices_live ? '<span class="text-blue-400 text-xs ml-1">● live</span>' : '';
+                 : breakout ? 'bg-blue-900/60 text-blue-300 border-blue-700'
+                 : 'bg-green-900/60 text-green-300 border-green-700';
+  const arrow = bearish ? '↓' : breakout ? '↗' : '↑';
+  const live  = t.prices_live ? '<span class="text-blue-400 text-xs">● live prices</span>' : '';
 
-  function recBadge(key) {
-    return rec === key
-      ? '<span class="ml-2 px-1.5 py-0.5 rounded text-xs font-bold bg-yellow-500/20 text-yellow-300 border border-yellow-600">★ RECOMMENDED</span>'
-      : '';
-  }
-
-  function row(label, val, cls='text-white') {
-    return `<div class="flex justify-between text-xs py-0.5">
+  function row(label, val, cls = 'text-white') {
+    return `<div class="flex justify-between text-xs py-0.5 border-b border-gray-800/50">
       <span class="text-gray-500">${label}</span>
       <span class="${cls} font-semibold">${val}</span></div>`;
   }
 
-  // Credit spread card
-  const cs = t.cs || {};
-  const csType = cs.type || 'Credit Spread';
-  const csDir  = csType.startsWith('Bear') ? 'Debit' : 'Credit';
-  const csCredit = cs.credit != null ? (cs.credit >= 0 ? `+$${cs.credit.toFixed(2)}` : `-$${Math.abs(cs.credit).toFixed(2)}`) : '—';
-  const csCard = `
-    <div class="bg-gray-800/60 rounded-lg border ${rec==='cs' ? 'border-yellow-600' : 'border-gray-700'} p-3 flex flex-col gap-1">
-      <div class="flex items-center gap-2 mb-1">
-        <span class="text-gray-300 font-bold text-sm">${csType}</span>
-        ${recBadge('cs')}
-      </div>
-      ${row('Expiry', `${t.expiry || '—'} (${t.dte || '?'}DTE)`)}
-      ${row('Long leg',  `$${cs.long_strike  || '?'}P @ $${cs.long_mid  != null ? cs.long_mid.toFixed(2)  : '?'}`, 'text-green-400')}
-      ${row('Short leg', `$${cs.short_strike || '?'}P @ $${cs.short_mid != null ? cs.short_mid.toFixed(2) : '?'}`, 'text-red-400')}
-      ${row('Width', `$${cs.width || '?'}`)}
-      ${row(csDir, csCredit, cs.credit >= 0 ? 'text-green-400' : 'text-red-400')}
-      ${row('Max Profit', `$${cs.max_profit_usd != null ? cs.max_profit_usd : '?'}`, 'text-green-400')}
-      ${row('Max Risk',   `$${cs.max_risk_usd  != null ? cs.max_risk_usd  : '?'}`, 'text-red-400')}
-      ${cs.rr_ratio != null ? row('R:R', `${cs.rr_ratio}×`) : ''}
-    </div>`;
+  function tradeCard(tr) {
+    const isRec    = tr.recommended;
+    const border   = isRec ? 'border-yellow-500' : 'border-gray-700';
+    const credit   = tr.credit != null ? tr.credit : 0;
+    const isCr     = credit >= 0;
+    const crLabel  = tr.is_credit ? 'Credit' : 'Debit';
+    const crCls    = isCr ? 'text-green-400' : 'text-red-400';
+    const crStr    = `${isCr ? '+' : '-'}$${Math.abs(credit).toFixed(2)}`;
 
-  // BWB card (or placeholder)
-  let bwbCard = '';
-  if (t.bwb) {
-    const b = t.bwb;
-    const ratingCls = b.rating === 'A+' ? 'text-green-400'
-                    : b.rating === 'Acceptable' ? 'text-blue-400'
-                    : 'text-red-400';
-    bwbCard = `
-      <div class="bg-gray-800/60 rounded-lg border ${rec==='bwb' ? 'border-yellow-600' : 'border-gray-700'} p-3 flex flex-col gap-1">
-        <div class="flex items-center gap-2 mb-1">
-          <span class="text-gray-300 font-bold text-sm">Bull BWB</span>
-          ${recBadge('bwb')}
-        </div>
-        ${row('Expiry', `${t.expiry || '—'} (${t.dte || '?'}DTE)`)}
-        ${row('Upper buy', `$${b.long_upper   || '?'}P @ $${b.upper_mid != null ? b.upper_mid.toFixed(2) : '?'}`, 'text-green-400')}
-        ${row('Short (×2)', `$${b.short_strike || '?'}P @ $${b.short_mid != null ? b.short_mid.toFixed(2) : '?'}`, 'text-red-400')}
-        ${row('Lower buy', `$${b.long_lower   || '?'}P @ $${b.lower_mid != null ? b.lower_mid.toFixed(2) : '?'}`, 'text-green-400')}
-        ${row('Credit', `+$${b.credit != null ? b.credit.toFixed(2) : '?'}`, 'text-green-400')}
-        ${row('Max Profit', `$${b.max_profit_usd != null ? Math.round(b.max_profit_usd) : '?'}`, 'text-green-400')}
-        ${row('Max Risk',   `$${b.max_loss_usd  != null ? Math.round(b.max_loss_usd)  : '?'}`, 'text-red-400')}
-        ${b.lower_breakeven != null ? row('Lower B/E', `$${b.lower_breakeven}`) : ''}
-        ${b.rr_ratio != null ? row('R:R', `${b.rr_ratio}×`) : ''}
-        <div class="flex justify-between text-xs py-0.5 mt-1 border-t border-gray-700">
-          <span class="text-gray-500">Rating</span>
-          <span class="${ratingCls} font-bold">${b.rating || '?'}  (${b.score || 0}/10)</span>
-        </div>
-        ${b.exit_plan ? `<div class="text-xs text-gray-500 mt-1 italic">${b.exit_plan}</div>` : ''}
+    const ratingCls = tr.rating === 'A+' ? 'text-green-400'
+                    : tr.rating === 'Acceptable' ? 'text-blue-400'
+                    : tr.rating ? 'text-orange-400' : '';
+
+    // Side badge color
+    const sideCls = tr.side === 'call'
+      ? 'bg-blue-900/40 text-blue-300 border-blue-700'
+      : 'bg-purple-900/40 text-purple-300 border-purple-700';
+
+    // Legs rows
+    const legRows = (tr.legs || []).map(lg => {
+      const qty    = lg.qty ? `×${lg.qty} ` : '';
+      const isSell = lg.action === 'SELL';
+      const cls    = isSell ? 'text-red-400' : 'text-green-400';
+      const mid    = lg.mid != null ? ` @ $${lg.mid.toFixed ? lg.mid.toFixed(2) : lg.mid}` : '';
+      return `<div class="flex justify-between text-xs py-0.5">
+        <span class="${cls}">${lg.action} ${qty}$${lg.strike}${lg.opt}</span>
+        <span class="text-gray-400">${mid}</span>
       </div>`;
-  } else if (!bearish) {
-    bwbCard = `
-      <div class="bg-gray-800/60 rounded-lg border border-gray-700 p-3 flex items-center justify-center text-gray-600 text-xs">
-        BWB not viable — no liquid structure found
+    }).join('');
+
+    return `
+      <div class="bg-gray-800/50 rounded-lg border ${border} p-3 flex flex-col gap-0.5">
+        <div class="flex items-center gap-2 mb-2 flex-wrap">
+          ${isRec ? '<span class="px-1.5 py-0.5 rounded text-xs font-bold bg-yellow-500/20 text-yellow-300 border border-yellow-600">★ REC</span>' : ''}
+          <span class="text-white font-bold text-sm">${tr.type}</span>
+          <span class="px-1.5 py-0.5 rounded text-xs border ${sideCls}">${tr.side.toUpperCase()}</span>
+          <span class="ml-auto text-gray-500 text-xs">${t.expiry || ''}  ${t.dte || '?'}DTE</span>
+        </div>
+        <div class="mb-1">${legRows}</div>
+        <div class="border-t border-gray-700 pt-1 mt-0.5">
+          ${row(crLabel, crStr, crCls)}
+          ${tr.max_profit_usd != null ? row('Max Profit', `$${Math.round(tr.max_profit_usd)}`, 'text-green-400') : ''}
+          ${tr.max_risk_usd   != null ? row('Max Risk',   `$${Math.round(tr.max_risk_usd)}`,   'text-red-400')   : ''}
+          ${tr.rr_ratio       != null ? row('R:R', `${tr.rr_ratio}×`) : ''}
+          ${tr.lower_breakeven != null ? row('Lower B/E', `$${tr.lower_breakeven}`) : ''}
+          ${tr.rating ? `<div class="flex justify-between text-xs py-0.5">
+            <span class="text-gray-500">Rating</span>
+            <span class="${ratingCls} font-bold">${tr.rating}${tr.score != null ? '  (' + tr.score + '/10)' : ''}</span>
+          </div>` : ''}
+          ${tr.exit_plan ? `<div class="text-xs text-gray-500 mt-1 italic">${tr.exit_plan}</div>` : ''}
+        </div>
       </div>`;
   }
 
+  const cols = trades.length <= 2 ? trades.length : trades.length <= 4 ? 2 : 3;
   el.innerHTML = `
-    <div class="bg-gray-900 rounded-lg border ${dirCls} p-4">
-      <div class="flex items-center gap-3 mb-3">
-        <span class="text-gray-400 text-xs font-semibold uppercase tracking-wider">Trade Idea — SPY</span>
+    <div class="bg-gray-900 rounded-lg border ${dirColor} p-4">
+      <div class="flex items-center gap-3 mb-3 flex-wrap">
+        <span class="text-gray-400 text-xs font-semibold uppercase tracking-wider">Trade Ideas — SPY</span>
         <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-bold border ${badgeCls}">
           ${arrow} ${t.direction}
         </span>
         ${live}
-        <span class="text-gray-500 text-xs ml-auto">${t.bearish_signals != null ? t.bearish_signals + ' bearish signal' + (t.bearish_signals !== 1 ? 's' : '') : ''}</span>
+        ${t.bearish_signals != null
+          ? `<span class="text-gray-500 text-xs ml-auto">${t.bearish_signals} bearish signal${t.bearish_signals !== 1 ? 's' : ''}</span>`
+          : ''}
       </div>
 
-      <div class="grid grid-cols-1 md:grid-cols-${t.bwb || (!bearish) ? 2 : 1} gap-3 mb-3">
-        ${csCard}
-        ${bwbCard}
+      <div class="grid grid-cols-1 md:grid-cols-${cols} gap-3 mb-3">
+        ${trades.map(tradeCard).join('')}
       </div>
 
       <div class="bg-gray-800/40 rounded p-3 mb-3">
@@ -622,6 +619,7 @@ function renderTrade(t) {
 
       <div class="text-xs text-gray-600 border-t border-gray-800 pt-2">
         ⚠ Do not hold 1–2DTE spreads past 3:30 PM ET — gamma pinning can whipsaw into the close.
+        Each structure is independent — you may enter one or both sides (IC = Bull Put + Bear Call).
       </div>
     </div>`;
 }
@@ -979,8 +977,33 @@ function renderScanResults(results) {
     }
 
     const c   = r.candidate;
+    const an  = c.analysis || {};
     const tierLabel = (r.tier || '').replace('_', ' ');
-    const spreadStr = `H:${fmt(c.h_spread,2)}  M:${fmt(c.m_spread,2)}  L:${fmt(c.l_spread,2)}`;
+
+    // Credit / risk display
+    const creditStr = c.credit != null
+      ? `<span class="${c.credit >= 0 ? 'text-green-400' : 'text-red-400'} font-semibold">
+           ${c.credit >= 0 ? '+' : ''}$${Math.abs(c.credit).toFixed(2)}</span>`
+      : '<span class="text-gray-600">—</span>';
+    const riskStr = an.max_loss_usd != null
+      ? `<span class="text-red-400 text-xs">risk $${an.max_loss_usd}</span>`
+      : '';
+
+    // Rating badge
+    const ratingColor = an.rating === 'A+' ? 'bg-green-900/60 text-green-300 border-green-700'
+                      : an.rating === 'Acceptable' ? 'bg-blue-900/60 text-blue-300 border-blue-700'
+                      : an.rating ? 'bg-orange-900/60 text-orange-300 border-orange-700'
+                      : 'bg-gray-800 text-gray-600 border-gray-700';
+    const ratingBadge = an.rating
+      ? `<span class="px-1.5 py-0.5 rounded text-xs border ${ratingColor}">${an.rating}</span>`
+      : '<span class="text-gray-700 text-xs">—</span>';
+
+    // Leg detail tooltip
+    const legDetail = `BUY $${c.long_upper}P @ $${c.h_mid?.toFixed(2)||'?'}
+SELL 2× $${c.short_strike}P @ $${c.m_mid?.toFixed(2)||'?'}
+BUY $${c.long_lower}P @ $${c.l_mid?.toFixed(2)||'?'}
+Net credit: ${c.credit != null ? '$'+c.credit.toFixed(2) : '?'}
+${an.exit_plan || ''}`.trim();
 
     return `
       <tr class="border-b border-gray-800/50 hover:bg-gray-800/20">
@@ -990,20 +1013,29 @@ function renderScanResults(results) {
         </td>
         <td class="px-3 py-2.5 text-right text-white font-semibold">$${fmt(r.spot)}</td>
         <td class="px-3 py-2.5 text-right ${chgCls} text-xs">${chgStr}</td>
-        <td class="px-4 py-2.5">
-          <span class="text-amber-300 font-semibold font-mono">
-            ${fmt(c.long_upper,0)}/${fmt(c.short_strike,0)}/${fmt(c.long_lower,0)}
-          </span>
-          <span class="text-gray-500 text-xs ml-2">${c.dte}DTE · wing ${c.upper_wing}/${c.lower_wing}</span>
-          ${r.gex_context ? `<span class="ml-2 text-xs font-semibold ${r.gex_context.regime?.includes('NEGATIVE') ? 'text-red-400' : 'text-green-400'}">
-            ${r.gex_context.regime?.includes('NEGATIVE') ? '▼γ' : '▲γ'}
-          </span>` : ''}
-          ${earningsBadge(c)}
+        <td class="px-4 py-2.5" title="${legDetail}">
+          <div class="flex items-center flex-wrap gap-x-2 gap-y-0.5">
+            <span class="text-amber-300 font-semibold font-mono">
+              ${fmt(c.long_upper,0)}/${fmt(c.short_strike,0)}/${fmt(c.long_lower,0)}
+            </span>
+            <span class="text-gray-500 text-xs">${c.dte}DTE · wing ${c.upper_wing}/${c.lower_wing}</span>
+            ${r.gex_context ? `<span class="text-xs font-semibold ${r.gex_context.regime?.includes('NEGATIVE') ? 'text-red-400' : 'text-green-400'}">
+              ${r.gex_context.regime?.includes('NEGATIVE') ? '▼γ' : '▲γ'}
+            </span>` : ''}
+            ${earningsBadge(c)}
+          </div>
+          <div class="text-xs text-gray-600 mt-0.5 font-mono">
+            H@${c.h_mid?.toFixed(2)||'?'} · M@${c.m_mid?.toFixed(2)||'?'} · L@${c.l_mid?.toFixed(2)||'?'}
+          </div>
         </td>
+        <td class="px-3 py-2.5 text-center">
+          <div>${creditStr}</div>
+          <div class="mt-0.5">${riskStr}</div>
+        </td>
+        <td class="px-3 py-2.5 text-center">${ratingBadge}</td>
         <td class="px-3 py-2.5 text-center">
           <span class="font-mono text-xs ${liqColor(c.liq_score)}" title="Liquidity score ${c.liq_score}/10">${liqDots(c.liq_score)}</span>
         </td>
-        <td class="px-3 py-2.5 text-center text-xs text-gray-500 font-mono" title="Bid-ask spreads per leg">${spreadStr}</td>
         <td class="px-3 py-2.5 text-center">
           <button onclick='prefillBWB(${JSON.stringify(r)})'
             class="px-2 py-1 text-xs bg-amber-700/60 hover:bg-amber-600/80 rounded border border-amber-600/50 text-amber-200 transition-colors font-semibold">
@@ -1022,7 +1054,7 @@ function prefillBWB(r) {
   $('bwb-long-upper').value  = c.long_upper;
   $('bwb-short').value       = c.short_strike;
   $('bwb-long-lower').value  = c.long_lower;
-  $('bwb-credit').value  = '';  // user must enter actual credit
+  $('bwb-credit').value  = c.credit != null ? c.credit.toFixed(2) : '';
   // Auto-check major news if earnings fall within the DTE window
   $('bwb-news').checked  = c.earnings_warning === true;
 

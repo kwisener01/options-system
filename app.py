@@ -128,19 +128,41 @@ def _build_live_trade_idea(spy: dict, vix_now: float, vix_prev: float) -> dict:
         return _live_trade_impl(spy, vix_now, vix_prev)
     except Exception as e:
         logger.warning("Live trade idea failed (%s) — using heuristic fallback", e)
-        return _build_trade_idea(spy, vix_now, vix_prev)
+        old = _build_trade_idea(spy, vix_now, vix_prev)
+        if not old:
+            return {}
+        tr = {
+            "type": old.get("type", ""), "side": "put",
+            "is_credit": old.get("direction") != "BEARISH",
+            "legs": [
+                {"action": "BUY",  "strike": old.get("long_leg",  "?"), "opt": "P", "mid": None},
+                {"action": "SELL", "strike": old.get("short_leg", "?"), "opt": "P", "mid": None},
+            ],
+            "width": old.get("width"), "credit": None,
+            "max_profit_usd": None, "max_risk_usd": None, "rr_ratio": None,
+            "rating": None, "score": None, "lower_breakeven": None, "exit_plan": None,
+            "recommended": True,
+        }
+        return {
+            "direction": old.get("direction", "BULLISH"),
+            "bearish_signals": 0,
+            "expiry": old.get("expiry", "1DTE"), "dte": 1,
+            "spot": spy["spot"], "prices_live": False,
+            "trades": [tr], "thesis": old.get("thesis", []),
+        }
 
 
 def _live_trade_impl(spy: dict, vix_now: float, vix_prev: float) -> dict:
     from src.live.alpaca_options import fetch_chain_combined
     from src.analysis.bwb_analyzer import BWBInputs, analyze
 
-    r        = spy.get("full_chain") or spy.get("tomorrow") or spy.get("today") or {}
-    spot     = spy["spot"]
-    flip     = r.get("flip_level") or spot - 10
-    put_wall = r.get("put_wall")   or spot - 15
-    regime   = r.get("regime", "UNKNOWN")
-    vix_chg  = vix_now - vix_prev
+    r         = spy.get("full_chain") or spy.get("tomorrow") or spy.get("today") or {}
+    spot      = spy["spot"]
+    flip      = r.get("flip_level") or spot - 10
+    put_wall  = r.get("put_wall")   or spot - 15
+    call_wall = r.get("call_wall")  or spot + 15
+    regime    = r.get("regime", "UNKNOWN")
+    vix_chg   = vix_now - vix_prev
 
     bearish_signals = sum([
         "NEGATIVE" in regime,
@@ -148,149 +170,223 @@ def _live_trade_impl(spy: dict, vix_now: float, vix_prev: float) -> dict:
         vix_chg > 0.3,
         spot < flip,
     ])
-    bearish = bearish_signals >= 2
+    bearish  = bearish_signals >= 2
+    breakout = spot > call_wall  # price has pushed through call wall
 
-    # Fetch 0–3 DTE SPY puts with live bid/ask
+    # Fetch 0–3 DTE SPY puts + calls with live bid/ask
     chain = fetch_chain_combined("SPY", spot, dte_min=0, dte_max=3)
-    puts  = chain.get("puts_liquid", [])
+    puts  = chain.get("puts_liquid",  [])
+    calls = chain.get("calls_liquid", [])
 
-    # Group by expiry; prefer soonest with DTE ≥ 1
-    by_exp: dict[str, list] = {}
-    for p in puts:
-        by_exp.setdefault(p["expiry"], []).append(p)
+    def pick_expiry(rows):
+        by_exp: dict[str, list] = {}
+        for p in rows:
+            by_exp.setdefault(p["expiry"], []).append(p)
+        for exp in sorted(by_exp.keys()):
+            if by_exp[exp][0]["dte"] >= 1:
+                return exp, by_exp[exp][0]["dte"], by_exp[exp]
+        return None, 1, []
 
-    target_exp, target_dte = None, 1
-    for exp in sorted(by_exp.keys()):
-        dte = by_exp[exp][0]["dte"]
-        if dte >= 1:
-            target_exp, target_dte = exp, dte
-            break
+    put_exp,  put_dte,  put_rows  = pick_expiry(puts)
+    call_exp, call_dte, call_rows = pick_expiry(calls)
 
-    # Build {strike: mid} price map for the chosen expiry
-    mids: dict[float, float] = {}
-    if target_exp:
-        for p in by_exp[target_exp]:
-            mids[p["strike"]] = round((p["bid"] + p["ask"]) / 2, 2)
+    # Use put-side expiry as canonical; fall back to call-side
+    target_exp = put_exp or call_exp or "1DTE"
+    target_dte = put_dte if put_exp else call_dte
 
-    def nearest(target: float) -> tuple[float, float]:
-        """Closest available strike and its mid-price."""
-        if not mids:
+    put_mids  = {p["strike"]: round((p["bid"] + p["ask"]) / 2, 2) for p in put_rows}
+    call_mids = {c["strike"]: round((c["bid"] + c["ask"]) / 2, 2) for c in call_rows}
+
+    def nearest_put(target: float) -> tuple[float, float]:
+        if not put_mids:
             return round(target), 0.0
-        s = min(mids, key=lambda x: abs(x - target))
-        return s, mids[s]
+        s = min(put_mids, key=lambda x: abs(x - target))
+        return s, put_mids[s]
 
+    def nearest_call(target: float) -> tuple[float, float]:
+        if not call_mids:
+            return round(target), 0.0
+        s = min(call_mids, key=lambda x: abs(x - target))
+        return s, call_mids[s]
+
+    trades: list[dict] = []
+
+    # ── PUT-SIDE STRUCTURES ───────────────────────────────────────────────────
+
+    if not bearish:
+        short_s, short_mid = nearest_put(round(put_wall))
+
+        # Bull Put Spread: sell put_wall, buy $5 lower
+        cs_l_s, cs_l_mid = nearest_put(short_s - 5)
+        cs_credit = round(short_mid - cs_l_mid, 2)
+        cs_width  = short_s - cs_l_s
+        if cs_credit > 0 and cs_width > 0:
+            trades.append({
+                "type": "Bull Put Spread", "side": "put", "is_credit": True,
+                "legs": [
+                    {"action": "SELL", "strike": short_s, "opt": "P", "mid": short_mid},
+                    {"action": "BUY",  "strike": cs_l_s,  "opt": "P", "mid": cs_l_mid},
+                ],
+                "width":          cs_width,
+                "credit":         cs_credit,
+                "max_profit_usd": round(cs_credit * 100),
+                "max_risk_usd":   round((cs_width - cs_credit) * 100),
+                "rr_ratio":       round(cs_credit / max(cs_width - cs_credit, 0.01), 2),
+                "rating": None, "score": None, "lower_breakeven": None, "exit_plan": None,
+            })
+
+        # Bull BWB: buy H, sell 2×M, buy L
+        h_s,     h_mid     = nearest_put(short_s + 5)
+        bwb_l_s, bwb_l_mid = nearest_put(short_s - 10)
+        bwb_credit = round(short_mid * 2 - h_mid - bwb_l_mid, 2)
+        bwb = analyze(BWBInputs(
+            ticker="SPY", spot=spot, dte=target_dte,
+            long_upper=h_s, short_strike=short_s, long_lower=bwb_l_s,
+            credit=bwb_credit, regime=regime, vix_now=vix_now, vix_prev=vix_prev,
+            flip_level=flip, put_wall=put_wall, call_wall=call_wall, major_news=False,
+        ))
+        if bwb_credit > 0:
+            trades.append({
+                "type": "Bull BWB", "side": "put", "is_credit": True,
+                "legs": [
+                    {"action": "BUY",  "strike": h_s,     "opt": "P", "mid": h_mid},
+                    {"action": "SELL", "strike": short_s,  "opt": "P", "mid": short_mid, "qty": 2},
+                    {"action": "BUY",  "strike": bwb_l_s,  "opt": "P", "mid": bwb_l_mid},
+                ],
+                "width":            short_s - bwb_l_s,
+                "credit":           bwb_credit,
+                "max_profit_usd":   round(bwb.max_profit_usd),
+                "max_risk_usd":     round(bwb.max_loss_usd),
+                "rr_ratio":         round(bwb.rr_ratio, 2),
+                "rating":           bwb.rating,
+                "score":            bwb.setup_score,
+                "lower_breakeven":  round(bwb.lower_breakeven, 2),
+                "exit_plan":        bwb.exit_plan,
+            })
+
+    else:
+        # Bear Put Spread: buy near flip, sell lower
+        long_s,  long_mid  = nearest_put(round(flip))
+        bps_s,   bps_mid   = nearest_put(max(round(put_wall), round(flip) - 10))
+        if long_s - bps_s < 3:
+            bps_s, bps_mid = nearest_put(long_s - 5)
+        bps_width = long_s - bps_s
+        bps_debit = round(long_mid - bps_mid, 2)
+        if bps_debit > 0:
+            trades.append({
+                "type": "Bear Put Spread", "side": "put", "is_credit": False,
+                "legs": [
+                    {"action": "BUY",  "strike": long_s, "opt": "P", "mid": long_mid},
+                    {"action": "SELL", "strike": bps_s,  "opt": "P", "mid": bps_mid},
+                ],
+                "width":          bps_width,
+                "credit":         -bps_debit,
+                "max_profit_usd": round((bps_width - bps_debit) * 100),
+                "max_risk_usd":   round(bps_debit * 100),
+                "rr_ratio":       round((bps_width - bps_debit) / max(bps_debit, 0.01), 2),
+                "rating": None, "score": None, "lower_breakeven": None, "exit_plan": None,
+            })
+
+    # ── CALL-SIDE STRUCTURES ──────────────────────────────────────────────────
+
+    if breakout and call_mids:
+        # Bull Call Spread: buy just above call wall, sell further OTM (breakout play)
+        lc_s, lc_mid = nearest_call(round(call_wall) + 2)
+        sc_s, sc_mid = nearest_call(round(call_wall) + 7)
+        bcs_debit = round(lc_mid - sc_mid, 2)
+        bcs_width = sc_s - lc_s
+        if bcs_debit > 0 and bcs_width > 0:
+            trades.append({
+                "type": "Bull Call Spread", "side": "call", "is_credit": False,
+                "legs": [
+                    {"action": "BUY",  "strike": lc_s, "opt": "C", "mid": lc_mid},
+                    {"action": "SELL", "strike": sc_s, "opt": "C", "mid": sc_mid},
+                ],
+                "width":          bcs_width,
+                "credit":         -bcs_debit,
+                "max_profit_usd": round((bcs_width - bcs_debit) * 100),
+                "max_risk_usd":   round(bcs_debit * 100),
+                "rr_ratio":       round((bcs_width - bcs_debit) / max(bcs_debit, 0.01), 2),
+                "rating": None, "score": None, "lower_breakeven": None, "exit_plan": None,
+            })
+
+    if not breakout and call_mids:
+        # Bear Call Spread: sell near call wall, buy higher (income above resistance)
+        sell_s, sell_mid = nearest_call(round(call_wall))
+        buy_s,  buy_mid  = nearest_call(round(call_wall) + 5)
+        becs_credit = round(sell_mid - buy_mid, 2)
+        becs_width  = buy_s - sell_s
+        if becs_credit > 0 and becs_width > 0:
+            trades.append({
+                "type": "Bear Call Spread", "side": "call", "is_credit": True,
+                "legs": [
+                    {"action": "SELL", "strike": sell_s, "opt": "C", "mid": sell_mid},
+                    {"action": "BUY",  "strike": buy_s,  "opt": "C", "mid": buy_mid},
+                ],
+                "width":          becs_width,
+                "credit":         becs_credit,
+                "max_profit_usd": round(becs_credit * 100),
+                "max_risk_usd":   round((becs_width - becs_credit) * 100),
+                "rr_ratio":       round(becs_credit / max(becs_width - becs_credit, 0.01), 2),
+                "rating": None, "score": None, "lower_breakeven": None, "exit_plan": None,
+            })
+
+        if bearish:
+            # Call BWB: buy lower call, sell 2× at call wall, buy higher (bearish income)
+            lc_s, lc_mid = nearest_call(round(call_wall) - 5)
+            mc_s, mc_mid = nearest_call(round(call_wall))
+            hc_s, hc_mid = nearest_call(round(call_wall) + 5)
+            cbwb_credit = round(mc_mid * 2 - lc_mid - hc_mid, 2)
+            uw = mc_s - lc_s
+            lw = hc_s - mc_s
+            if cbwb_credit > 0:
+                trades.append({
+                    "type": "Call BWB", "side": "call", "is_credit": True,
+                    "legs": [
+                        {"action": "BUY",  "strike": lc_s, "opt": "C", "mid": lc_mid},
+                        {"action": "SELL", "strike": mc_s, "opt": "C", "mid": mc_mid, "qty": 2},
+                        {"action": "BUY",  "strike": hc_s, "opt": "C", "mid": hc_mid},
+                    ],
+                    "width":          lw + uw,
+                    "credit":         cbwb_credit,
+                    "max_profit_usd": round(cbwb_credit * 100),
+                    "max_risk_usd":   round(max(lw - cbwb_credit, 0) * 100),
+                    "rr_ratio":       None,
+                    "rating": None, "score": None, "lower_breakeven": None, "exit_plan": None,
+                })
+
+    # ── Recommend the best structure ──────────────────────────────────────────
+    def _priority(tr: dict) -> int:
+        t = tr["type"]
+        if t == "Bull BWB" and tr["rating"] in ("A+", "Acceptable") and tr["credit"] >= 0.15:
+            return 0
+        if t == "Bull Put Spread"  and tr["credit"] >= 0.10: return 1
+        if t == "Bear Call Spread" and tr["credit"] >= 0.10: return 2
+        if t == "Bear Put Spread":                            return 3
+        if t in ("Bull Call Spread", "Call BWB"):             return 4
+        return 9
+
+    if trades:
+        best = min(trades, key=_priority)
+        for tr in trades:
+            tr["recommended"] = (tr is best)
+
+    direction = "BREAKOUT" if breakout else ("BEARISH" if bearish else "BULLISH")
     thesis = [
-        f"Put wall ${put_wall:.0f} — GEX-defined support"
-        if not bearish else
-        f"Negative gamma ({r.get('gex', 0):.0f}B) — dealer amplification",
+        f"Put wall ${put_wall:.0f}  |  Call wall ${call_wall:.0f}  |  Flip ${flip:.0f}",
         f"Regime: {regime.replace('_', ' ').title()}  |  VIX {vix_chg:+.2f}",
         f"Vanna: {r.get('vanna_signal','—')}  |  Charm: {r.get('charm_signal','—')}",
     ]
 
-    # ── BULLISH: credit spread + BWB, both evaluated ──────────────────────────
-    if not bearish:
-        short_s, short_mid = nearest(round(put_wall))
-        h_s,     h_mid     = nearest(short_s + 5)
-        cs_l_s,  cs_l_mid  = nearest(short_s - 5)
-        bwb_l_s, bwb_l_mid = nearest(short_s - 10)
-
-        # Credit spread (sell short, buy cs_long)
-        cs_credit = short_mid - cs_l_mid
-        cs_width  = short_s - cs_l_s
-        cs_profit = round(cs_credit * 100)
-        cs_risk   = round((cs_width - cs_credit) * 100)
-
-        # BWB (buy H, sell 2×M, buy L)
-        bwb_credit = round(short_mid * 2 - h_mid - bwb_l_mid, 2)
-        bwb_inp = BWBInputs(
-            ticker="SPY", spot=spot, dte=target_dte,
-            long_upper=h_s, short_strike=short_s, long_lower=bwb_l_s,
-            credit=bwb_credit,
-            regime=regime, vix_now=vix_now, vix_prev=vix_prev,
-            flip_level=flip, put_wall=put_wall,
-            call_wall=r.get("call_wall", 0), major_news=False,
-        )
-        bwb = analyze(bwb_inp)
-
-        # Prefer BWB if it's rated well and credit is meaningful
-        rec_bwb = (bwb.rating in ("A+", "Acceptable")
-                   and bwb_credit >= 0.15
-                   and bwb.max_loss_usd <= 700)
-
-        return {
-            "direction":       "BULLISH",
-            "bearish_signals": bearish_signals,
-            "expiry":          target_exp or "1DTE",
-            "dte":             target_dte,
-            "spot":            spot,
-            "prices_live":     bool(mids),
-            "cs": {
-                "type":           "Bull Put Spread",
-                "long_strike":    cs_l_s,
-                "short_strike":   short_s,
-                "width":          cs_width,
-                "credit":         round(cs_credit, 2),
-                "long_mid":       cs_l_mid,
-                "short_mid":      short_mid,
-                "max_profit_usd": cs_profit,
-                "max_risk_usd":   cs_risk,
-                "rr_ratio":       round(cs_profit / cs_risk, 2) if cs_risk > 0 else 0,
-            },
-            "bwb": {
-                "type":            "Bull BWB",
-                "long_upper":      h_s,
-                "short_strike":    short_s,
-                "long_lower":      bwb_l_s,
-                "credit":          bwb_credit,
-                "upper_mid":       h_mid,
-                "short_mid":       short_mid,
-                "lower_mid":       bwb_l_mid,
-                "max_profit_usd":  round(bwb.max_profit_usd),
-                "max_loss_usd":    round(bwb.max_loss_usd),
-                "lower_breakeven": round(bwb.lower_breakeven, 2),
-                "rr_ratio":        round(bwb.rr_ratio, 2),
-                "rating":          bwb.rating,
-                "score":           bwb.setup_score,
-                "exit_plan":       bwb.exit_plan,
-                "overnight_ok":    bwb.overnight_ok,
-            },
-            "recommended": "bwb" if rec_bwb else "cs",
-            "thesis": thesis,
-        }
-
-    # ── BEARISH: bear put spread (BWB is a bullish-only structure) ────────────
-    long_s,  long_mid  = nearest(round(flip))
-    short_s, short_mid = nearest(max(round(put_wall), round(flip) - 10))
-    if long_s - short_s < 3:
-        short_s, short_mid = nearest(long_s - 5)
-
-    width      = long_s - short_s
-    net_debit  = round(long_mid - short_mid, 2)
-    bear_profit = round((width - net_debit) * 100)
-    bear_risk   = round(net_debit * 100)
-
     return {
-        "direction":       "BEARISH",
+        "direction":       direction,
         "bearish_signals": bearish_signals,
-        "expiry":          target_exp or "1DTE",
+        "expiry":          target_exp,
         "dte":             target_dte,
         "spot":            spot,
-        "prices_live":     bool(mids),
-        "cs": {
-            "type":           "Bear Put Spread",
-            "long_strike":    long_s,
-            "short_strike":   short_s,
-            "width":          width,
-            "credit":         -net_debit,
-            "long_mid":       long_mid,
-            "short_mid":      short_mid,
-            "max_profit_usd": bear_profit,
-            "max_risk_usd":   bear_risk,
-            "rr_ratio":       round(bear_profit / bear_risk, 2) if bear_risk > 0 else 0,
-        },
-        "bwb":         None,
-        "recommended": "cs",
-        "thesis":      thesis,
+        "prices_live":     bool(put_mids or call_mids),
+        "trades":          trades,
+        "thesis":          thesis,
     }
 
 
@@ -605,32 +701,30 @@ def _fmt_slack(d: dict) -> str:
     if t:
         direction = t.get("direction", "")
         color     = ":red_circle:" if direction == "BEARISH" else ":green_circle:"
-        rec       = t.get("recommended", "cs")
-        cs        = t.get("cs") or {}
-        bwb       = t.get("bwb")
-        rec_label = ("BWB" if rec == "bwb" else cs.get("type", "CS"))
         live_tag  = " _(live prices)_" if t.get("prices_live") else ""
+        trades    = t.get("trades") or []
+        rec_trade = next((tr for tr in trades if tr.get("recommended")), None)
+        rec_label = rec_trade["type"] if rec_trade else "—"
 
-        cs_line = (
-            f"CS: {cs.get('type','')}  "
-            f"${cs.get('long_strike','?')}/{cs.get('short_strike','?')}  "
-            f"Credit ${cs.get('credit',0):.2f}  "
-            f"Risk ${cs.get('max_risk_usd',0):.0f}"
-        ) if cs else ""
-
-        bwb_line = ""
-        if bwb:
-            bwb_line = (
-                f"BWB: {bwb.get('long_upper','?')}/{bwb.get('short_strike','?')}/{bwb.get('long_lower','?')}  "
-                f"Credit ${bwb.get('credit',0):.2f}  "
-                f"Rating {bwb.get('rating','?')}  MaxLoss ${bwb.get('max_loss_usd',0):.0f}"
+        trade_lines = []
+        for tr in trades:
+            star  = "★ " if tr.get("recommended") else "  "
+            legs  = "/".join(f"${lg['strike']}" for lg in tr.get("legs", []))
+            cr    = tr.get("credit", 0) or 0
+            profit = tr.get("max_profit_usd") or 0
+            risk   = tr.get("max_risk_usd") or 0
+            rating = f"  [{tr['rating']}]" if tr.get("rating") else ""
+            trade_lines.append(
+                f">  {star}{tr['type']}  {legs}  "
+                f"{'Cr' if cr >= 0 else 'Dr'} ${abs(cr):.2f}  "
+                f"Profit ${profit}  Risk ${risk}{rating}"
             )
 
         trade_block = (
-            f"\n{color} *Trade Idea — {direction}  |  Recommended: {rec_label}"
+            f"\n{color} *SPY Trade Ideas — {direction}  |  Recommended: {rec_label}"
             f"  |  Expiry {t.get('expiry','')} ({t.get('dte','')}DTE){live_tag}*\n"
-            + (f">  {cs_line}\n" if cs_line else "")
-            + (f">  {bwb_line}\n" if bwb_line else "")
+            + "\n".join(trade_lines)
+            + ("\n" if trade_lines else "")
             + "\n".join(f">  - {pt}" for pt in t.get("thesis", []))
         )
 

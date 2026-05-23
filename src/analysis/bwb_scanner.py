@@ -149,6 +149,10 @@ def _suggest_bwb(spot: float, puts: list[dict]) -> Optional[dict]:
 
                     if score > best_score:
                         best_score = score
+                        h_mid = round((h["bid"] + h["ask"]) / 2, 3)
+                        m_mid = round((m["bid"] + m["ask"]) / 2, 3)
+                        l_mid = round((l["bid"] + l["ask"]) / 2, 3)
+                        net_credit = round(m_mid * 2 - h_mid - l_mid, 3)
                         best = {
                             "expiry":       expiry,
                             "dte":          dte,
@@ -158,12 +162,13 @@ def _suggest_bwb(spot: float, puts: list[dict]) -> Optional[dict]:
                             "upper_wing":   round(uw, 2),
                             "lower_wing":   round(lw, 2),
                             "liq_score":    min(round(liq / 8), 10),
-                            "h_bid":   h["bid"],  "h_ask": h["ask"],
+                            "h_bid":   h["bid"],  "h_ask": h["ask"],  "h_mid": h_mid,
                             "h_spread":h["spread"], "h_oi": h["oi_proxy"],
-                            "m_bid":   m["bid"],  "m_ask": m["ask"],
+                            "m_bid":   m["bid"],  "m_ask": m["ask"],  "m_mid": m_mid,
                             "m_spread":m["spread"], "m_oi": m["oi_proxy"],
-                            "l_bid":   l["bid"],  "l_ask": l["ask"],
+                            "l_bid":   l["bid"],  "l_ask": l["ask"],  "l_mid": l_mid,
                             "l_spread":l["spread"], "l_oi": l["oi_proxy"],
+                            "credit":  net_credit,
                         }
     return best
 
@@ -236,6 +241,38 @@ def _scan_one(ticker: str, spot: float, prev: float, tier: str,
         gex_ctx = _compute_gex_context(spot, vix_now, vix_prev, chain["gex_contracts"])
         result["candidate"]   = candidate
         result["gex_context"] = gex_ctx
+
+        # Run BWB analyzer for rating, risk, exit plan
+        try:
+            from src.analysis.bwb_analyzer import BWBInputs, analyze as _bwb_analyze
+            gx = gex_ctx or {}
+            bwb_result = _bwb_analyze(BWBInputs(
+                ticker=ticker, spot=spot, dte=candidate["dte"],
+                long_upper=candidate["long_upper"],
+                short_strike=candidate["short_strike"],
+                long_lower=candidate["long_lower"],
+                credit=candidate.get("credit", 0.0),
+                regime=gx.get("regime", "UNKNOWN"),
+                vix_now=vix_now, vix_prev=vix_prev,
+                flip_level=gx.get("flip_level", 0.0),
+                put_wall=gx.get("put_wall", 0.0),
+                call_wall=gx.get("call_wall", 0.0),
+                major_news=bool(candidate.get("earnings_warning")),
+            ))
+            candidate["analysis"] = {
+                "rating":          bwb_result.rating,
+                "score":           bwb_result.setup_score,
+                "max_profit_usd":  round(bwb_result.max_profit_usd),
+                "max_loss_usd":    round(bwb_result.max_loss_usd),
+                "lower_breakeven": round(bwb_result.lower_breakeven, 2),
+                "rr_ratio":        round(bwb_result.rr_ratio, 2),
+                "exit_plan":       bwb_result.exit_plan,
+                "overnight_ok":    bwb_result.overnight_ok,
+                "summary":         bwb_result.summary,
+            }
+        except Exception as e:
+            logger.debug("BWB analysis failed for %s: %s", ticker, e)
+            candidate["analysis"] = None
 
         # Earnings check: flag if earnings fall within the option's DTE window
         today = date.today()

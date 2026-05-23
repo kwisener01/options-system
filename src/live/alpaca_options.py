@@ -342,7 +342,7 @@ def fetch_chain_combined(underlying: str, spot: float,
     """
     from datetime import date as _date
 
-    empty: dict = {"gex_contracts": [], "puts_liquid": []}
+    empty: dict = {"gex_contracts": [], "puts_liquid": [], "calls_liquid": []}
     try:
         from alpaca.data.requests import OptionChainRequest
     except ImportError:
@@ -350,8 +350,9 @@ def fetch_chain_combined(underlying: str, spot: float,
         return empty
 
     today = _date.today()
-    gex_rows: list[dict] = []
-    put_rows: list[dict] = []
+    gex_rows:  list[dict] = []
+    put_rows:  list[dict] = []
+    call_rows: list[dict] = []
 
     try:
         req = OptionChainRequest(underlying_symbol=underlying, feed="indicative")
@@ -373,8 +374,8 @@ def fetch_chain_combined(underlying: str, spot: float,
             except Exception:
                 continue
 
-            # GEX uses ±10%; scanner puts need 0.5–16% OTM below spot
-            if spot and not (spot * 0.90 <= strike <= spot * 1.10):
+            # GEX uses ±15%; puts scan 84–102% of spot; calls scan 98–115%
+            if spot and not (spot * 0.85 <= strike <= spot * 1.15):
                 continue
 
             contract = (getattr(snap, "contract_details", None)
@@ -422,13 +423,11 @@ def fetch_chain_combined(underlying: str, spot: float,
 
             gex_rows.append(dict(strike=strike, oi=oi, iv=iv, T=T, is_call=is_call))
 
-            if (is_put and dte_min <= dte <= dte_max
-                    and spot * 0.84 <= strike <= spot * 1.02
-                    and quote):
+            if quote and dte_min <= dte <= dte_max:
                 bid = float(getattr(quote, "bid_price", 0) or 0)
                 ask = float(getattr(quote, "ask_price", 0) or 0)
                 if bid > 0 and ask > 0:
-                    put_rows.append({
+                    row = {
                         "strike":   strike,
                         "expiry":   expiry_str[:10],
                         "dte":      dte,
@@ -437,14 +436,18 @@ def fetch_chain_combined(underlying: str, spot: float,
                         "spread":   round(ask - bid, 3),
                         "oi_proxy": bid_sz + ask_sz,
                         "iv":       round(iv, 4),
-                    })
+                    }
+                    if is_put and spot * 0.84 <= strike <= spot * 1.02:
+                        put_rows.append(row)
+                    elif is_call and spot * 0.98 <= strike <= spot * 1.15:
+                        call_rows.append(row)
         except Exception as e:
             logger.debug("Skip %s: %s", symbol, e)
             continue
 
-    logger.info("Combined chain %s: %d GEX contracts, %d liquid puts (DTE %d-%d)",
-                underlying, len(gex_rows), len(put_rows), dte_min, dte_max)
-    return {"gex_contracts": gex_rows, "puts_liquid": put_rows}
+    logger.info("Combined chain %s: %d GEX, %d puts, %d calls (DTE %d-%d)",
+                underlying, len(gex_rows), len(put_rows), len(call_rows), dte_min, dte_max)
+    return {"gex_contracts": gex_rows, "puts_liquid": put_rows, "calls_liquid": call_rows}
 
 
 def get_option_positions() -> list:
