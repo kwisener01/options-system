@@ -790,6 +790,117 @@ def api_bwb_scan():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/analyze")
+def analyze_page():
+    return render_template("analyze.html")
+
+
+@app.route("/api/risk", methods=["POST"])
+def api_risk():
+    """Analyze a hypothetical or live option position (1-6 legs)."""
+    try:
+        body     = request.get_json(force=True)
+        raw_legs = body.get("legs", [])
+        if not raw_legs or len(raw_legs) > 6:
+            return jsonify({"ok": False, "error": "Provide 1-6 legs"}), 400
+
+        from risk_profile import (
+            auto_group_spreads, enrich_legs, build_scenario_table,
+            build_expiry_table, max_risk_per_position, _build_occ, SCENARIO_MOVES,
+        )
+        from datetime import date as _date
+
+        legs = []
+        for r in raw_legs:
+            underlying = str(r.get("underlying", "")).upper().strip()
+            expiry_str = str(r.get("expiry", "")).strip()
+            is_call    = bool(r.get("is_call", True))
+            strike     = float(r.get("strike", 0))
+            qty        = int(r.get("qty", 1))
+            entry      = float(r.get("entry_price", 0))
+            if not underlying or not expiry_str or strike <= 0:
+                continue
+            try:
+                exp_date = _date.fromisoformat(expiry_str)
+            except ValueError:
+                continue
+            sym = _build_occ(underlying, exp_date, is_call, strike)
+            legs.append({
+                "source":      "analyze",
+                "id":          sym,
+                "label":       (f"{underlying} {'C' if is_call else 'P'}"
+                                f"{strike:.0f} {exp_date.strftime('%b%y')}"),
+                "symbol":      sym,
+                "underlying":  underlying,
+                "strike":      strike,
+                "expiry":      expiry_str,
+                "is_call":     is_call,
+                "qty":         qty,
+                "entry_price": entry,
+            })
+
+        if not legs:
+            return jsonify({"ok": False, "error": "No valid legs parsed"}), 400
+
+        legs     = auto_group_spreads(legs)
+        enriched = enrich_legs(legs, use_api=True)
+        if not enriched:
+            return jsonify({"ok": False, "error": "Could not fetch live data"}), 500
+
+        for leg in enriched:
+            if leg["entry_price"] == 0.0 and leg["mid"] > 0:
+                leg["entry_price"] = leg["mid"]
+
+        scenarios    = build_scenario_table(enriched)
+        expiry_tbl   = build_expiry_table(enriched)
+        max_risks    = max_risk_per_position(enriched)
+        u            = enriched[0]["underlying"]
+        spot         = enriched[0]["spot"]
+
+        def _fmt_money(v):
+            if v is None:
+                return "unlimited"
+            return f"+${v:,.2f}" if v >= 0 else f"-${abs(v):,.2f}"
+
+        return jsonify({
+            "ok":         True,
+            "underlying": u,
+            "spot":       spot,
+            "moves":      SCENARIO_MOVES,
+            "legs": [{
+                "label":       l["label"],
+                "qty":         l["qty"],
+                "strike":      l["strike"],
+                "is_call":     l["is_call"],
+                "expiry":      l["expiry"],
+                "entry_price": round(l["entry_price"], 3),
+                "mid":         round(l["mid"], 3),
+                "iv":          l["iv"],
+                "delta":       l["delta"],
+                "gamma":       l["gamma"],
+                "theta":       l["theta"],
+                "vega":        l["vega"],
+                "bs_source":   l["bs_source"],
+            } for l in enriched],
+            "scenarios":    {str(k): v for k, v in (scenarios.get(u) or {}).items()},
+            "expiry_table": {str(k): v for k, v in (expiry_tbl.get(u) or {}).items()},
+            "max_risks": [{
+                "label":    r["label"],
+                "max_gain": _fmt_money(r["max_gain"]),
+                "max_loss": _fmt_money(r["max_loss"]),
+            } for r in max_risks],
+            "net_greeks": {
+                "delta": round(sum(l["pos_delta"] for l in enriched), 2),
+                "gamma": round(sum(l["pos_gamma"] for l in enriched), 2),
+                "theta": round(sum(l["pos_theta"] for l in enriched), 2),
+                "vega":  round(sum(l["pos_vega"]  for l in enriched), 2),
+            },
+        })
+    except Exception as e:
+        logger.exception("Risk analysis failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/health")
 def health():
     return jsonify({"status": "ok"})
