@@ -42,6 +42,10 @@ _wl_lock = threading.Lock()
 _wl_cache: dict = {"data": None, "ts": 0.0}
 WL_CACHE_TTL = 1800  # 30 minutes
 
+_fa_lock = threading.Lock()
+_fa_cache: dict = {"data": None, "ts": 0.0}
+FA_CACHE_TTL = 3600  # 1 hour — price data is daily, no need to refresh often
+
 
 # ── data fetching ──────────────────────────────────────────────────────────────
 
@@ -765,6 +769,45 @@ def api_watchlist_alert():
         return jsonify({"ok": ok})
     except Exception as e:
         logger.exception("Watchlist alert failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/fallen-angels", methods=["GET"])
+def api_fallen_angels():
+    """Scan for beaten-down large-caps near multi-year floor."""
+    force = request.args.get("force", "false").lower() == "true"
+    try:
+        with _fa_lock:
+            age = time.time() - _fa_cache["ts"]
+            if force or _fa_cache["data"] is None or age > FA_CACHE_TTL:
+                logger.info("Running fallen angel scan (force=%s age=%.0fs)", force, age)
+                from src.analysis.fallen_angel_scanner import scan_fallen_angels
+                _fa_cache["data"] = scan_fallen_angels()
+                _fa_cache["ts"]   = time.time()
+        return jsonify({"ok": True, "angels": _fa_cache["data"],
+                        "timestamp": datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")})
+    except Exception as e:
+        logger.exception("Fallen angel scan failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/fallen-angels/alert", methods=["POST"])
+def api_fallen_angels_alert():
+    """Post STRONG + WATCH fallen angel signals to Slack."""
+    try:
+        with _fa_lock:
+            angels = _fa_cache["data"]
+        if not angels:
+            from src.analysis.fallen_angel_scanner import scan_fallen_angels
+            angels = scan_fallen_angels()
+        from src.analysis.fallen_angel_scanner import fmt_slack as fa_fmt
+        from src.notifications.slack_notifier import send_message
+        ts  = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
+        msg = fa_fmt(angels, ts)
+        ok  = send_message(msg)
+        return jsonify({"ok": ok})
+    except Exception as e:
+        logger.exception("Fallen angel alert failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
