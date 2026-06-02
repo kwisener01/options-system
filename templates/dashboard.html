@@ -41,6 +41,9 @@
     <button onclick="runWatchlist()" class="px-3 py-1 text-xs bg-emerald-700 hover:bg-emerald-600 rounded border border-emerald-500 transition-colors font-semibold">
       📈 Watchlist
     </button>
+    <button onclick="runFallenAngels()" class="px-3 py-1 text-xs bg-rose-800 hover:bg-rose-700 rounded border border-rose-600 transition-colors font-semibold">
+      🕊 Angels
+    </button>
     <button onclick="openBWB()" class="px-3 py-1 text-xs bg-amber-700 hover:bg-amber-600 rounded border border-amber-500 transition-colors font-semibold">
       🦋 BWB
     </button>
@@ -177,6 +180,56 @@
 
   <div id="wl-empty" class="text-center py-6 text-gray-600 text-xs">
     Click <strong class="text-emerald-500">📈 Watchlist</strong> to scan for buy signals.
+  </div>
+</div>
+
+<!-- ── Fallen Angels Panel ── -->
+<div class="mx-4 mb-4 bg-gray-900 rounded-lg border border-rose-900/60 overflow-hidden">
+  <div class="px-4 py-3 bg-gray-800/50 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <span class="text-rose-400 font-bold text-sm">🕊 Fallen Angels</span>
+      <span class="text-gray-600 text-xs">Beaten-down large-caps near floor · P/C ratio + GEX confirmation</span>
+    </div>
+    <div class="flex items-center gap-3">
+      <span id="fa-ts" class="text-gray-600 text-xs"></span>
+      <button onclick="runFallenAngels(true)"
+        class="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 rounded border border-gray-700 transition-colors">
+        ↻ Re-scan
+      </button>
+      <button id="fa-slack-btn" onclick="sendFallenAngelsSlack()"
+        class="px-3 py-1 text-xs bg-indigo-700 hover:bg-indigo-600 rounded border border-indigo-500 transition-colors font-semibold">
+        → Slack
+      </button>
+    </div>
+  </div>
+
+  <div id="fa-loading" class="hidden text-center py-8 text-gray-500 text-sm">
+    <div class="pulse inline-block mr-2">⟳</div>Scanning 92 large-caps for floor setups + options flow…
+  </div>
+
+  <div id="fa-results" class="hidden overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead>
+        <tr class="border-b border-gray-800 text-gray-500 text-xs uppercase tracking-wider">
+          <th class="text-left px-4 py-2">Ticker</th>
+          <th class="text-right px-3 py-2">Price</th>
+          <th class="text-right px-3 py-2">Chg</th>
+          <th class="text-right px-3 py-2">From Top</th>
+          <th class="text-right px-3 py-2">From Floor</th>
+          <th class="text-center px-3 py-2">RSI</th>
+          <th class="text-center px-3 py-2">Vol Ratio</th>
+          <th class="text-center px-3 py-2">P/C Ratio</th>
+          <th class="text-center px-3 py-2">Put Wall</th>
+          <th class="text-center px-3 py-2">Score</th>
+          <th class="text-center px-3 py-2">Signal</th>
+        </tr>
+      </thead>
+      <tbody id="fa-tbody"></tbody>
+    </table>
+  </div>
+
+  <div id="fa-empty" class="text-center py-6 text-gray-600 text-xs">
+    Click <strong class="text-rose-400">🕊 Angels</strong> to scan for fallen angel setups.
   </div>
 </div>
 
@@ -1166,7 +1219,7 @@ function signalBadgeWL(signal, score) {
   };
   const c = cfg[signal] || cfg.NONE;
   return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-bold border ${c.cls}">
-    ${c.icon} ${c.label} ${score}/9
+    ${c.icon} ${c.label} ${score}
   </span>`;
 }
 
@@ -1236,6 +1289,139 @@ function renderWatchlist(signals) {
         <td class="px-3 py-2.5 text-center text-xs text-gray-400">${pwStr}</td>
         <td class="px-3 py-2.5 text-center">${wlEarningsBadge(s)}</td>
         <td class="px-3 py-2.5 text-center">${signalBadgeWL(s.signal, s.score)}</td>
+      </tr>`;
+  }).join('');
+}
+
+// ── Fallen Angels ─────────────────────────────────────────────────────────────
+
+async function runFallenAngels(force = false) {
+  $('fa-loading').classList.remove('hidden');
+  $('fa-results').classList.add('hidden');
+  $('fa-empty').classList.add('hidden');
+  try {
+    const url  = `/api/fallen-angels${force ? '?force=true' : ''}`;
+    const resp = await fetch(url);
+    const json = await resp.json();
+    if (!json.ok) throw new Error(json.error || 'Scan failed');
+    renderFallenAngels(json.angels);
+    const ts = $('fa-ts');
+    if (ts) ts.textContent = `Updated: ${new Date().toLocaleTimeString()}`;
+  } catch(err) {
+    showToast('Fallen angel scan error: ' + err.message, false);
+    $('fa-empty').classList.remove('hidden');
+    $('fa-empty').textContent = 'Scan failed: ' + err.message;
+  } finally {
+    $('fa-loading').classList.add('hidden');
+  }
+}
+
+async function sendFallenAngelsSlack() {
+  const btn = $('fa-slack-btn');
+  btn.disabled = true; btn.textContent = 'Sending…';
+  try {
+    const resp = await fetch('/api/fallen-angels/alert', { method: 'POST' });
+    const json = await resp.json();
+    showToast(json.ok ? '✓ Fallen Angels sent to Slack' : '✗ ' + json.error, json.ok);
+  } catch(err) {
+    showToast('✗ ' + err.message, false);
+  } finally {
+    btn.disabled = false; btn.textContent = '→ Slack';
+  }
+}
+
+function pcColor(pc) {
+  if (pc === null || pc === undefined) return 'text-gray-600';
+  if (pc < 0.5) return 'text-green-400 font-bold';
+  if (pc < 0.8) return 'text-green-300';
+  if (pc < 1.2) return 'text-gray-300';
+  return 'text-red-400';
+}
+
+function fromHighColor(pct) {
+  // More negative = better (more beaten down)
+  if (pct <= -50) return 'text-rose-400 font-bold';
+  if (pct <= -40) return 'text-rose-300';
+  if (pct <= -30) return 'text-amber-400';
+  return 'text-gray-400';
+}
+
+function fromLowColor(pct) {
+  // Lower % from floor = better
+  if (pct <= 5)  return 'text-green-400 font-bold';
+  if (pct <= 10) return 'text-green-300';
+  if (pct <= 20) return 'text-amber-400';
+  return 'text-gray-400';
+}
+
+function faSignalBadge(signal, score) {
+  const cfg = {
+    STRONG: { cls: 'bg-rose-900/70 text-rose-300 border-rose-700',   icon: '★', label: 'BUY ZONE'  },
+    WATCH:  { cls: 'bg-amber-900/70 text-amber-300 border-amber-700', icon: '◎', label: 'DEVELOPING'},
+    NONE:   { cls: 'bg-gray-800 text-gray-600 border-gray-700',       icon: '—', label: 'TOO EARLY' },
+  };
+  const c = cfg[signal] || cfg.NONE;
+  return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-bold border ${c.cls}">
+    ${c.icon} ${c.label} ${score}/13
+  </span>`;
+}
+
+function renderFallenAngels(angels) {
+  const tbody = $('fa-tbody');
+  if (!tbody || !angels?.length) {
+    $('fa-empty').classList.remove('hidden');
+    $('fa-empty').textContent = 'No fallen angel setups found — no stocks meet the criteria today.';
+    return;
+  }
+  $('fa-results').classList.remove('hidden');
+
+  tbody.innerHTML = angels.map(a => {
+    const chgCls = a.change_pct >= 0 ? 'text-green-400' : 'text-red-400';
+    const chgStr = (a.change_pct >= 0 ? '+' : '') + fmt(a.change_pct) + '%';
+
+    const rsiStr = `<span class="${rsiColor(a.rsi)}">${fmt(a.rsi, 1)}</span>`;
+    const volStr = a.vol_ratio
+      ? `<span class="${a.vol_ratio >= 1.25 ? 'text-green-400 font-bold' : a.vol_ratio >= 1.10 ? 'text-green-300' : 'text-gray-500'}">${a.vol_ratio.toFixed(2)}x</span>`
+      : '<span class="text-gray-600">—</span>';
+    const pcStr = a.put_call_ratio != null
+      ? `<span class="${pcColor(a.put_call_ratio)}">${a.put_call_ratio.toFixed(2)}</span>`
+      : '<span class="text-gray-600">—</span>';
+    const pwStr = a.put_wall
+      ? `<span class="text-green-400 text-xs">$${fmt(a.put_wall, 0)}</span>`
+      : '<span class="text-gray-700">—</span>';
+
+    // Tooltip with full reasons
+    const tip = (a.reasons || []).map(r => `✓ ${r}`).join('\n');
+
+    // Range bar: show where spot sits in the 52w range
+    const rangePct = a.high_52w > a.low_52w
+      ? ((a.spot - a.low_52w) / (a.high_52w - a.low_52w) * 100).toFixed(0)
+      : 50;
+
+    return `
+      <tr class="border-b border-gray-800/50 hover:bg-gray-800/20 cursor-default" title="${tip.replace(/"/g,"'")}">
+        <td class="px-4 py-2.5">
+          <div class="font-bold text-white">${a.ticker}</div>
+          <div class="text-gray-700 text-xs mt-0.5 font-mono">
+            <div class="w-20 h-1 bg-gray-800 rounded overflow-hidden">
+              <div class="h-full bg-rose-600 rounded" style="width:${rangePct}%"></div>
+            </div>
+            <span class="text-gray-700">${a.low_52w}–${a.high_52w}</span>
+          </div>
+        </td>
+        <td class="px-3 py-2.5 text-right font-semibold text-white">$${fmt(a.spot)}</td>
+        <td class="px-3 py-2.5 text-right text-xs ${chgCls}">${chgStr}</td>
+        <td class="px-3 py-2.5 text-right text-xs ${fromHighColor(a.pct_from_high)}">${a.pct_from_high}%</td>
+        <td class="px-3 py-2.5 text-right text-xs ${fromLowColor(a.pct_from_low)}">+${a.pct_from_low}%</td>
+        <td class="px-3 py-2.5 text-center text-xs">${rsiStr}${a.rsi_was_oversold ? ' <span class="text-green-600 text-xs" title="Was oversold in past 20 sessions">⤴</span>' : ''}</td>
+        <td class="px-3 py-2.5 text-center text-xs">${volStr}</td>
+        <td class="px-3 py-2.5 text-center text-xs">${pcStr}</td>
+        <td class="px-3 py-2.5 text-center text-xs">${pwStr}</td>
+        <td class="px-3 py-2.5 text-center text-xs">
+          <span class="text-gray-300 font-semibold">${a.score}</span>
+          <span class="text-gray-700">/13</span>
+        </td>
+        <td class="px-3 py-2.5 text-center">${faSignalBadge(a.signal, a.score)}</td>
       </tr>`;
   }).join('');
 }
