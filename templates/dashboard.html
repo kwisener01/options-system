@@ -47,6 +47,9 @@
     <button onclick="runFallenAngels()" class="px-2.5 py-1.5 text-xs bg-rose-800 hover:bg-rose-700 rounded border border-rose-600 transition-colors font-semibold">
       🕊 Angels
     </button>
+    <button onclick="runBullPut()" class="px-2.5 py-1.5 text-xs bg-violet-800 hover:bg-violet-700 rounded border border-violet-600 transition-colors font-semibold">
+      💰 Bull Put
+    </button>
     <button onclick="openBWB()" class="px-2.5 py-1.5 text-xs bg-amber-700 hover:bg-amber-600 rounded border border-amber-500 transition-colors font-semibold">
       🦋 BWB
     </button>
@@ -186,6 +189,53 @@
 
   <div id="wl-empty" class="text-center py-6 text-gray-600 text-xs">
     Click <strong class="text-emerald-500">📈 Watchlist</strong> to scan for buy signals.
+  </div>
+</div>
+
+<!-- ── Bull Put Credit Spread Panel ── -->
+<div class="mx-4 mb-4 bg-gray-900 rounded-lg border border-violet-900/60 overflow-hidden">
+  <div class="px-3 py-2.5 bg-gray-800/50 flex items-center gap-2 flex-wrap">
+    <span class="text-violet-400 font-bold text-sm shrink-0">💰 Bull Put Spreads</span>
+    <span class="text-gray-600 text-xs hidden sm:inline">Short strike AT GEX put wall · Credit &gt; 50% of width</span>
+    <div class="flex items-center gap-1.5 ml-auto">
+      <span id="bp-ts" class="text-gray-600 text-xs hidden sm:inline"></span>
+      <button onclick="runBullPut(true)"
+        class="px-2.5 py-1 text-xs bg-gray-800 hover:bg-gray-700 rounded border border-gray-700 transition-colors">
+        ↻ Re-scan
+      </button>
+      <button id="bp-slack-btn" onclick="sendBullPutSlack()"
+        class="px-2.5 py-1 text-xs bg-indigo-700 hover:bg-indigo-600 rounded border border-indigo-500 transition-colors font-semibold">
+        → Slack
+      </button>
+    </div>
+  </div>
+
+  <div id="bp-loading" class="hidden text-center py-8 text-gray-500 text-sm">
+    <div class="pulse inline-block mr-2">⟳</div>Scanning chains for put wall credit spreads…
+  </div>
+
+  <div id="bp-results" class="hidden overflow-x-auto">
+    <table class="w-full text-sm min-w-[680px]">
+      <thead>
+        <tr class="border-b border-gray-800 text-gray-500 text-xs uppercase tracking-wider">
+          <th class="text-left px-4 py-2">Ticker</th>
+          <th class="text-right px-3 py-2">Price</th>
+          <th class="text-right px-3 py-2">Chg</th>
+          <th class="text-left px-4 py-2">Structure</th>
+          <th class="text-center px-3 py-2">Credit</th>
+          <th class="text-center px-3 py-2">Credit %</th>
+          <th class="text-center px-3 py-2">P&amp;L</th>
+          <th class="text-center px-3 py-2">Put Wall</th>
+          <th class="text-center px-3 py-2">Earnings</th>
+          <th class="text-center px-3 py-2">Signal</th>
+        </tr>
+      </thead>
+      <tbody id="bp-tbody"></tbody>
+    </table>
+  </div>
+
+  <div id="bp-empty" class="text-center py-6 text-gray-600 text-xs">
+    Click <strong class="text-violet-400">💰 Bull Put</strong> to scan for credit spread setups at GEX support.
   </div>
 </div>
 
@@ -1317,6 +1367,125 @@ function renderWatchlist(signals) {
         <td class="px-3 py-2.5 text-center text-xs text-gray-400">${pwStr}</td>
         <td class="px-3 py-2.5 text-center">${wlEarningsBadge(s)}</td>
         <td class="px-3 py-2.5 text-center">${signalBadgeWL(s.signal, s.score)}</td>
+      </tr>`;
+  }).join('');
+}
+
+// ── Bull Put Credit Spread ────────────────────────────────────────────────────
+
+async function runBullPut(force = false) {
+  $('bp-loading').classList.remove('hidden');
+  $('bp-results').classList.add('hidden');
+  $('bp-empty').classList.add('hidden');
+  try {
+    const url  = `/api/bull-put/scan${force ? '?force=true' : ''}`;
+    const resp = await fetch(url);
+    const json = await resp.json();
+    if (!json.ok) throw new Error(json.error || 'Scan failed');
+    renderBullPut(json.results);
+    const ts = $('bp-ts');
+    if (ts) ts.textContent = `Updated: ${new Date().toLocaleTimeString()}`;
+  } catch(err) {
+    showToast('Bull put scan error: ' + err.message, false);
+    $('bp-empty').classList.remove('hidden');
+    $('bp-empty').textContent = 'Scan failed: ' + err.message;
+  } finally {
+    $('bp-loading').classList.add('hidden');
+  }
+}
+
+async function sendBullPutSlack() {
+  const btn = $('bp-slack-btn');
+  btn.disabled = true; btn.textContent = 'Sending…';
+  try {
+    const resp = await fetch('/api/bull-put/alert', { method: 'POST' });
+    const json = await resp.json();
+    showToast(json.ok ? '✓ Bull Put sent to Slack' : '✗ ' + json.error, json.ok);
+  } catch(err) {
+    showToast('✗ ' + err.message, false);
+  } finally {
+    btn.disabled = false; btn.textContent = '→ Slack';
+  }
+}
+
+function creditPctColor(pct) {
+  if (pct >= 65) return 'text-green-400 font-bold';
+  if (pct >= 55) return 'text-green-300';
+  return 'text-amber-400';
+}
+
+function bpSignalBadge(signal, score) {
+  const cfg = {
+    STRONG: { cls: 'bg-violet-900/70 text-violet-300 border-violet-700', icon: '★', label: 'STRONG' },
+    WATCH:  { cls: 'bg-amber-900/70  text-amber-300  border-amber-700',  icon: '◎', label: 'WATCH'  },
+    NONE:   { cls: 'bg-gray-800      text-gray-600   border-gray-700',   icon: '—', label: 'SKIP'   },
+  };
+  const c = cfg[signal] || cfg.NONE;
+  return `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-bold border ${c.cls}">
+    ${c.icon} ${c.label} ${score}/9
+  </span>`;
+}
+
+function renderBullPut(results) {
+  const tbody = $('bp-tbody');
+  if (!tbody) return;
+
+  const rows = results.filter(r => r.price_ok);
+  if (!rows.length) {
+    $('bp-empty').classList.remove('hidden');
+    return;
+  }
+  $('bp-results').classList.remove('hidden');
+
+  tbody.innerHTML = rows.map(r => {
+    const chgCls = r.change_pct >= 0 ? 'text-green-400' : 'text-red-400';
+    const chgStr = (r.change_pct >= 0 ? '+' : '') + fmt(r.change_pct) + '%';
+
+    if (!r.candidate) {
+      return `
+        <tr class="border-b border-gray-800/50 hover:bg-gray-800/20">
+          <td class="px-4 py-2.5 font-bold text-gray-400">${r.ticker}</td>
+          <td class="px-3 py-2.5 text-right text-gray-400">$${fmt(r.spot)}</td>
+          <td class="px-3 py-2.5 text-right text-xs ${chgCls}">${chgStr}</td>
+          <td class="px-4 py-2.5 text-xs text-gray-600" colspan="7">${r.note || '—'}</td>
+        </tr>`;
+    }
+
+    const c = r.candidate;
+    const pwStr = r.put_wall ? `$${fmt(r.put_wall, 2)}` : '—';
+    const earnStr = c.earnings_warning
+      ? `<span class="text-red-400 text-xs font-bold" title="${r.earnings_date}">⚠ ${c.earnings_days_out}d</span>`
+      : r.earnings_date
+        ? `<span class="text-gray-600 text-xs">${c.earnings_days_out}d</span>`
+        : '<span class="text-gray-700">—</span>';
+
+    return `
+      <tr class="border-b border-gray-800/50 hover:bg-gray-800/20">
+        <td class="px-4 py-2.5 font-bold text-white">${r.ticker}</td>
+        <td class="px-3 py-2.5 text-right font-semibold text-white">$${fmt(r.spot)}</td>
+        <td class="px-3 py-2.5 text-right text-xs ${chgCls}">${chgStr}</td>
+        <td class="px-4 py-2.5">
+          <div class="text-violet-300 font-semibold font-mono text-sm">
+            SELL $${c.short_strike}P / BUY $${c.long_strike}P
+          </div>
+          <div class="text-gray-500 text-xs mt-0.5">${c.dte}DTE · ${c.expiry} · width $${c.width}</div>
+        </td>
+        <td class="px-3 py-2.5 text-center">
+          <span class="text-green-400 font-bold">+$${fmt(c.credit)}</span>
+        </td>
+        <td class="px-3 py-2.5 text-center text-xs">
+          <span class="${creditPctColor(c.credit_pct)}">${c.credit_pct}%</span>
+        </td>
+        <td class="px-3 py-2.5 text-center text-xs">
+          <div class="text-green-400">+$${c.max_profit_usd}</div>
+          <div class="text-red-400 text-xs">-$${c.max_loss_usd}</div>
+        </td>
+        <td class="px-3 py-2.5 text-center text-xs">
+          <span class="text-green-400">$${pwStr}</span>
+          <div class="text-gray-600 text-xs">${c.pw_distance} away</div>
+        </td>
+        <td class="px-3 py-2.5 text-center">${earnStr}</td>
+        <td class="px-3 py-2.5 text-center">${bpSignalBadge(r.signal, c.score)}</td>
       </tr>`;
   }).join('');
 }

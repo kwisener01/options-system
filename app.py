@@ -46,6 +46,10 @@ _fa_lock = threading.Lock()
 _fa_cache: dict = {"data": None, "ts": 0.0}
 FA_CACHE_TTL = 3600  # 1 hour — price data is daily, no need to refresh often
 
+_bp_lock = threading.Lock()
+_bp_cache: dict = {"data": None, "ts": 0.0}
+BP_CACHE_TTL = 900   # 15 minutes — chain prices move during the day
+
 
 # ── data fetching ──────────────────────────────────────────────────────────────
 
@@ -851,6 +855,47 @@ def api_fallen_angels_alert():
         return jsonify({"ok": ok})
     except Exception as e:
         logger.exception("Fallen angel alert failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/bull-put/scan", methods=["GET"])
+def api_bull_put_scan():
+    force = request.args.get("force", "false").lower() == "true"
+    try:
+        with _bp_lock:
+            age = time.time() - _bp_cache["ts"]
+            if force or _bp_cache["data"] is None or age > BP_CACHE_TTL:
+                logger.info("Running bull put scan (force=%s age=%.0fs)", force, age)
+                from src.analysis.bull_put_scanner import scan as bp_scan
+                vix = get_data()["vix"]
+                _bp_cache["data"] = bp_scan(vix_now=vix["now"], vix_prev=vix["prev"])
+                _bp_cache["ts"]   = time.time()
+        return jsonify({"ok": True, "results": _bp_cache["data"],
+                        "timestamp": datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")})
+    except Exception as e:
+        logger.exception("Bull put scan failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.route("/api/bull-put/alert", methods=["POST"])
+def api_bull_put_alert():
+    try:
+        with _bp_lock:
+            results = _bp_cache["data"]
+        if not results:
+            from src.analysis.bull_put_scanner import scan as bp_scan
+            vix = get_data()["vix"]
+            results = bp_scan(vix_now=vix["now"], vix_prev=vix["prev"])
+        d   = get_data()
+        fc  = d["spy"].get("full_chain") or {}
+        from src.analysis.bull_put_scanner import fmt_slack as bp_fmt
+        from src.notifications.slack_notifier import send_message
+        ts  = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
+        msg = bp_fmt(results, fc.get("regime", "UNKNOWN"), d["vix"]["now"], ts)
+        ok  = send_message(msg)
+        return jsonify({"ok": ok})
+    except Exception as e:
+        logger.exception("Bull put alert failed")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
