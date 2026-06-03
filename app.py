@@ -67,10 +67,12 @@ def _fetch_prices() -> tuple:
 
     spy = meta("SPY")
     qqq = meta("QQQ")
+    iwm = meta("IWM")
     vix = meta("^VIX")
     return (
         spy["regularMarketPrice"], spy["chartPreviousClose"],
         qqq["regularMarketPrice"], qqq["chartPreviousClose"],
+        iwm["regularMarketPrice"], iwm["chartPreviousClose"],
         vix["regularMarketPrice"], vix["chartPreviousClose"],
     )
 
@@ -97,7 +99,7 @@ def _scan_ticker(ticker: str, spot: float, prev: float,
     from src.live.alpaca_options import fetch_chain_for_gex
     from src.analysis.gex_scanner import compute_exposures
 
-    contracts = fetch_chain_for_gex(ticker, spot=spot, n_expiries=4)
+    contracts = fetch_chain_for_gex(ticker, spot=spot, n_expiries=6)
 
     c_by_dte: dict[int, list] = {}
     for c in contracts:
@@ -107,18 +109,33 @@ def _scan_ticker(ticker: str, spot: float, prev: float,
     c0 = c_by_dte.get(0) or contracts
     c1 = c_by_dte.get(1, [])
 
-    r0 = compute_exposures(spot, vix_now, vix_prev, c0) if c0 else None
-    r1 = compute_exposures(spot, vix_now, vix_prev, c1) if c1 else None
-    rA = compute_exposures(spot, vix_now, vix_prev, contracts) if contracts else None
+    # Weekly: nearest expiry 4–14 DTE (standard weekly option)
+    w_dte = next((d for d in sorted(c_by_dte) if 4 <= d <= 14), None)
+    c_wk  = c_by_dte.get(w_dte, [])
+
+    # Monthly: nearest expiry 15–60 DTE (standard monthly)
+    m_dte = next((d for d in sorted(c_by_dte) if 15 <= d <= 60), None)
+    c_mo  = c_by_dte.get(m_dte, [])
+
+    def _gex(cl):
+        return compute_exposures(spot, vix_now, vix_prev, cl) if cl else None
+
+    def _rdict(r, dte=None):
+        d = _r_to_dict(r)
+        if d is not None and dte is not None:
+            d["dte"] = dte
+        return d
 
     return {
         "spot":       spot,
         "prev_close": prev,
         "change":     round(spot - prev, 2),
         "change_pct": round((spot - prev) / prev * 100, 2),
-        "today":      _r_to_dict(r0),
-        "tomorrow":   _r_to_dict(r1),
-        "full_chain": _r_to_dict(rA),
+        "today":      _rdict(_gex(c0), 0),
+        "tomorrow":   _rdict(_gex(c1), 1),
+        "weekly":     _rdict(_gex(c_wk), w_dte),
+        "monthly":    _rdict(_gex(c_mo), m_dte),
+        "full_chain": _r_to_dict(_gex(contracts)),
     }
 
 
@@ -587,14 +604,16 @@ def _build_trade_idea(spy: dict, vix_now: float, vix_prev: float) -> dict:
 
 
 def _build_data() -> dict:
-    spy_spot, spy_prev, qqq_spot, qqq_prev, vix_now, vix_prev = _fetch_prices()
+    spy_spot, spy_prev, qqq_spot, qqq_prev, iwm_spot, iwm_prev, vix_now, vix_prev = _fetch_prices()
     spy   = _scan_ticker("SPY", spy_spot, spy_prev, vix_now, vix_prev)
     qqq   = _scan_ticker("QQQ", qqq_spot, qqq_prev, vix_now, vix_prev)
+    iwm   = _scan_ticker("IWM", iwm_spot, iwm_prev, vix_now, vix_prev)
     trade = _build_live_trade_idea(spy, vix_now, vix_prev)
     return {
         "timestamp":  datetime.now(ET).strftime("%Y-%m-%d %H:%M ET"),
         "spy":        spy,
         "qqq":        qqq,
+        "iwm":        iwm,
         "vix":        {
             "now":    vix_now,
             "prev":   vix_prev,

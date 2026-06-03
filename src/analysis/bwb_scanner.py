@@ -30,7 +30,8 @@ PRICE_MAX    = 150.0
 OI_PROXY_MIN = 5
 SPREAD_MAX   = 0.20
 DTE_MIN      = 7
-DTE_MAX      = 35
+DTE_MAX      = 45
+CREDIT_MIN   = 0.05   # reject any structure that doesn't collect at least a nickel
 
 
 def _fetch_spots(tickers: list[str]) -> dict[str, tuple[float, float]]:
@@ -142,6 +143,14 @@ def _suggest_bwb(spot: float, puts: list[dict]) -> Optional[dict]:
                         continue
                     lw = m_strike - l_strike
                     if lw > uw * 2.5:
+                        continue
+
+                    net_credit_check = round(
+                        ((m["bid"] + m["ask"]) / 2) * 2
+                        - (h["bid"] + h["ask"]) / 2
+                        - (l["bid"] + l["ask"]) / 2, 3
+                    )
+                    if net_credit_check < CREDIT_MIN:
                         continue
 
                     liq = h["oi_proxy"] + m["oi_proxy"] + l["oi_proxy"]

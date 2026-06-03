@@ -78,6 +78,9 @@
       <div id="qqq-panel"></div>
     </div>
 
+    <!-- IWM panel (Russell 2000) -->
+    <div id="iwm-panel" class="mb-4"></div>
+
     <!-- Trade idea -->
     <div id="trade-panel"></div>
 
@@ -520,38 +523,60 @@ function levelCard(label, r, spot, ladderId, barsId) {
 }
 
 // ── Ticker Panel ─────────────────────────────────────────────────────────────
+const _activeExpiryTab = {};
+
 function renderTickerPanel(panelId, name, data) {
   const el = $(panelId);
-  if (!el) return;
+  if (!el || !data) return;
+
   const chgCls = chgClass(data.change);
   const pct    = data.change_pct >= 0 ? `+${fmt(data.change_pct)}` : fmt(data.change_pct);
 
+  // Build available expiry tabs from what the API returned
+  const expiryOpts = [
+    { key: 'today',    label: 'Today',    dteLbl: '0DTE',  r: data.today    },
+    { key: 'tomorrow', label: 'Tomorrow', dteLbl: '1DTE',  r: data.tomorrow },
+    { key: 'weekly',   label: 'Weekly',   dteLbl: data.weekly?.dte  != null ? `${data.weekly.dte}DTE`  : 'Wkly', r: data.weekly   },
+    { key: 'monthly',  label: 'Monthly',  dteLbl: data.monthly?.dte != null ? `${data.monthly.dte}DTE` : 'Mo',   r: data.monthly  },
+  ].filter(e => e.r);
+
+  if (!expiryOpts.length) { el.innerHTML = ''; return; }
+
+  const activeKey = _activeExpiryTab[panelId] || expiryOpts[0].key;
+  const active    = expiryOpts.find(e => e.key === activeKey) || expiryOpts[0];
+
+  const tabsHtml = expiryOpts.map(e => `
+    <button onclick="_setExpiryTab('${panelId}', '${name}', '${e.key}')"
+      class="px-2 py-1 text-xs rounded border transition-colors ${activeKey === e.key
+        ? 'border-amber-600 bg-amber-900/40 text-amber-300 font-semibold'
+        : 'border-gray-700 text-gray-500 hover:text-gray-200 hover:border-gray-500'}">
+      ${e.label}<span class="ml-1 text-gray-600 text-xs">${e.dteLbl}</span>
+    </button>`).join('');
+
+  const ladderId = `${panelId}-ladder`;
+  const barsId   = `${panelId}-bars`;
+
   el.innerHTML = `
     <div class="bg-gray-900 rounded-lg border border-gray-800 overflow-hidden">
-      <!-- ticker header -->
-      <div class="px-4 py-3 bg-gray-800/50 flex items-center gap-4">
+      <div class="px-3 py-2.5 bg-gray-800/50 flex items-center gap-3 flex-wrap">
         <span class="text-white font-bold text-xl">${name}</span>
         <span class="text-white font-bold text-2xl">$${fmt(data.spot)}</span>
         <span class="${chgCls} text-sm">${data.change >= 0 ? '+' : ''}${fmt(data.change)} (${pct}%)</span>
+        <div class="flex gap-1.5 ml-auto flex-wrap">${tabsHtml}</div>
       </div>
-      <!-- level cards -->
-      <div class="p-3 grid grid-cols-1 md:grid-cols-2 gap-3">
-        <div>
-          <div class="text-xs text-gray-600 mb-2 uppercase tracking-wider font-semibold">Today</div>
-          ${levelCard('Today (0DTE)', data.today, data.spot, `${panelId}-today-ladder`, `${panelId}-today-bars`)}
-        </div>
-        <div>
-          <div class="text-xs text-gray-600 mb-2 uppercase tracking-wider font-semibold">Tomorrow</div>
-          ${levelCard('Tomorrow (1DTE)', data.tomorrow, data.spot, `${panelId}-tmrw-ladder`, `${panelId}-tmrw-bars`)}
-        </div>
+      <div class="p-3">
+        ${levelCard(`${active.label} (${active.dteLbl})`, active.r, data.spot, ladderId, barsId)}
       </div>
     </div>`;
 
-  // Now render the dynamic parts (ladders + bars need the elements to exist)
-  renderLadder(`${panelId}-today-ladder`, data.today, data.spot);
-  renderLadder(`${panelId}-tmrw-ladder`, data.tomorrow, data.spot);
-  renderBars(`${panelId}-today-bars`, data.today?.top_levels, data.spot);
-  renderBars(`${panelId}-tmrw-bars`, data.tomorrow?.top_levels, data.spot);
+  renderLadder(ladderId, active.r, data.spot);
+  renderBars(barsId, active.r?.top_levels, data.spot);
+}
+
+function _setExpiryTab(panelId, name, key) {
+  _activeExpiryTab[panelId] = key;
+  const dataMap = { 'spy-panel': gexData?.spy, 'qqq-panel': gexData?.qqq, 'iwm-panel': gexData?.iwm };
+  renderTickerPanel(panelId, name, dataMap[panelId]);
 }
 
 // ── VIX Bar ───────────────────────────────────────────────────────────────────
@@ -729,7 +754,8 @@ function renderPriceStrip(d) {
   const chips = [
     { name: 'SPY', data: d.spy },
     { name: 'QQQ', data: d.qqq },
-  ].map(({ name, data }) => {
+    { name: 'IWM', data: d.iwm },
+  ].filter(x => x.data).map(({ name, data }) => {
     const cls = chgClass(data.change);
     return `
       <span class="flex items-center gap-1.5">
@@ -759,6 +785,7 @@ function render(d) {
   renderVixBar(d.vix);
   renderTickerPanel('spy-panel', 'SPY', d.spy);
   renderTickerPanel('qqq-panel', 'QQQ', d.qqq);
+  if (d.iwm) renderTickerPanel('iwm-panel', 'IWM', d.iwm);
   renderTrade(d.trade_idea);
 
   const ts = $('last-updated');
