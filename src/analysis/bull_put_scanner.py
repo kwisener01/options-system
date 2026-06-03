@@ -29,34 +29,29 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 UNIVERSE: list[str] = [
-    # BWB universe — already liquid
+    # High-liquidity options, price range $10-$150 (1-5pt spreads meaningful)
     "BAC", "F", "T", "PFE", "INTC", "PYPL", "UBER",
     "PLTR", "SOFI", "HOOD", "DKNG", "CCL", "MU",
-    # Value watchlist
-    "KO", "AXP", "CVX", "KR", "BMY", "ABBV", "GILD",
-    # Large-cap with deep option markets
-    "JPM", "WFC", "MS", "GS", "C",
-    "AAPL", "MSFT", "AMZN", "META", "GOOGL",
-    "XOM", "HAL", "SLB",
-    "GE", "BA", "CAT",
-    # Index ETFs
-    "SPY", "QQQ", "IWM",
+    "KO", "AXP", "CVX", "KR", "GILD", "C", "WFC",
 ]
 
 PRICE_MIN    = 10.0
-PRICE_MAX    = 600.0
+PRICE_MAX    = 200.0
 DTE_MIN      = 7
 DTE_MAX      = 45
 SPREAD_MAX   = 0.25   # max bid/ask spread per leg
 OI_MIN       = 3      # min OI proxy per leg
-CREDIT_MIN_PCT = 0.50  # must collect > 50% of width
+CREDIT_MIN_PCT = 0.50  # must collect > 50% of width — reward > risk
 CREDIT_MIN_ABS = 0.05  # must collect at least a nickel
 
 STRONG_SCORE = 6
 WATCH_SCORE  = 4
 
-# Spread widths to try, in order of preference
-WIDTHS = [1.0, 2.0, 2.5, 3.0, 5.0]
+# Spread widths to try — wider for higher-priced stocks
+def _widths_for(spot: float) -> list[float]:
+    if spot >= 100: return [5.0, 7.5, 10.0, 2.5]
+    if spot >= 50:  return [2.5, 3.0, 5.0,  1.0]
+    return              [1.0, 2.0, 2.5, 3.0]
 
 
 # ── Data fetchers ─────────────────────────────────────────────────────────────
@@ -150,7 +145,7 @@ def _find_best_spread(spot: float, put_wall: float,
 
             short_mid = (short["bid"] + short["ask"]) / 2
 
-            for width in WIDTHS:
+            for width in _widths_for(spot):
                 long_target = short_s - width
                 # Find the nearest available strike to the long target
                 long_s = min(strikes, key=lambda s: abs(s - long_target))
@@ -202,21 +197,23 @@ def _find_best_spread(spot: float, put_wall: float,
                 if score > best_score:
                     best_score = score
                     best = {
-                        "expiry":      expiry,
-                        "dte":         dte,
-                        "short_strike": short_s,
-                        "long_strike":  long_s,
-                        "width":        act_width,
-                        "credit":       credit,
-                        "credit_pct":   round(credit_pct * 100, 1),
-                        "max_profit_usd": round(credit * 100, 0),
-                        "max_loss_usd":   round((act_width - credit) * 100, 0),
-                        "put_wall":     put_wall,
-                        "pw_distance":  round(abs(short_s - put_wall), 2),
-                        "liq_score":    min(round(liq / 8), 10),
-                        "short_bid":    short["bid"], "short_ask": short["ask"],
-                        "long_bid":     long["bid"],  "long_ask":  long["ask"],
-                        "score":        round(score, 1),
+                        "expiry":         str(expiry),
+                        "dte":            int(dte),
+                        "short_strike":   float(short_s),
+                        "long_strike":    float(long_s),
+                        "width":          float(act_width),
+                        "credit":         float(credit),
+                        "credit_pct":     float(round(credit_pct * 100, 1)),
+                        "max_profit_usd": int(round(credit * 100)),
+                        "max_loss_usd":   int(round((act_width - credit) * 100)),
+                        "put_wall":       float(put_wall),
+                        "pw_distance":    float(round(abs(short_s - put_wall), 2)),
+                        "liq_score":      int(min(round(liq / 8), 10)),
+                        "short_bid":      float(short["bid"]),
+                        "short_ask":      float(short["ask"]),
+                        "long_bid":       float(long["bid"]),
+                        "long_ask":       float(long["ask"]),
+                        "score":          float(round(score, 1)),
                     }
 
     return best
@@ -273,8 +270,8 @@ def _scan_one(ticker: str, spot: float, prev: float,
             result["note"] = "No GEX put wall — cannot anchor short strike"
             return result
 
-        result["put_wall"]   = round(put_wall, 2)
-        result["gex_regime"] = gex_regime
+        result["put_wall"]   = float(round(float(put_wall), 2))
+        result["gex_regime"] = str(gex_regime) if gex_regime else None
 
         candidate = _find_best_spread(spot, put_wall, puts)
         if not candidate:
