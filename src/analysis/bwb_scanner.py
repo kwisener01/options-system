@@ -185,15 +185,18 @@ def _compute_gex_context(spot: float, vix_now: float, vix_prev: float,
     try:
         from src.analysis.gex_scanner import compute_exposures
         r = compute_exposures(spot, vix_now, vix_prev, gex_contracts)
+        # Per-stock GEX always uses Alpaca indicative data (no real OI available).
+        # Mark regime as LOW confidence so the BWB analyzer treats it as neutral.
         return {
-            "regime":       r.gex_regime,
-            "flip_level":   r.flip_level,
-            "put_wall":     r.put_wall,
-            "call_wall":    r.call_wall,
-            "gamma_wall":   r.gamma_wall,
-            "vanna_signal": r.vanna_signal,
-            "charm_signal": r.charm_signal,
-            "gex":          round(r.net_gex_bn, 3),
+            "regime":             "UNKNOWN",   # Alpaca proxy OI — not reliable for regime
+            "flip_level":         r.flip_level,
+            "put_wall":           r.put_wall,
+            "call_wall":          r.call_wall,
+            "gamma_wall":         r.gamma_wall,
+            "vanna_signal":       r.vanna_signal,
+            "charm_signal":       r.charm_signal,
+            "gex":                round(r.net_gex_bn, 3),
+            "regime_confidence":  "LOW",
         }
     except Exception as e:
         logger.warning("GEX computation failed: %s", e)
@@ -376,3 +379,49 @@ def scan(tickers: list[str] = None, tier: str = "low_risk",
     logger.info("BWB scan complete: %d/%d candidates, %d with GEX",
                 n_candidates, len(results), n_with_gex)
     return results
+
+
+def fmt_slack(results: list[dict], tier: str, spy_regime: str,
+              vix_now: float, timestamp: str) -> str:
+    """Format BWB scan results for Slack."""
+    tier_label = tier.replace("_", " ").title()
+    lines = [
+        f":butterfly: *BWB Scanner — {timestamp}*  ({tier_label})",
+        f"SPY: `{spy_regime.replace('_', ' ').title()}` | VIX {vix_now:.2f}",
+        "",
+    ]
+
+    candidates = [r for r in results if r.get("candidate")]
+    skipped    = [r for r in results if not r.get("candidate") and r.get("price_ok")]
+
+    if not candidates:
+        lines.append("_No viable BWB structures found today._")
+        if skipped:
+            lines.append(f"_Scanned: {', '.join(r['ticker'] for r in results)} — no qualifying setups._")
+        return "\n".join(lines)
+
+    for r in candidates:
+        c   = r["candidate"]
+        an  = c.get("analysis") or {}
+        gc  = r.get("gex_context") or {}
+
+        rating = an.get("rating", "—")
+        rating_icon = ":white_check_mark:" if rating == "A+" else ":large_blue_circle:" if rating == "Acceptable" else ":warning:"
+        chg_str = f"{r['change_pct']:+.1f}%"
+        credit_str = f"+${c['credit']:.2f}" if c.get("credit") is not None and c["credit"] >= 0 else f"-${abs(c.get('credit',0)):.2f}"
+        risk_str   = f"${int(an['max_loss_usd'])}" if an.get("max_loss_usd") else "?"
+        rr_str     = f"{an['rr_ratio']:.1f}×" if an.get("rr_ratio") else "?"
+        regime_str = gc.get("regime", "").replace("_", " ").title() if gc else "SPY proxy"
+        ew_str     = f"  ⚠ Earnings {c.get('earnings_date')}" if c.get("earnings_warning") else ""
+
+        lines += [
+            f"{rating_icon} *{r['ticker']} ${r['spot']:.2f}* ({chg_str})  ·  {rating}",
+            f"  `BUY ${c['long_upper']}P / SELL 2× ${c['short_strike']}P / BUY ${c['long_lower']}P`  ·  {c['dte']}DTE",
+            f"  Credit {credit_str}  ·  Max risk {risk_str}  ·  R:R {rr_str}  ·  GEX: {regime_str}{ew_str}",
+            "",
+        ]
+
+    n = len(candidates)
+    total = len(results)
+    lines.append(f"_{n} of {total} ticker{'s' if total != 1 else ''} {'have' if n != 1 else 'has'} a viable BWB structure today._")
+    return "\n".join(lines)

@@ -7,6 +7,8 @@
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     body { font-family: 'Courier New', monospace; }
+    .scrollbar-hide::-webkit-scrollbar { display: none; }
+    .scrollbar-hide { -ms-overflow-style: none; scrollbar-width: none; }
     .price-ladder { position: relative; height: 180px; }
     .ladder-row {
       position: absolute; left: 0; right: 0;
@@ -25,29 +27,30 @@
 <body class="bg-gray-950 text-gray-100 min-h-screen">
 
 <!-- ── Header ── -->
-<header class="bg-gray-900 border-b border-gray-800 px-4 py-3 flex items-center justify-between">
-  <div class="flex items-center gap-3">
-    <span class="text-amber-400 font-bold text-lg">GEX</span>
-    <span class="text-gray-500 text-sm">Dealer Exposure Dashboard</span>
+<header class="bg-gray-900 border-b border-gray-800">
+  <!-- Row 1: brand + live price strip -->
+  <div class="px-3 pt-2.5 pb-1 flex items-center gap-2 min-w-0">
+    <span class="text-amber-400 font-bold text-lg shrink-0">GEX</span>
+    <div id="price-strip" class="flex items-center gap-3 text-sm overflow-x-auto min-w-0 flex-1 scrollbar-hide">
+      <span class="text-gray-600 text-xs">Loading…</span>
+    </div>
+    <span id="last-updated" class="text-gray-600 text-xs shrink-0 hidden sm:inline whitespace-nowrap"></span>
   </div>
-  <div id="price-strip" class="flex items-center gap-4 text-sm">
-    <span class="text-gray-600">Loading...</span>
-  </div>
-  <div class="flex items-center gap-2">
-    <span id="last-updated" class="text-gray-600 text-xs"></span>
-    <button onclick="refreshData()" class="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 rounded border border-gray-700 transition-colors">
+  <!-- Row 2: action buttons -->
+  <div class="px-3 pb-2 flex items-center gap-1.5 flex-wrap">
+    <button onclick="refreshData()" class="px-2.5 py-1.5 text-xs bg-gray-800 hover:bg-gray-700 rounded border border-gray-700 transition-colors">
       ↻ Refresh
     </button>
-    <button onclick="runWatchlist()" class="px-3 py-1 text-xs bg-emerald-700 hover:bg-emerald-600 rounded border border-emerald-500 transition-colors font-semibold">
+    <button onclick="runWatchlist()" class="px-2.5 py-1.5 text-xs bg-emerald-700 hover:bg-emerald-600 rounded border border-emerald-500 transition-colors font-semibold">
       📈 Watchlist
     </button>
-    <button onclick="runFallenAngels()" class="px-3 py-1 text-xs bg-rose-800 hover:bg-rose-700 rounded border border-rose-600 transition-colors font-semibold">
+    <button onclick="runFallenAngels()" class="px-2.5 py-1.5 text-xs bg-rose-800 hover:bg-rose-700 rounded border border-rose-600 transition-colors font-semibold">
       🕊 Angels
     </button>
-    <button onclick="openBWB()" class="px-3 py-1 text-xs bg-amber-700 hover:bg-amber-600 rounded border border-amber-500 transition-colors font-semibold">
+    <button onclick="openBWB()" class="px-2.5 py-1.5 text-xs bg-amber-700 hover:bg-amber-600 rounded border border-amber-500 transition-colors font-semibold">
       🦋 BWB
     </button>
-    <button id="slack-btn" onclick="sendSlack()" class="px-3 py-1 text-xs bg-indigo-700 hover:bg-indigo-600 rounded border border-indigo-500 transition-colors font-semibold">
+    <button id="slack-btn" onclick="sendSlack()" class="px-2.5 py-1.5 text-xs bg-indigo-700 hover:bg-indigo-600 rounded border border-indigo-500 transition-colors font-semibold">
       → Slack
     </button>
   </div>
@@ -82,37 +85,39 @@
 
   <!-- BWB Watchlist Scanner (always visible) -->
   <div class="mt-4 bg-gray-900 rounded-lg border border-gray-800 overflow-hidden">
-      <div class="px-4 py-3 bg-gray-800/50 flex items-center justify-between">
-        <div class="flex items-center gap-3">
-          <span class="text-amber-400 font-bold text-sm">🦋 BWB Watchlist</span>
-          <div class="flex gap-2">
-            <button onclick="runScan('low_risk')" id="scan-btn-low"
-              class="px-2 py-0.5 text-xs rounded border border-amber-700 bg-amber-900/40 hover:bg-amber-800/60 text-amber-300 transition-colors">
-              Low Risk
-            </button>
-            <button onclick="runScan('medium_risk')" id="scan-btn-med"
-              class="px-2 py-0.5 text-xs rounded border border-gray-700 hover:border-gray-500 text-gray-400 hover:text-gray-200 transition-colors">
-              Medium Risk
-            </button>
-            <button onclick="runScan('all')" id="scan-btn-all"
-              class="px-2 py-0.5 text-xs rounded border border-gray-700 hover:border-gray-500 text-gray-400 hover:text-gray-200 transition-colors">
-              All
-            </button>
-          </div>
+      <div class="px-3 py-2.5 bg-gray-800/50 flex items-center gap-2 flex-wrap">
+        <span class="text-amber-400 font-bold text-sm shrink-0">🦋 BWB Watchlist</span>
+        <div class="flex gap-1.5">
+          <button onclick="runScan('low_risk')" id="scan-btn-low"
+            class="px-2 py-1 text-xs rounded border border-amber-700 bg-amber-900/40 hover:bg-amber-800/60 text-amber-300 transition-colors">
+            Low Risk
+          </button>
+          <button onclick="runScan('medium_risk')" id="scan-btn-med"
+            class="px-2 py-1 text-xs rounded border border-gray-700 hover:border-gray-500 text-gray-400 hover:text-gray-200 transition-colors">
+            Med Risk
+          </button>
+          <button onclick="runScan('all')" id="scan-btn-all"
+            class="px-2 py-1 text-xs rounded border border-gray-700 hover:border-gray-500 text-gray-400 hover:text-gray-200 transition-colors">
+            All
+          </button>
         </div>
-        <div class="flex items-center gap-3">
-          <span id="scan-ts" class="text-gray-600 text-xs"></span>
+        <div class="flex items-center gap-1.5 ml-auto">
+          <span id="scan-ts" class="text-gray-600 text-xs hidden sm:inline"></span>
           <button onclick="runScan(currentScanTier, true)"
-            class="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 rounded border border-gray-700 transition-colors">
+            class="px-2.5 py-1 text-xs bg-gray-800 hover:bg-gray-700 rounded border border-gray-700 transition-colors">
             ↻ Re-scan
+          </button>
+          <button id="bwb-slack-btn" onclick="sendBWBSlack()"
+            class="px-2.5 py-1 text-xs bg-indigo-700 hover:bg-indigo-600 rounded border border-indigo-500 transition-colors font-semibold">
+            → Slack
           </button>
         </div>
       </div>
       <div id="scan-loading" class="hidden text-center py-8 text-gray-500 text-sm">
         <div class="pulse inline-block mr-2">⟳</div>Scanning option chains…
       </div>
-      <div id="scan-results" class="hidden">
-        <table class="w-full text-sm">
+      <div id="scan-results" class="hidden overflow-x-auto">
+        <table class="w-full text-sm min-w-[640px]">
           <thead>
             <tr class="border-b border-gray-800 text-gray-500 text-xs uppercase tracking-wider">
               <th class="text-left px-4 py-2">Ticker</th>
@@ -137,19 +142,17 @@
 
 <!-- ── Value Watchlist Panel ── -->
 <div class="mx-4 mb-4 bg-gray-900 rounded-lg border border-gray-800 overflow-hidden">
-  <div class="px-4 py-3 bg-gray-800/50 flex items-center justify-between">
-    <div class="flex items-center gap-3">
-      <span class="text-emerald-400 font-bold text-sm">📈 Value Watchlist</span>
-      <span class="text-gray-600 text-xs">Own Now · Own Lower</span>
-    </div>
-    <div class="flex items-center gap-3">
-      <span id="wl-ts" class="text-gray-600 text-xs"></span>
+  <div class="px-3 py-2.5 bg-gray-800/50 flex items-center gap-2 flex-wrap">
+    <span class="text-emerald-400 font-bold text-sm shrink-0">📈 Value Watchlist</span>
+    <span class="text-gray-600 text-xs hidden sm:inline">Own Now · Own Lower</span>
+    <div class="flex items-center gap-1.5 ml-auto">
+      <span id="wl-ts" class="text-gray-600 text-xs hidden sm:inline"></span>
       <button onclick="runWatchlist(true)"
-        class="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 rounded border border-gray-700 transition-colors">
+        class="px-2.5 py-1 text-xs bg-gray-800 hover:bg-gray-700 rounded border border-gray-700 transition-colors">
         ↻ Re-scan
       </button>
       <button id="wl-slack-btn" onclick="sendWatchlistSlack()"
-        class="px-3 py-1 text-xs bg-indigo-700 hover:bg-indigo-600 rounded border border-indigo-500 transition-colors font-semibold">
+        class="px-2.5 py-1 text-xs bg-indigo-700 hover:bg-indigo-600 rounded border border-indigo-500 transition-colors font-semibold">
         → Slack
       </button>
     </div>
@@ -185,19 +188,17 @@
 
 <!-- ── Fallen Angels Panel ── -->
 <div class="mx-4 mb-4 bg-gray-900 rounded-lg border border-rose-900/60 overflow-hidden">
-  <div class="px-4 py-3 bg-gray-800/50 flex items-center justify-between">
-    <div class="flex items-center gap-3">
-      <span class="text-rose-400 font-bold text-sm">🕊 Fallen Angels</span>
-      <span class="text-gray-600 text-xs">Beaten-down large-caps near floor · P/C ratio + GEX confirmation</span>
-    </div>
-    <div class="flex items-center gap-3">
-      <span id="fa-ts" class="text-gray-600 text-xs"></span>
+  <div class="px-3 py-2.5 bg-gray-800/50 flex items-center gap-2 flex-wrap">
+    <span class="text-rose-400 font-bold text-sm shrink-0">🕊 Fallen Angels</span>
+    <span class="text-gray-600 text-xs hidden sm:inline">Floor + P/C + GEX</span>
+    <div class="flex items-center gap-1.5 ml-auto">
+      <span id="fa-ts" class="text-gray-600 text-xs hidden sm:inline"></span>
       <button onclick="runFallenAngels(true)"
-        class="px-3 py-1 text-xs bg-gray-800 hover:bg-gray-700 rounded border border-gray-700 transition-colors">
+        class="px-2.5 py-1 text-xs bg-gray-800 hover:bg-gray-700 rounded border border-gray-700 transition-colors">
         ↻ Re-scan
       </button>
       <button id="fa-slack-btn" onclick="sendFallenAngelsSlack()"
-        class="px-3 py-1 text-xs bg-indigo-700 hover:bg-indigo-600 rounded border border-indigo-500 transition-colors font-semibold">
+        class="px-2.5 py-1 text-xs bg-indigo-700 hover:bg-indigo-600 rounded border border-indigo-500 transition-colors font-semibold">
         → Slack
       </button>
     </div>
@@ -237,8 +238,8 @@
 <div id="toast" class="hidden fixed bottom-6 right-6 px-4 py-2 rounded-lg text-sm font-semibold shadow-lg transition-all"></div>
 
 <!-- ── BWB Analyzer Modal ── -->
-<div id="bwb-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm p-4">
-  <div class="bg-gray-900 border border-gray-700 rounded-xl w-full max-w-3xl max-h-[90vh] overflow-y-auto shadow-2xl">
+<div id="bwb-modal" class="hidden fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/70 backdrop-blur-sm sm:p-4">
+  <div class="bg-gray-900 border-t sm:border border-gray-700 rounded-t-2xl sm:rounded-xl w-full max-w-3xl max-h-[92vh] sm:max-h-[90vh] overflow-y-auto shadow-2xl">
 
     <!-- modal header -->
     <div class="flex items-center justify-between px-5 py-4 border-b border-gray-800">
@@ -260,7 +261,7 @@
       <!-- structure inputs -->
       <div>
         <div class="text-gray-500 text-xs uppercase tracking-wider mb-2 font-semibold">Structure  <span class="text-gray-600 normal-case">(Buy H / Sell 2× M / Buy L)</span></div>
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <div>
             <label class="text-xs text-gray-500 mb-1 block">Ticker</label>
             <input id="bwb-ticker" list="bwb-ticker-list" value="SPY"
@@ -331,7 +332,7 @@
       <div id="bwb-rating-banner" class="rounded-lg p-4 text-center font-bold text-xl"></div>
 
       <!-- risk math + context grid -->
-      <div class="grid grid-cols-2 gap-3">
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
 
         <div class="bg-gray-800/60 rounded-lg p-3">
           <div class="text-gray-500 text-xs uppercase tracking-wider mb-2 font-semibold">Risk Math</div>
@@ -357,7 +358,7 @@
       </div>
 
       <!-- main risk + exit + overnight -->
-      <div class="grid grid-cols-1 md:grid-cols-3 gap-3">
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div class="bg-gray-800/60 rounded-lg p-3">
           <div class="text-red-400 text-xs font-semibold uppercase tracking-wider mb-1">Main Risk</div>
           <div id="bwb-main-risk" class="text-sm text-gray-300"></div>
@@ -1291,6 +1292,22 @@ function renderWatchlist(signals) {
         <td class="px-3 py-2.5 text-center">${signalBadgeWL(s.signal, s.score)}</td>
       </tr>`;
   }).join('');
+}
+
+// ── BWB Slack ─────────────────────────────────────────────────────────────────
+async function sendBWBSlack() {
+  const btn = $('bwb-slack-btn');
+  btn.disabled = true; btn.textContent = 'Sending…';
+  try {
+    const url  = `/api/bwb/alert?tier=${currentScanTier}`;
+    const resp = await fetch(url, { method: 'POST' });
+    const json = await resp.json();
+    showToast(json.ok ? '✓ BWB scan sent to Slack' : '✗ ' + json.error, json.ok);
+  } catch(err) {
+    showToast('✗ ' + err.message, false);
+  } finally {
+    btn.disabled = false; btn.textContent = '→ Slack';
+  }
 }
 
 // ── Fallen Angels ─────────────────────────────────────────────────────────────

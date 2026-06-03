@@ -161,15 +161,7 @@ def _fetch_options_flow(ticker: str, spot: float) -> dict:
                             for c in contracts if c.get("option_type") == "put")
         pc_ratio = round(total_put_oi / total_call_oi, 2) if total_call_oi > 0 else None
 
-        # GEX levels
-        vix_now, vix_prev = 20.0, 20.0   # neutral estimate when called standalone
-        try:
-            from src.live.alpaca_options import get_vix
-            vix_now, vix_prev = get_vix()
-        except Exception:
-            pass
-
-        gex = compute_exposures(spot, vix_now, vix_prev, contracts)
+        gex = compute_exposures(spot, 20.0, 20.0, contracts)
         return {
             "put_call_ratio": pc_ratio,
             "put_wall":       gex.put_wall,

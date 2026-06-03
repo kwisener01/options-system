@@ -576,7 +576,7 @@ def fmt_slack(signals: list[dict], spy_regime: str, vix_now: float,
         for s in sell:
             lines += [
                 f":red_circle: *{s['ticker']} ${s['spot']:.2f}*"
-                f"  ({s['label'].replace('_',' ').title()})  ▼ SELL  {s['score']}/15",
+                f"  ({s['label'].replace('_',' ').title()})  ▼ SELL  {s['score']}",
             ]
             for t in s.get("sell_triggers", []):
                 lines.append(f"  ⚠ {t}")
@@ -591,7 +591,7 @@ def fmt_slack(signals: list[dict], spy_regime: str, vix_now: float,
                     if s["earnings_date"] else "")
         lines += [
             f":white_check_mark: *{s['ticker']} ${s['spot']:.2f}*"
-            f"  ({s['label'].replace('_',' ').title()})  ★ BUY NOW  {s['score']}/15",
+            f"  ({s['label'].replace('_',' ').title()})  ★ BUY NOW  {s['score']}",
         ]
         for r in s["reasons"]:
             lines.append(f"  ✓ {r}")
@@ -604,7 +604,7 @@ def fmt_slack(signals: list[dict], spy_regime: str, vix_now: float,
     for s in watch:
         lines += [
             f":eyes: *{s['ticker']} ${s['spot']:.2f}*"
-            f"  ({s['label'].replace('_',' ').title()})  ◎ ACCUMULATE  {s['score']}/15",
+            f"  ({s['label'].replace('_',' ').title()})  ◎ ACCUMULATE  {s['score']}",
         ]
         for r in s["reasons"]:
             lines.append(f"  ✓ {r}")

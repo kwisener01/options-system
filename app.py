@@ -772,6 +772,30 @@ def api_watchlist_alert():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/bwb/alert", methods=["POST"])
+def api_bwb_alert():
+    """Post BWB scan results to Slack."""
+    try:
+        tier = request.args.get("tier", "low_risk")
+        with _scan_lock:
+            results = _scan_cache["data"]
+        if not results:
+            from src.analysis.bwb_scanner import scan
+            vix = get_data()["vix"]
+            results = scan(tier=tier, vix_now=vix["now"], vix_prev=vix["prev"])
+        d  = get_data()
+        fc = d["spy"].get("full_chain") or {}
+        from src.analysis.bwb_scanner import fmt_slack as bwb_fmt
+        from src.notifications.slack_notifier import send_message
+        ts  = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
+        msg = bwb_fmt(results, tier, fc.get("regime", "UNKNOWN"), d["vix"]["now"], ts)
+        ok  = send_message(msg)
+        return jsonify({"ok": ok})
+    except Exception as e:
+        logger.exception("BWB alert failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/fallen-angels", methods=["GET"])
 def api_fallen_angels():
     """Scan for beaten-down large-caps near multi-year floor."""
