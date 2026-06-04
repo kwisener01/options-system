@@ -1386,9 +1386,10 @@ async function runBullPut(force = false) {
     const ts = $('bp-ts');
     if (ts) ts.textContent = `Updated: ${new Date().toLocaleTimeString()}`;
   } catch(err) {
-    showToast('Bull put scan error: ' + err.message, false);
+    const msg = err.message.includes('token') ? 'Server needs restart — new route not loaded yet' : err.message;
+    showToast('Bull put error: ' + msg, false);
     $('bp-empty').classList.remove('hidden');
-    $('bp-empty').textContent = 'Scan failed: ' + err.message;
+    $('bp-empty').textContent = msg.includes('restart') ? '⚠ Restart the Flask server to load the new scanner, then try again.' : 'Scan failed: ' + err.message;
   } finally {
     $('bp-loading').classList.add('hidden');
   }

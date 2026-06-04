@@ -29,10 +29,11 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 UNIVERSE: list[str] = [
-    # High-liquidity options, price range $10-$150 (1-5pt spreads meaningful)
+    # BWB universe (already confirmed liquid options)
     "BAC", "F", "T", "PFE", "INTC", "PYPL", "UBER",
     "PLTR", "SOFI", "HOOD", "DKNG", "CCL", "MU",
-    "KO", "AXP", "CVX", "KR", "GILD", "C", "WFC",
+    # Value watchlist additions (price $10–$200)
+    "KO", "CVX", "KR", "GILD", "C", "WFC", "BMY", "ABBV",
 ]
 
 PRICE_MIN    = 10.0
