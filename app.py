@@ -1573,8 +1573,8 @@ def _cmd_eod(resp_url: str):
 HELP_TEXT = (
     ":robot_face: *Trader Bot Commands*\n\n"
     "`/positions`  — show all open positions + close suggestions\n"
-    "`/close TICKER`  — market-sell a stock/ETF position\n"
-    "  _e.g._ `/close VBR`\n\n"
+    "`/close_position TICKER`  — market-sell a stock/ETF position\n"
+    "  _e.g._ `/close_position VBR`\n\n"
     "`/place TICKER SHORT LONG EXPIRY [QTY]`  — place bull put credit spread\n"
     "  _e.g._ `/place KO 82.5 80 2026-07-17`\n\n"
     "`/scan`  — run bull put scanner now + send results\n"
@@ -1591,6 +1591,10 @@ def slack_command():
     command  = request.form.get("command", "").lstrip("/").lower()
     text     = request.form.get("text", "").strip()
     resp_url = request.form.get("response_url", "")
+
+    # Normalise — /close_position is the Slack-safe alias for /close
+    if command == "close_position":
+        command = "close"
 
     # Acknowledge immediately — Slack requires response within 3 seconds
     ack_map = {
