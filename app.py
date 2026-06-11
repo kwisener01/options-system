@@ -899,6 +899,17 @@ def api_bull_put_alert():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/eod-report", methods=["POST"])
+def api_eod_report():
+    """Manually trigger the EOD report + close suggestions to Slack."""
+    try:
+        _eod_report_job()
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.exception("Manual EOD report failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/bwb/scan", methods=["GET"])
 def api_bwb_scan():
     tier  = request.args.get("tier", "low_risk")
@@ -1146,6 +1157,128 @@ def _bull_put_scan_job():
         logger.error("_bull_put_scan_job error: %s", e)
 
 
+# ── EOD Report + Close Suggestions ───────────────────────────────────────────
+
+def _eod_report_job():
+    """Runs at 4:05 PM ET Mon-Fri. Sends daily P&L, full P&L, and close suggestions."""
+    try:
+        from src.live.alpaca_options import _trading
+        from src.notifications.slack_notifier import send_message
+        from alpaca.trading.requests import GetPortfolioHistoryRequest
+        from datetime import date, timedelta
+
+        client  = _trading()
+        acct    = client.get_account()
+        equity  = float(acct.equity)
+        cash    = float(acct.cash)
+        bp      = float(getattr(acct, "options_buying_power", 0) or 0)
+        now_str = datetime.now(ET).strftime("%A %b %d, %Y")
+
+        # -- Portfolio history: daily P&L and 30-day P&L ----------------------
+        try:
+            hist_1m = client.get_portfolio_history(
+                GetPortfolioHistoryRequest(period="1M", timeframe="1D")
+            )
+            eq_series = hist_1m.equity or []
+            pl_series = hist_1m.profit_loss or []
+            start_eq  = eq_series[0]  if eq_series  else equity
+            daily_pl  = pl_series[-1] if pl_series  else 0.0
+            full_pl   = equity - start_eq
+            daily_pct = (daily_pl / (equity - daily_pl) * 100) if equity != daily_pl else 0
+            full_pct  = (full_pl  / start_eq * 100)            if start_eq            else 0
+        except Exception as e:
+            logger.warning("Portfolio history fetch failed: %s", e)
+            daily_pl = full_pl = daily_pct = full_pct = 0.0
+            start_eq = equity
+
+        # -- Positions --------------------------------------------------------
+        positions = client.get_all_positions()
+        stocks  = [p for p in positions if len(p.symbol) <= 6]
+        options = [p for p in positions if len(p.symbol) > 6]
+
+        def _fmt_pos(p):
+            unreal = float(getattr(p, "unrealized_pl",    0) or 0)
+            pct    = float(getattr(p, "unrealized_plpc",  0) or 0) * 100
+            mkt    = float(getattr(p, "market_value",     0) or 0)
+            icon   = ":green_circle:" if unreal >= 0 else ":red_circle:"
+            return f"  {icon} `{p.symbol}`  mkt=${mkt:,.2f}  P&L=${unreal:+,.2f} ({pct:+.1f}%)"
+
+        stock_lines  = "\n".join(_fmt_pos(p) for p in stocks)  or "  _none_"
+        option_lines = "\n".join(_fmt_pos(p) for p in options) or "  _none_"
+
+        # -- Close suggestions ------------------------------------------------
+        suggestions = []
+        today = date.today()
+
+        for p in stocks:
+            pct = float(getattr(p, "unrealized_plpc", 0) or 0) * 100
+            if pct <= -8:
+                suggestions.append(
+                    f":rotating_light: *CLOSE `{p.symbol}`* — down {pct:.1f}% from cost. Stop-loss zone."
+                )
+            elif pct >= 20:
+                suggestions.append(
+                    f":moneybag: *TRIM `{p.symbol}`* — up {pct:.1f}%. Consider taking partial profit."
+                )
+
+        for p in options:
+            unreal = float(getattr(p, "unrealized_pl", 0) or 0)
+            mkt    = float(getattr(p, "market_value",  0) or 0)
+            qty    = float(p.qty)
+            # Parse DTE from OCC symbol (YYMMDD at positions 3-9 for 2-char roots, or similar)
+            try:
+                sym = p.symbol
+                type_pos = len(sym) - 9
+                raw_date = sym[type_pos - 6: type_pos]
+                exp_date = date(2000 + int(raw_date[0:2]), int(raw_date[2:4]), int(raw_date[4:6]))
+                dte = (exp_date - today).days
+            except Exception:
+                dte = 99
+
+            if dte <= 3:
+                suggestions.append(
+                    f":warning: *REVIEW `{p.symbol}`* — {dte} DTE. Expires soon; close or let expire."
+                )
+            # For short options (negative market value = liability), check if > 50% profit
+            cost_basis = float(getattr(p, "cost_basis", 0) or 0)
+            if qty < 0 and cost_basis != 0:
+                profit_pct = (abs(cost_basis) - abs(mkt)) / abs(cost_basis) * 100
+                if profit_pct >= 50:
+                    suggestions.append(
+                        f":white_check_mark: *CLOSE `{p.symbol}`* — {profit_pct:.0f}% of max profit captured. Lock it in."
+                    )
+
+        suggestion_block = (
+            "\n".join(suggestions)
+            if suggestions
+            else "  _No action needed — hold current positions._"
+        )
+
+        # -- Build message ----------------------------------------------------
+        d_icon = ":chart_with_upwards_trend:" if daily_pl >= 0 else ":chart_with_downwards_trend:"
+        f_icon = ":chart_with_upwards_trend:" if full_pl  >= 0 else ":chart_with_downwards_trend:"
+
+        msg = (
+            f":bar_chart: *EOD Report — {now_str}*\n\n"
+            f"*Portfolio:* ${equity:,.2f}   "
+            f"*Cash:* ${cash:,.2f}   "
+            f"*Options BP:* ${bp:,.2f}\n\n"
+            f"{d_icon} *Today's P&L:*  ${daily_pl:+,.2f}  ({daily_pct:+.1f}%)\n"
+            f"{f_icon} *30-Day P&L:*   ${full_pl:+,.2f}  ({full_pct:+.1f}%)  "
+            f"_(start ${start_eq:,.2f})_\n\n"
+            f"*Stocks ({len(stocks)}):*\n{stock_lines}\n\n"
+            f"*Options ({len(options)}):*\n{option_lines}\n\n"
+            f"*Close / Action Suggestions:*\n{suggestion_block}"
+        )
+        send_message(msg)
+        logger.info("EOD report sent")
+
+    except Exception as e:
+        logger.error("_eod_report_job error: %s", e)
+        from src.notifications.slack_notifier import send_message as _sm
+        _sm(f":rotating_light: EOD report error: {e}")
+
+
 def _start_scheduler():
     """Start background scheduler once — guarded against double-start in reloaders."""
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -1155,8 +1288,10 @@ def _start_scheduler():
                   id="bull_put_morning",   replace_existing=True)
     sched.add_job(_bull_put_scan_job, "cron", day_of_week="mon-fri", hour=12, minute=30,
                   id="bull_put_midday",    replace_existing=True)
+    sched.add_job(_eod_report_job,   "cron", day_of_week="mon-fri", hour=16, minute=5,
+                  id="eod_report",         replace_existing=True)
     sched.start()
-    logger.info("Bull put scheduler started (9:45 AM + 12:30 PM ET, Mon-Fri)")
+    logger.info("Scheduler started: bull put 9:45/12:30, EOD report 4:05 PM ET (Mon-Fri)")
     return sched
 
 
