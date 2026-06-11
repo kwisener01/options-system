@@ -1214,6 +1214,7 @@ def _bull_put_scan_job():
     """
     try:
         from src.analysis.bull_put_scanner import scan as bp_scan, fmt_slack as bp_fmt
+        from src.analysis.gex_scanner import scan as gex_scan, format_gex_message
         from src.notifications.slack_notifier import send_message
 
         session = "Morning" if datetime.now(ET).hour < 12 else "Midday"
@@ -1221,6 +1222,20 @@ def _bull_put_scan_job():
         d       = get_data()
         vix     = d["vix"]
         fc      = d["spy"].get("full_chain") or {}
+
+        # -- SPY / VIX / GEX block --------------------------------------------
+        gex_block = ""
+        try:
+            gex_result = gex_scan()
+            if gex_result:
+                gex_block = format_gex_message(gex_result, session=session.lower())
+        except Exception as e:
+            logger.warning("GEX scan failed in scan job: %s", e)
+            gex_block = (
+                f":bar_chart: *SPY Greeks*\n"
+                f"  VIX {vix['now']:.2f} ({vix['change']:+.2f})  |  "
+                f"Regime: {fc.get('regime','?').replace('_',' ').title()}"
+            )
 
         # -- Position review --------------------------------------------------
         close_block, pos_block = _build_position_summary()
@@ -1259,12 +1274,13 @@ def _bull_put_scan_job():
             )
 
         # -- Assemble message -------------------------------------------------
-        sections = [
-            f":mag: *{session} Scan — {ts}*",
-            f"VIX {vix['now']:.2f}  |  SPY regime: {fc.get('regime','?').replace('_',' ').title()}",
-        ]
+        sections = [f":mag: *{session} Scan — {ts}*"]
 
-        # Close suggestions (always show if any)
+        # SPY / VIX / GEX analysis
+        if gex_block:
+            sections += ["", gex_block]
+
+        # Close suggestions
         if close_block:
             sections += ["", "*--- CLOSE / ACTION ---*", close_block]
 
@@ -1276,7 +1292,7 @@ def _bull_put_scan_job():
         if open_lines:
             sections += ["", "*--- NEW SETUPS (place trade) ---*"] + open_lines
         else:
-            sections += ["", "_No qualifying setups right now._"]
+            sections += ["", "_No qualifying bull put setups right now._"]
 
         send_message("\n".join(sections))
         logger.info("Scan alert sent — %d STRONG, %d WATCH, close_tips=%s",
