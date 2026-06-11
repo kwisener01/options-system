@@ -10,7 +10,8 @@ ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets
 IS_PAPER = "paper" in ALPACA_BASE_URL
 
 # Slack
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL")
+SLACK_WEBHOOK_URL    = os.getenv("SLACK_WEBHOOK_URL")
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "")
 
 # Trading parameters — tunable via env vars (change in Render dashboard, no redeploy needed)
 ACCOUNT_RISK_PCT  = float(os.getenv("ACCOUNT_RISK_PCT", "0.08"))   # 8% per position

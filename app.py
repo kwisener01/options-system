@@ -7,6 +7,8 @@ Routes:
   POST /api/slack — post current data to Slack
   GET  /health    — Render health check
 """
+import hashlib
+import hmac
 import logging
 import os
 import sys
@@ -1420,6 +1422,202 @@ def _eod_report_job():
         logger.error("_eod_report_job error: %s", e)
         from src.notifications.slack_notifier import send_message as _sm
         _sm(f":rotating_light: EOD report error: {e}")
+
+
+# ── Slack Slash Commands ──────────────────────────────────────────────────────
+#
+# Register ALL commands in your Slack app pointing to ONE URL:
+#   https://<your-render-app>.onrender.com/slack/command
+#
+# Commands: /close  /place  /scan  /eod  /positions  /help
+
+def _verify_slack(req) -> bool:
+    secret = os.environ.get("SLACK_SIGNING_SECRET", "")
+    if not secret:
+        return True  # dev — skip verification
+    ts  = req.headers.get("X-Slack-Request-Timestamp", "0")
+    sig = req.headers.get("X-Slack-Signature", "")
+    if abs(time.time() - float(ts)) > 300:
+        return False
+    base     = f"v0:{ts}:{req.get_data(as_text=True)}"
+    expected = "v0=" + hmac.new(secret.encode(), base.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
+def _slack_respond(url: str, text: str):
+    """Post a delayed response back to Slack via response_url."""
+    import requests as _r
+    try:
+        _r.post(url, json={"text": text, "response_type": "in_channel"}, timeout=10)
+    except Exception as e:
+        logger.error("Slack response_url post failed: %s", e)
+
+
+def _cmd_positions(resp_url: str):
+    close_block, pos_block = _build_position_summary()
+    sections = [":clipboard: *Open Positions*", pos_block or "  _none_"]
+    if close_block:
+        sections += ["", "*Suggestions:*", close_block]
+    _slack_respond(resp_url, "\n".join(sections))
+
+
+def _cmd_close(ticker: str, resp_url: str):
+    from src.live.alpaca_options import _trading
+    from alpaca.trading.requests import MarketOrderRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    try:
+        client    = _trading()
+        positions = client.get_all_positions()
+        pos       = next((p for p in positions if p.symbol == ticker.upper()), None)
+        if pos is None:
+            _slack_respond(resp_url, f":x: No open position found for `{ticker.upper()}`.")
+            return
+        qty    = float(pos.qty)
+        unreal = float(getattr(pos, "unrealized_pl",   0) or 0)
+        pct    = float(getattr(pos, "unrealized_plpc", 0) or 0) * 100
+        mkt    = float(getattr(pos, "market_value",    0) or 0)
+        req = MarketOrderRequest(
+            symbol=ticker.upper(), qty=qty,
+            side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
+        )
+        order = client.submit_order(req)
+        icon  = ":green_circle:" if unreal >= 0 else ":red_circle:"
+        _slack_respond(resp_url,
+            f"{icon} *Closed `{ticker.upper()}`*\n"
+            f"  Qty {qty:.4f}  |  Mkt ${mkt:,.2f}  |  P&L ${unreal:+,.2f} ({pct:+.1f}%)\n"
+            f"  Order ID: `{order.id}`"
+        )
+    except Exception as e:
+        _slack_respond(resp_url, f":rotating_light: Close failed: {e}")
+
+
+def _cmd_place(args: str, resp_url: str):
+    """args: TICKER SHORT LONG EXPIRY [QTY]"""
+    from src.live.alpaca_options import _trading, get_mid_price, occ_symbol
+    from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    from datetime import date
+    try:
+        parts = args.split()
+        if len(parts) < 4:
+            _slack_respond(resp_url,
+                ":x: Usage: `/place TICKER SHORT LONG EXPIRY [QTY]`\n"
+                "  e.g. `/place KO 82.5 80 2026-07-17`")
+            return
+        ticker  = parts[0].upper()
+        short_k = float(parts[1])
+        long_k  = float(parts[2])
+        expiry  = date.fromisoformat(parts[3])
+        qty     = int(parts[4]) if len(parts) > 4 else 1
+
+        short_sym = occ_symbol(ticker, expiry, "PUT", short_k)
+        long_sym  = occ_symbol(ticker, expiry, "PUT", long_k)
+        width     = round(short_k - long_k, 2)
+        dte       = (expiry - date.today()).days
+
+        short_mid = get_mid_price(short_sym)
+        long_mid  = get_mid_price(long_sym)
+        if not short_mid or not long_mid:
+            _slack_respond(resp_url, f":x: Could not fetch quotes for `{ticker}` options.")
+            return
+
+        short_lim  = round(short_mid * 0.97, 2)
+        long_lim   = round(long_mid  * 1.03, 2)
+        net_credit = round(short_lim - long_lim, 2)
+        credit_pct = round(net_credit / width * 100, 1)
+        max_profit = round(net_credit * 100 * qty, 2)
+        max_loss   = round((width - net_credit) * 100 * qty, 2)
+
+        if net_credit <= 0:
+            _slack_respond(resp_url, f":x: Net credit is ${net_credit:.2f} — not a credit spread.")
+            return
+
+        acct = _trading().get_account()
+        bp   = float(getattr(acct, "options_buying_power", 0) or 0)
+        if bp < max_loss:
+            _slack_respond(resp_url,
+                f":x: Insufficient BP — need ${max_loss:.2f}, have ${bp:.2f}.")
+            return
+
+        legs = [
+            OptionLegRequest(symbol=short_sym, ratio_qty=qty,
+                             side=OrderSide.SELL, position_intent=PositionIntent.SELL_TO_OPEN),
+            OptionLegRequest(symbol=long_sym,  ratio_qty=qty,
+                             side=OrderSide.BUY,  position_intent=PositionIntent.BUY_TO_OPEN),
+        ]
+        order = _trading().submit_order(LimitOrderRequest(
+            symbol=ticker, qty=1, side=OrderSide.SELL,
+            type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
+            limit_price=net_credit, legs=legs,
+        ))
+        _slack_respond(resp_url,
+            f":white_check_mark: *Placed — Bull Put Spread*\n"
+            f"  `{ticker}` SELL ${short_k}P / BUY ${long_k}P  {dte}DTE  Qty {qty}\n"
+            f"  Credit +${net_credit:.2f} ({credit_pct:.1f}%)  "
+            f"Max profit +${max_profit:.0f}  Max loss -${max_loss:.0f}\n"
+            f"  Order ID: `{order.id}`"
+        )
+    except Exception as e:
+        _slack_respond(resp_url, f":rotating_light: Place failed: {e}")
+
+
+def _cmd_scan(resp_url: str):
+    _bull_put_scan_job()
+    # scan job sends its own Slack message; no need to double-post
+
+
+def _cmd_eod(resp_url: str):
+    _eod_report_job()
+
+
+HELP_TEXT = (
+    ":robot_face: *Trader Bot Commands*\n\n"
+    "`/positions`  — show all open positions + close suggestions\n"
+    "`/close TICKER`  — market-sell a stock/ETF position\n"
+    "  _e.g._ `/close VBR`\n\n"
+    "`/place TICKER SHORT LONG EXPIRY [QTY]`  — place bull put credit spread\n"
+    "  _e.g._ `/place KO 82.5 80 2026-07-17`\n\n"
+    "`/scan`  — run bull put scanner now + send results\n"
+    "`/eod`   — generate EOD P&L report now\n"
+    "`/help`  — show this message"
+)
+
+
+@app.route("/slack/command", methods=["POST"])
+def slack_command():
+    if not _verify_slack(request):
+        return jsonify({"text": ":x: Invalid Slack signature."}), 403
+
+    command  = request.form.get("command", "").lstrip("/").lower()
+    text     = request.form.get("text", "").strip()
+    resp_url = request.form.get("response_url", "")
+
+    # Acknowledge immediately — Slack requires response within 3 seconds
+    ack_map = {
+        "positions": ":hourglass: Fetching positions...",
+        "close":     f":hourglass: Closing `{text.upper()}`...",
+        "place":     f":hourglass: Placing spread `{text}`...",
+        "scan":      ":hourglass: Running bull put scan...",
+        "eod":       ":hourglass: Generating EOD report...",
+        "help":      None,
+    }
+
+    if command not in ack_map:
+        return jsonify({"text": f":x: Unknown command `/{command}`. Try `/help`."}), 200
+
+    if command == "help":
+        return jsonify({"text": HELP_TEXT, "response_type": "ephemeral"}), 200
+
+    # Fire background thread, respond with ack immediately
+    dispatch = {
+        "positions": lambda: _cmd_positions(resp_url),
+        "close":     lambda: _cmd_close(text, resp_url),
+        "place":     lambda: _cmd_place(text, resp_url),
+        "scan":      lambda: _cmd_scan(resp_url),
+        "eod":       lambda: _cmd_eod(resp_url),
+    }
+    threading.Thread(target=dispatch[command], daemon=True).start()
+    return jsonify({"text": ack_map[command], "response_type": "in_channel"}), 200
 
 
 def _start_scheduler():
