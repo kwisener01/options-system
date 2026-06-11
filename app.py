@@ -1126,32 +1126,160 @@ def _fmt_slack(d: dict) -> str:
 
 # ── Bull Put Scheduled Scanner (HITL alerts) ──────────────────────────────────
 
+def _build_position_summary() -> tuple[str, str]:
+    """
+    Returns (close_block, positions_block) for open positions.
+    close_block  — urgent close suggestions with runnable commands.
+    positions_block — one-line summary of every open position.
+    """
+    from src.live.alpaca_options import _trading
+    from datetime import date
+
+    try:
+        client    = _trading()
+        positions = client.get_all_positions()
+        acct      = client.get_account()
+        bp        = float(getattr(acct, "options_buying_power", 0) or 0)
+    except Exception as e:
+        logger.warning("Position fetch failed in scan job: %s", e)
+        return "", ""
+
+    if not positions:
+        return "", f"  _No open positions_  |  BP ${bp:,.2f}"
+
+    today      = date.today()
+    pos_lines  = []
+    close_tips = []
+
+    for p in positions:
+        sym    = p.symbol
+        qty    = float(p.qty)
+        unreal = float(getattr(p, "unrealized_pl",   0) or 0)
+        pct    = float(getattr(p, "unrealized_plpc", 0) or 0) * 100
+        mkt    = float(getattr(p, "market_value",    0) or 0)
+        icon   = ":green_circle:" if unreal >= 0 else ":red_circle:"
+        is_opt = len(sym) > 6
+
+        pos_lines.append(
+            f"  {icon} `{sym}`  ${mkt:,.2f}  P&L ${unreal:+,.2f} ({pct:+.1f}%)"
+        )
+
+        if is_opt:
+            # DTE warning
+            try:
+                tp       = len(sym) - 9
+                raw      = sym[tp - 6: tp]
+                exp_date = date(2000 + int(raw[0:2]), int(raw[2:4]), int(raw[4:6]))
+                dte      = (exp_date - today).days
+            except Exception:
+                dte = 99
+
+            if dte <= 3:
+                close_tips.append(
+                    f":warning: *`{sym}`* — {dte} DTE, expires soon.\n"
+                    f"  > `python close_bwb.py`  _(or let expire — defined-risk)_"
+                )
+            # Short option at 50%+ profit
+            cost = float(getattr(p, "cost_basis", 0) or 0)
+            if qty < 0 and cost != 0:
+                profit_pct = (abs(cost) - abs(mkt)) / abs(cost) * 100
+                if profit_pct >= 50:
+                    close_tips.append(
+                        f":moneybag: *`{sym}`* — {profit_pct:.0f}% of max profit captured.\n"
+                        f"  > `python close_bwb.py`"
+                    )
+        else:
+            if pct <= -8:
+                close_tips.append(
+                    f":rotating_light: *`{sym}`* — down {pct:.1f}%, stop-loss zone.\n"
+                    f"  > `python close_position.py --ticker {sym}`"
+                )
+            elif pct >= 20:
+                close_tips.append(
+                    f":moneybag: *`{sym}`* — up {pct:.1f}%, consider trimming.\n"
+                    f"  > `python close_position.py --ticker {sym}`"
+                )
+
+    pos_block   = "\n".join(pos_lines) + f"\n  BP available: ${bp:,.2f}"
+    close_block = "\n\n".join(close_tips) if close_tips else ""
+    return close_block, pos_block
+
+
 def _bull_put_scan_job():
-    """Runs at 9:45 AM and 12:30 PM ET Mon-Fri. Sends Slack alert for STRONG setups only."""
+    """Runs at 9:45 AM and 12:30 PM ET Mon-Fri.
+    Always sends positions + close suggestions.
+    Appends open trade commands when STRONG setups exist.
+    """
     try:
         from src.analysis.bull_put_scanner import scan as bp_scan, fmt_slack as bp_fmt
         from src.notifications.slack_notifier import send_message
 
-        d   = get_data()
-        vix = d["vix"]
+        session = "Morning" if datetime.now(ET).hour < 12 else "Midday"
+        ts      = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
+        d       = get_data()
+        vix     = d["vix"]
+        fc      = d["spy"].get("full_chain") or {}
+
+        # -- Position review --------------------------------------------------
+        close_block, pos_block = _build_position_summary()
+
+        # -- Bull put scan ----------------------------------------------------
         results = bp_scan(vix_now=vix["now"], vix_prev=vix["prev"])
+        strong  = [r for r in results if r.get("signal") == "STRONG"]
+        watch   = [r for r in results if r.get("signal") == "WATCH"]
 
-        strong = [r for r in results if r.get("signal") == "STRONG"]
-        if not strong:
-            logger.info("Bull put scan: no STRONG setups — skipping Slack alert")
-            return
-
-        fc  = d["spy"].get("full_chain") or {}
-        ts  = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
-        msg = bp_fmt(results, fc.get("regime", "UNKNOWN"), vix["now"], ts)
-        msg += "\n\n:point_right: *Review above and reply to place a trade.*"
-        send_message(msg)
-        logger.info("Bull put scan alert sent — %d STRONG setup(s)", len(strong))
-
-        # Refresh cache so dashboard stays current
+        # Refresh cache
         with _bp_lock:
             _bp_cache["data"] = results
             _bp_cache["ts"]   = time.time()
+
+        # -- Build open-trade command block -----------------------------------
+        open_lines = []
+        for r in strong + watch:
+            c = r.get("candidate")
+            if not c:
+                continue
+            sig  = r["signal"]
+            icon = ":white_check_mark:" if sig == "STRONG" else ":large_yellow_circle:"
+            cmd  = (
+                f"python place_spread.py "
+                f"--ticker {r['ticker']} "
+                f"--short {c['short_strike']} "
+                f"--long {c['long_strike']} "
+                f"--expiry {c['expiry']}"
+            )
+            open_lines.append(
+                f"{icon} *{r['ticker']} ${r['spot']:.2f}* ({r.get('change_pct',0):+.1f}%)  "
+                f"[{sig} {c['score']:.0f}/9]\n"
+                f"  SELL ${c['short_strike']}P / BUY ${c['long_strike']}P  "
+                f"{c['dte']}DTE  Credit +${c['credit']:.2f} ({c['credit_pct']:.0f}%)  "
+                f"Max loss -${c['max_loss_usd']}\n"
+                f"  > `{cmd}`"
+            )
+
+        # -- Assemble message -------------------------------------------------
+        sections = [
+            f":mag: *{session} Scan — {ts}*",
+            f"VIX {vix['now']:.2f}  |  SPY regime: {fc.get('regime','?').replace('_',' ').title()}",
+        ]
+
+        # Close suggestions (always show if any)
+        if close_block:
+            sections += ["", "*--- CLOSE / ACTION ---*", close_block]
+
+        # Open positions snapshot
+        if pos_block:
+            sections += ["", "*--- OPEN POSITIONS ---*", pos_block]
+
+        # New trade setups
+        if open_lines:
+            sections += ["", "*--- NEW SETUPS (place trade) ---*"] + open_lines
+        else:
+            sections += ["", "_No qualifying setups right now._"]
+
+        send_message("\n".join(sections))
+        logger.info("Scan alert sent — %d STRONG, %d WATCH, close_tips=%s",
+                    len(strong), len(watch), bool(close_block))
 
     except Exception as e:
         logger.error("_bull_put_scan_job error: %s", e)
