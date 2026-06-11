@@ -1113,6 +1113,58 @@ def _fmt_slack(d: dict) -> str:
     )
 
 
+# ── Bull Put Scheduled Scanner (HITL alerts) ──────────────────────────────────
+
+def _bull_put_scan_job():
+    """Runs at 9:45 AM and 12:30 PM ET Mon-Fri. Sends Slack alert for STRONG setups only."""
+    try:
+        from src.analysis.bull_put_scanner import scan as bp_scan, fmt_slack as bp_fmt
+        from src.notifications.slack_notifier import send_message
+
+        d   = get_data()
+        vix = d["vix"]
+        results = bp_scan(vix_now=vix["now"], vix_prev=vix["prev"])
+
+        strong = [r for r in results if r.get("signal") == "STRONG"]
+        if not strong:
+            logger.info("Bull put scan: no STRONG setups — skipping Slack alert")
+            return
+
+        fc  = d["spy"].get("full_chain") or {}
+        ts  = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
+        msg = bp_fmt(results, fc.get("regime", "UNKNOWN"), vix["now"], ts)
+        msg += "\n\n:point_right: *Review above and reply to place a trade.*"
+        send_message(msg)
+        logger.info("Bull put scan alert sent — %d STRONG setup(s)", len(strong))
+
+        # Refresh cache so dashboard stays current
+        with _bp_lock:
+            _bp_cache["data"] = results
+            _bp_cache["ts"]   = time.time()
+
+    except Exception as e:
+        logger.error("_bull_put_scan_job error: %s", e)
+
+
+def _start_scheduler():
+    """Start background scheduler once — guarded against double-start in reloaders."""
+    from apscheduler.schedulers.background import BackgroundScheduler
+
+    sched = BackgroundScheduler(timezone=ET)
+    sched.add_job(_bull_put_scan_job, "cron", day_of_week="mon-fri", hour=9,  minute=45,
+                  id="bull_put_morning",   replace_existing=True)
+    sched.add_job(_bull_put_scan_job, "cron", day_of_week="mon-fri", hour=12, minute=30,
+                  id="bull_put_midday",    replace_existing=True)
+    sched.start()
+    logger.info("Bull put scheduler started (9:45 AM + 12:30 PM ET, Mon-Fri)")
+    return sched
+
+
+# Start scheduler only in the main process (not in Flask debug reloader child)
+if not app.debug or os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+    _scheduler = _start_scheduler()
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
