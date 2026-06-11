@@ -1214,20 +1214,22 @@ def _eod_report_job():
             pct = float(getattr(p, "unrealized_plpc", 0) or 0) * 100
             if pct <= -8:
                 suggestions.append(
-                    f":rotating_light: *CLOSE `{p.symbol}`* — down {pct:.1f}% from cost. Stop-loss zone."
+                    f":rotating_light: *CLOSE `{p.symbol}`* — down {pct:.1f}% from cost. Stop-loss zone.\n"
+                    f"  > `python close_position.py --ticker {p.symbol}`"
                 )
             elif pct >= 20:
                 suggestions.append(
-                    f":moneybag: *TRIM `{p.symbol}`* — up {pct:.1f}%. Consider taking partial profit."
+                    f":moneybag: *TRIM `{p.symbol}`* — up {pct:.1f}%. Consider taking partial profit.\n"
+                    f"  > `python close_position.py --ticker {p.symbol}`"
                 )
 
         for p in options:
             unreal = float(getattr(p, "unrealized_pl", 0) or 0)
             mkt    = float(getattr(p, "market_value",  0) or 0)
             qty    = float(p.qty)
-            # Parse DTE from OCC symbol (YYMMDD at positions 3-9 for 2-char roots, or similar)
+            sym    = p.symbol
+            # Parse DTE from OCC symbol
             try:
-                sym = p.symbol
                 type_pos = len(sym) - 9
                 raw_date = sym[type_pos - 6: type_pos]
                 exp_date = date(2000 + int(raw_date[0:2]), int(raw_date[2:4]), int(raw_date[4:6]))
@@ -1235,24 +1237,37 @@ def _eod_report_job():
             except Exception:
                 dte = 99
 
+            # Parse strike and type for close_bwb-style display
+            try:
+                strike = int(sym[-8:]) / 1000.0
+                opt_type = sym[len(sym) - 9]  # C or P
+                type_pos = len(sym) - 9
+                raw_date = sym[type_pos - 6: type_pos]
+                expiry_str = f"20{raw_date[0:2]}-{raw_date[2:4]}-{raw_date[4:6]}"
+                underlying = sym[:type_pos - 6]
+            except Exception:
+                strike, opt_type, expiry_str, underlying = 0, "P", "", sym
+
             if dte <= 3:
+                action = "BUY_TO_CLOSE" if qty < 0 else "SELL_TO_CLOSE"
                 suggestions.append(
-                    f":warning: *REVIEW `{p.symbol}`* — {dte} DTE. Expires soon; close or let expire."
+                    f":warning: *REVIEW `{sym}`* — {dte} DTE. Expires soon.\n"
+                    f"  > `python close_bwb.py`  _(or let expire — spread is defined-risk)_"
                 )
-            # For short options (negative market value = liability), check if > 50% profit
+
             cost_basis = float(getattr(p, "cost_basis", 0) or 0)
             if qty < 0 and cost_basis != 0:
                 profit_pct = (abs(cost_basis) - abs(mkt)) / abs(cost_basis) * 100
                 if profit_pct >= 50:
                     suggestions.append(
-                        f":white_check_mark: *CLOSE `{p.symbol}`* — {profit_pct:.0f}% of max profit captured. Lock it in."
+                        f":white_check_mark: *CLOSE `{sym}`* — {profit_pct:.0f}% of max profit captured. Lock it in.\n"
+                        f"  > `python close_bwb.py`"
                     )
 
-        suggestion_block = (
-            "\n".join(suggestions)
-            if suggestions
-            else "  _No action needed — hold current positions._"
-        )
+        if not suggestions:
+            suggestion_block = "  _No action needed — hold current positions._"
+        else:
+            suggestion_block = "\n\n".join(suggestions)
 
         # -- Build message ----------------------------------------------------
         d_icon = ":chart_with_upwards_trend:" if daily_pl >= 0 else ":chart_with_downwards_trend:"
