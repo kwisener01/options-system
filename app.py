@@ -1241,14 +1241,13 @@ def _bull_put_scan_job():
             c = r.get("candidate")
             if not c:
                 continue
-            sig  = r["signal"]
-            icon = ":white_check_mark:" if sig == "STRONG" else ":large_yellow_circle:"
-            cmd  = (
-                f"python place_spread.py "
-                f"--ticker {r['ticker']} "
-                f"--short {c['short_strike']} "
-                f"--long {c['long_strike']} "
-                f"--expiry {c['expiry']}"
+            sig        = r["signal"]
+            icon       = ":white_check_mark:" if sig == "STRONG" else ":large_yellow_circle:"
+            slack_cmd  = (
+                f"/place {r['ticker']} "
+                f"{c['short_strike']} "
+                f"{c['long_strike']} "
+                f"{c['expiry']}"
             )
             open_lines.append(
                 f"{icon} *{r['ticker']} ${r['spot']:.2f}* ({r.get('change_pct',0):+.1f}%)  "
@@ -1256,7 +1255,7 @@ def _bull_put_scan_job():
                 f"  SELL ${c['short_strike']}P / BUY ${c['long_strike']}P  "
                 f"{c['dte']}DTE  Credit +${c['credit']:.2f} ({c['credit_pct']:.0f}%)  "
                 f"Max loss -${c['max_loss_usd']}\n"
-                f"  > `{cmd}`"
+                f"  :point_right: `{slack_cmd}`"
             )
 
         # -- Assemble message -------------------------------------------------
