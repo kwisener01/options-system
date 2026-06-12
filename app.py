@@ -1715,13 +1715,17 @@ def _start_scheduler():
 
     sched = BackgroundScheduler(timezone=ET)
     sched.add_job(_unified_scan_job, "cron", day_of_week="mon-fri", hour=9,  minute=45,
-                  id="scan_morning",       replace_existing=True)
+                  id="scan_0945",          replace_existing=True)
+    sched.add_job(_unified_scan_job, "cron", day_of_week="mon-fri", hour=10, minute=0,
+                  id="scan_1000",          replace_existing=True)
+    sched.add_job(_unified_scan_job, "cron", day_of_week="mon-fri", hour=10, minute=30,
+                  id="scan_1030",          replace_existing=True)
     sched.add_job(_unified_scan_job, "cron", day_of_week="mon-fri", hour=12, minute=30,
-                  id="scan_midday",        replace_existing=True)
+                  id="scan_1230",          replace_existing=True)
     sched.add_job(_eod_report_job,   "cron", day_of_week="mon-fri", hour=16, minute=5,
                   id="eod_report",         replace_existing=True)
     sched.start()
-    logger.info("Scheduler started: unified scan 9:45/12:30, EOD report 4:05 PM ET (Mon-Fri)")
+    logger.info("Scheduler started: unified scan 9:45/10:00/10:30/12:30, EOD 4:05 PM ET (Mon-Fri)")
     return sched
 
 
