@@ -19,7 +19,6 @@ from datetime import date, datetime
 from typing import Optional
 
 import numpy as np
-import yfinance as yf
 from scipy.stats import norm
 
 from config.settings import GEX_CHAIN_DIR
@@ -97,55 +96,103 @@ def _charm_bs(S: float, K: float, T: float, sig: float, is_call: bool) -> float:
 
 # ── data fetch ────────────────────────────────────────────────────────────────
 
-def _spot_and_vix():
-    """Return (spot, vix_now, vix_prev_close)."""
-    spy_info = yf.Ticker("SPY").fast_info
-    spot     = float(spy_info.get("last_price") or spy_info.get("regularMarketPrice") or 0)
-    if not spot:
-        df   = yf.download("SPY", period="2d", interval="1d", auto_adjust=True, progress=False)
-        col  = df["Close"] if "Close" in df.columns else df.iloc[:, 0]
-        spot = float(col.iloc[-1].item() if hasattr(col.iloc[-1], "item") else col.iloc[-1])
+_YF_HEADERS = {"User-Agent": "Mozilla/5.0"}
 
-    vix_df = yf.download("^VIX", period="5d", interval="1d", auto_adjust=True, progress=False)
-    col    = vix_df["Close"] if "Close" in vix_df.columns else vix_df.iloc[:, 0]
-    vix_now  = float(col.iloc[-1].item() if hasattr(col.iloc[-1], "item") else col.iloc[-1])
-    vix_prev = float(col.iloc[-2].item() if hasattr(col.iloc[-2], "item") else col.iloc[-2]) if len(col) > 1 else vix_now
+
+def _yf_get(url: str, session=None) -> dict:
+    """GET to Yahoo Finance with SSL verification disabled."""
+    import requests, urllib3
+    urllib3.disable_warnings()
+    if session is not None:
+        return session.get(url, headers=_YF_HEADERS, timeout=15, verify=False).json()
+    return requests.get(url, headers=_YF_HEADERS, timeout=15, verify=False).json()
+
+
+def _yf_session_with_crumb():
+    """
+    Return (curl_cffi session, crumb) for Yahoo Finance v7 authenticated requests.
+    Uses curl_cffi so verify=False works (requests module has SSL issues on this host).
+    Returns (None, None) if crumb cannot be obtained.
+    """
+    try:
+        import curl_cffi.requests as ccr
+        s = ccr.Session(verify=False)
+        s.get("https://finance.yahoo.com/quote/SPY", verify=False)
+        cr = s.get("https://query1.finance.yahoo.com/v1/test/getcrumb", verify=False)
+        crumb = cr.text.strip()
+        if cr.status_code != 200 or not crumb or crumb.startswith("{"):
+            logger.warning("Crumb fetch failed (status %d): %s", cr.status_code, crumb[:60])
+            return None, None
+        return s, crumb
+    except Exception as e:
+        logger.warning("Crumb session setup failed: %s", e)
+        return None, None
+
+
+def _spot_and_vix():
+    """Return (spot, vix_now, vix_prev_close) via Yahoo Finance v8 chart API."""
+    spy_meta = _yf_get(
+        "https://query1.finance.yahoo.com/v8/finance/chart/SPY?interval=1d&range=2d"
+    )["chart"]["result"][0]["meta"]
+    spot = float(spy_meta["regularMarketPrice"])
+
+    vix_data = _yf_get(
+        "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1d&range=5d"
+    )["chart"]["result"][0]
+    closes   = vix_data["indicators"]["quote"][0]["close"]
+    closes   = [c for c in closes if c is not None]
+    vix_now  = float(closes[-1])
+    vix_prev = float(closes[-2]) if len(closes) > 1 else vix_now
 
     return spot, vix_now, vix_prev
 
 
 def _fetch_chain_from_api(spot: float, n_expiries: int = 3) -> list[dict]:
-    """Pull SPY option chain from yfinance. Call sparingly — use load/save_chain instead."""
-    ticker = yf.Ticker("SPY")
-    today  = date.today()
-    rows   = []
+    """Pull SPY option chain via Yahoo Finance v7 (real OI). Returns [] on auth failure."""
+    today = date.today()
+    rows: list[dict] = []
+
+    session, crumb = _yf_session_with_crumb()
+    if session is None:
+        logger.warning("Cannot fetch YF chain — crumb unavailable (rate-limited or market closed)")
+        return rows
+
+    base = f"https://query1.finance.yahoo.com/v7/finance/options/SPY?crumb={crumb}"
 
     try:
-        exps = list(ticker.options)[:n_expiries]
+        resp0 = session.get(base, headers=_YF_HEADERS, verify=False).json()
+        if "optionChain" not in resp0:
+            logger.warning("YF v7 response missing optionChain: %s",
+                           str(resp0)[:120])
+            return rows
+        all_exp_ts: list[int] = resp0["optionChain"]["result"][0].get("expirationDates", [])
     except Exception as e:
         logger.error("Failed to fetch SPY expirations: %s", e)
         return rows
 
-    for exp_str in exps:
+    for ts in all_exp_ts[:n_expiries]:
         try:
-            exp_date = date.fromisoformat(exp_str)
+            exp_date = date.fromtimestamp(ts)
             T = max((exp_date - today).days, 0) / 365
-            chain = ticker.option_chain(exp_str)
+            resp = session.get(f"{base}&date={ts}", headers=_YF_HEADERS,
+                               verify=False).json()
+            chain_data = resp["optionChain"]["result"][0]["options"][0]
 
-            for df, is_call in [(chain.calls, True), (chain.puts, False)]:
-                if df is None or df.empty:
-                    continue
-                for _, row in df.iterrows():
-                    strike = float(row["strike"])
+            for contracts, is_call in [
+                (chain_data.get("calls", []), True),
+                (chain_data.get("puts",  []), False),
+            ]:
+                for c in contracts:
+                    strike = float(c.get("strike", 0))
                     if not (spot * 0.92 <= strike <= spot * 1.08):
                         continue
-                    oi = int(row.get("openInterest") or 0)
-                    iv = float(row.get("impliedVolatility") or 0)
+                    oi = int(c.get("openInterest", 0) or 0)
+                    iv = float(c.get("impliedVolatility", 0) or 0)
                     if oi < 10 or iv < 0.01:
                         continue
                     rows.append(dict(strike=strike, oi=oi, iv=iv, T=T, is_call=is_call))
         except Exception as e:
-            logger.warning("Chain fetch failed for %s: %s", exp_str, e)
+            logger.warning("Chain fetch failed for ts=%s: %s", ts, e)
 
     return rows
 
@@ -154,33 +201,38 @@ def _fetch_chain(spot: float, n_expiries: int = 3,
                  as_of: date | None = None) -> list[dict]:
     """
     Return SPY option chain contracts, using today's disk cache when available.
-    Live fetches try Alpaca first (real-time), fall back to yfinance.
-    Pass as_of for historical replay (backtesting — yfinance only).
+
+    Source priority:
+      1. Yahoo Finance v7 (real OI) — authoritative for GEX
+      2. Alpaca indicative feed — fallback with bid>0 filter to avoid garbage entries
+         (Alpaca never returns real OI for SPY; without the bid>0 filter the GEX
+         bloats to -230B from large ask_sz on zero-bid deep-OTM contracts)
+
+    Pass as_of for historical replay.
     """
     as_of = as_of or date.today()
     cached = load_chain(as_of)
     if cached is not None:
-        return cached
+        return cached, "HIGH"   # cached chains were validated at save time
 
-    # Try Alpaca for live data (real-time quotes + IV)
-    rows = []
+    # Primary: Yahoo Finance v7 (real open interest)
+    rows = _fetch_chain_from_api(spot, n_expiries)
+    if rows:
+        logger.info("GEX chain: Yahoo Finance v7 (%d contracts, real OI)", len(rows))
+        save_chain(rows, as_of)
+        return rows, "HIGH"
+
+    # Fallback: Alpaca indicative — bid/ask size is NOT real OI; regime confidence is LOW
+    logger.warning("Yahoo Finance unavailable — falling back to Alpaca indicative (LOW confidence)")
     try:
         from src.live.alpaca_options import fetch_chain_for_gex
         rows = fetch_chain_for_gex("SPY", spot=spot, n_expiries=n_expiries)
         if rows:
-            logger.info("Using Alpaca chain data (%d contracts)", len(rows))
+            logger.info("GEX chain: Alpaca fallback (%d contracts, LOW confidence)", len(rows))
+            save_chain(rows, as_of)
     except Exception as e:
-        logger.warning("Alpaca chain unavailable, falling back to yfinance: %s", e)
-
-    # Fall back to yfinance
-    if not rows:
-        rows = _fetch_chain_from_api(spot, n_expiries)
-        if rows:
-            logger.info("Using yfinance chain data (%d contracts)", len(rows))
-
-    if rows:
-        save_chain(rows, as_of)
-    return rows
+        logger.warning("Alpaca chain also unavailable: %s", e)
+    return rows, "LOW"
 
 
 # ── exposure aggregation ──────────────────────────────────────────────────────
@@ -191,7 +243,7 @@ class GEXResult:
     vix:              float
     vix_prev:         float
     net_gex_bn:       float          # net GEX in $ billions (positive = long gamma)
-    gex_regime:       str            # POSITIVE_GAMMA | NEGATIVE_GAMMA
+    gex_regime:       str            # POSITIVE_GAMMA | NEGATIVE_GAMMA | UNKNOWN
     gamma_wall:       float          # strike nearest spot with highest net GEX
     put_wall:         float          # highest put GEX below spot
     call_wall:        float          # highest call GEX above spot
@@ -202,6 +254,8 @@ class GEXResult:
     charm_signal:     str            # BUYING_PRESSURE | SELLING_PRESSURE | NEUTRAL
     top_levels:       list = field(default_factory=list)  # [(strike, gex_bn), ...]
     dte_nearest:      int  = 0
+    # HIGH = Yahoo Finance real OI; LOW = Alpaca indicative (bid/ask size proxy, not real OI)
+    regime_confidence: str = "HIGH"
 
 
 def compute_exposures(spot: float, vix: float, vix_prev: float,
@@ -326,13 +380,20 @@ def scan(as_of: date | None = None,
         if not spot or not vix:
             logger.error("Could not fetch SPY/VIX prices")
             return None
-        contracts = _fetch_chain(spot, as_of=as_of)
+        contracts, confidence = _fetch_chain(spot, as_of=as_of)
         if not contracts:
             logger.warning("No option chain data — chain may be empty or market closed")
             return None
         result = compute_exposures(spot, vix, vix_prev or vix, contracts)
-        logger.info("GEX scan: net_gex=%.2fbn regime=%s gamma_wall=%.1f vanna=%s",
-                    result.net_gex_bn, result.gex_regime, result.gamma_wall, result.vanna_signal)
+        result.regime_confidence = confidence
+        # When OI data is low-confidence (Alpaca proxy), the raw regime is unreliable.
+        # Callers should treat regime as neutral / informational only.
+        if confidence == "LOW":
+            logger.warning("GEX regime is LOW confidence (Alpaca proxy OI, not real OI) — "
+                           "regime=%s may not reflect actual dealer positioning", result.gex_regime)
+        logger.info("GEX scan: net_gex=%.2fbn regime=%s [%s] gamma_wall=%.1f vanna=%s",
+                    result.net_gex_bn, result.gex_regime, confidence,
+                    result.gamma_wall, result.vanna_signal)
         return result
     except Exception as e:
         logger.error("GEX scan failed: %s", e)

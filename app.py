@@ -1167,19 +1167,21 @@ def _build_position_summary() -> tuple[str, str]:
         )
 
         if is_opt:
-            # DTE warning
+            # Parse underlying and DTE from OCC symbol
             try:
-                tp       = len(sym) - 9
-                raw      = sym[tp - 6: tp]
-                exp_date = date(2000 + int(raw[0:2]), int(raw[2:4]), int(raw[4:6]))
-                dte      = (exp_date - today).days
+                tp         = len(sym) - 9
+                raw        = sym[tp - 6: tp]
+                exp_date   = date(2000 + int(raw[0:2]), int(raw[2:4]), int(raw[4:6]))
+                dte        = (exp_date - today).days
+                underlying = sym[:tp - 6]
             except Exception:
-                dte = 99
+                dte        = 99
+                underlying = sym
 
             if dte <= 3:
                 close_tips.append(
                     f":warning: *`{sym}`* — {dte} DTE, expires soon.\n"
-                    f"  > `python close_bwb.py`  _(or let expire — defined-risk)_"
+                    f"  > `python close_bwb.py --ticker {underlying}`  _(or let expire — defined-risk)_"
                 )
             # Short option at 50%+ profit
             cost = float(getattr(p, "cost_basis", 0) or 0)
@@ -1188,7 +1190,7 @@ def _build_position_summary() -> tuple[str, str]:
                 if profit_pct >= 50:
                     close_tips.append(
                         f":moneybag: *`{sym}`* — {profit_pct:.0f}% of max profit captured.\n"
-                        f"  > `python close_bwb.py`"
+                        f"  > `python close_bwb.py --ticker {underlying}`"
                     )
         else:
             if pct <= -8:
@@ -1222,6 +1224,7 @@ def _bull_put_scan_job():
         d       = get_data()
         vix     = d["vix"]
         fc      = d["spy"].get("full_chain") or {}
+        t       = d.get("trade_idea") or {}
 
         # -- SPY / VIX / GEX block --------------------------------------------
         gex_block = ""
@@ -1235,6 +1238,36 @@ def _bull_put_scan_job():
                 f":bar_chart: *SPY Greeks*\n"
                 f"  VIX {vix['now']:.2f} ({vix['change']:+.2f})  |  "
                 f"Regime: {fc.get('regime','?').replace('_',' ').title()}"
+            )
+
+        # -- SPY trade idea block ---------------------------------------------
+        trade_block = ""
+        if t:
+            direction = t.get("direction", "")
+            color     = ":red_circle:" if direction == "BEARISH" else ":green_circle:"
+            live_tag  = " _(live prices)_" if t.get("prices_live") else ""
+            trades    = t.get("trades") or []
+            rec_trade = next((tr for tr in trades if tr.get("recommended")), None)
+            rec_label = rec_trade["type"] if rec_trade else "—"
+            trade_lines = []
+            for tr in trades:
+                star   = "★ " if tr.get("recommended") else "  "
+                legs   = "/".join(f"${lg['strike']}" for lg in tr.get("legs", []))
+                cr     = tr.get("credit", 0) or 0
+                profit = tr.get("max_profit_usd") or 0
+                risk   = tr.get("max_risk_usd") or 0
+                rating = f"  [{tr['rating']}]" if tr.get("rating") else ""
+                trade_lines.append(
+                    f">  {star}{tr['type']}  {legs}  "
+                    f"{'Cr' if cr >= 0 else 'Dr'} ${abs(cr):.2f}  "
+                    f"Profit ${profit}  Risk ${risk}{rating}"
+                )
+            trade_block = (
+                f"{color} *SPY Trade Ideas — {direction}  |  Recommended: {rec_label}"
+                f"  |  Expiry {t.get('expiry','')} ({t.get('dte','')}DTE){live_tag}*\n"
+                + "\n".join(trade_lines)
+                + ("\n" if trade_lines else "")
+                + "\n".join(f">  - {pt}" for pt in t.get("thesis", []))
             )
 
         # -- Position review --------------------------------------------------
@@ -1279,6 +1312,10 @@ def _bull_put_scan_job():
         # SPY / VIX / GEX analysis
         if gex_block:
             sections += ["", gex_block]
+
+        # SPY trade idea
+        if trade_block:
+            sections += ["", "*--- SPY TRADE IDEA ---*", trade_block]
 
         # Close suggestions
         if close_block:
@@ -1394,10 +1431,9 @@ def _eod_report_job():
                 strike, opt_type, expiry_str, underlying = 0, "P", "", sym
 
             if dte <= 3:
-                action = "BUY_TO_CLOSE" if qty < 0 else "SELL_TO_CLOSE"
                 suggestions.append(
                     f":warning: *REVIEW `{sym}`* — {dte} DTE. Expires soon.\n"
-                    f"  > `python close_bwb.py`  _(or let expire — spread is defined-risk)_"
+                    f"  > `python close_bwb.py --ticker {underlying}`  _(or let expire — spread is defined-risk)_"
                 )
 
             cost_basis = float(getattr(p, "cost_basis", 0) or 0)
@@ -1406,7 +1442,7 @@ def _eod_report_job():
                 if profit_pct >= 50:
                     suggestions.append(
                         f":white_check_mark: *CLOSE `{sym}`* — {profit_pct:.0f}% of max profit captured. Lock it in.\n"
-                        f"  > `python close_bwb.py`"
+                        f"  > `python close_bwb.py --ticker {underlying}`"
                     )
 
         if not suggestions:

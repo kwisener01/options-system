@@ -311,7 +311,13 @@ def fetch_chain_for_gex(underlying: str = "SPY",
                 continue
 
             # open interest — use contract OI when available; otherwise use
-            # quote bid+ask size as a liquidity proxy (indicative feed has no OI)
+            # quote bid+ask size as a liquidity proxy (indicative feed has no OI).
+            # Require bid_price > 0: deep-OTM contracts have bid=0, ask_sz=500+,
+            # which inflates the OI proxy and blows up GEX to unrealistic levels.
+            bid_px = float(getattr(quote, "bid_price", 0) or 0) if quote else 0.0
+            if bid_px <= 0:
+                continue
+
             oi = 0
             if contract:
                 oi = int(getattr(contract, "open_interest", 0) or 0)
@@ -411,17 +417,24 @@ def fetch_chain_combined(underlying: str, spot: float,
             quote   = getattr(snap, "latest_quote", None)
             oi      = 0
             bid_sz  = ask_sz = 0
+            bid_px  = ask_px = 0.0
             if contract:
                 oi = int(getattr(contract, "open_interest", 0) or 0)
             if quote:
                 bid_sz = int(getattr(quote, "bid_size", 0) or 0)
                 ask_sz = int(getattr(quote, "ask_size", 0) or 0)
+                bid_px = float(getattr(quote, "bid_price", 0) or 0)
+                ask_px = float(getattr(quote, "ask_price", 0) or 0)
                 if oi < 10:
                     oi = bid_sz + ask_sz
             if oi < 5:
                 continue
 
-            gex_rows.append(dict(strike=strike, oi=oi, iv=iv, T=T, is_call=is_call))
+            # Only include contracts with a live two-sided market for GEX.
+            # Contracts with bid=0 (deep OTM, no buyers) inflate OI proxy via
+            # ask_sz alone and produce garbage GEX values (-230B type artifacts).
+            if bid_px > 0 and ask_px > 0:
+                gex_rows.append(dict(strike=strike, oi=oi, iv=iv, T=T, is_call=is_call))
 
             if quote and dte_min <= dte <= dte_max:
                 bid = float(getattr(quote, "bid_price", 0) or 0)

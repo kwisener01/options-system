@@ -83,7 +83,8 @@ def analyze(inp: BWBInputs) -> BWBResult:
     rr_ratio = (max_profit_usd / max_loss_usd) if max_loss_usd > 0 else 99.0
 
     # ── 2. Checklist ───────────────────────────────────────────────────────────
-    neg_gamma   = "NEGATIVE" in inp.regime.upper()
+    # UNKNOWN = per-stock GEX from Alpaca proxy OI (not real OI) — treat as neutral
+    neg_gamma   = inp.regime.upper() == "NEGATIVE_GAMMA"
     vix_rising  = (inp.vix_now > inp.vix_prev * 1.03) if inp.vix_prev else False
     near_struct = inp.spot <= inp.long_upper + 2          # within $2 of upper long
     wing_ok     = lower_wing <= upper_wing * 2            # lower ≤ 2× upper

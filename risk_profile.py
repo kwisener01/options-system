@@ -235,9 +235,21 @@ def fetch_chain_greeks(underlying: str) -> dict:
 def get_spot(ticker: str) -> float:
     try:
         import yfinance as yf
-        return round(float(yf.Ticker(ticker).fast_info.last_price), 2)
+        price = float(yf.Ticker(ticker).fast_info.last_price or 0)
+        if price > 0:
+            return round(price, 2)
     except Exception:
-        return 0.0
+        pass
+    try:
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestTradeRequest
+        from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY
+        sdc = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        trade = sdc.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=ticker))
+        return round(float(trade[ticker].price), 2)
+    except Exception:
+        pass
+    return 0.0
 
 
 # -- Leg enrichment -------------------------------------------------------------
@@ -348,6 +360,8 @@ def _leg_scenario_pnl(leg: dict, move_pct: float) -> float:
 
     # Skip BS repricing when the option is >10% ITM — chain IV is unreliable
     # for deep ITM options and produces nonsense P&L curves.
+    if S <= 0:
+        return 0.0
     itm_frac = max((S - K) / S if leg["is_call"] else (K - S) / S, 0.0)
     use_bs   = T > 0 and iv > 0.01 and S_new > 0 and itm_frac < 0.10
 
