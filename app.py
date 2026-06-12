@@ -1209,15 +1209,21 @@ def _build_position_summary() -> tuple[str, str]:
     return close_block, pos_block
 
 
-def _bull_put_scan_job():
+def _unified_scan_job():
     """Runs at 9:45 AM and 12:30 PM ET Mon-Fri.
-    Always sends positions + close suggestions.
-    Appends open trade commands when STRONG setups exist.
+    Runs all strategy scanners in parallel. Only sends Slack when there is
+    something actionable — a STRONG/WATCH signal from any strategy, or a
+    position that needs closing. Silent days produce no noise.
     """
     try:
-        from src.analysis.bull_put_scanner import scan as bp_scan, fmt_slack as bp_fmt
-        from src.analysis.gex_scanner import scan as gex_scan, format_gex_message
-        from src.notifications.slack_notifier import send_message
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from src.analysis.bull_put_scanner       import scan as bp_scan
+        from src.analysis.fallen_angel_scanner   import scan_fallen_angels as fa_scan
+        from src.analysis.fallen_angel_scanner   import fmt_slack as fa_fmt
+        from src.analysis.value_watchlist        import scan_watchlist as vw_scan
+        from src.analysis.value_watchlist        import fmt_slack as vw_fmt
+        from src.analysis.gex_scanner            import scan as gex_scan, format_gex_message
+        from src.notifications.slack_notifier    import send_message
 
         session = "Morning" if datetime.now(ET).hour < 12 else "Midday"
         ts      = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
@@ -1225,22 +1231,73 @@ def _bull_put_scan_job():
         vix     = d["vix"]
         fc      = d["spy"].get("full_chain") or {}
         t       = d.get("trade_idea") or {}
+        regime  = fc.get("regime", "UNKNOWN")
 
-        # -- SPY / VIX / GEX block --------------------------------------------
+        # -- Run all scanners in parallel -------------------------------------
+        bp_results = fa_results = vw_results = []
+        gex_result = None
+
+        def _run_bp():
+            return bp_scan(vix_now=vix["now"], vix_prev=vix["prev"])
+        def _run_fa():
+            return fa_scan()
+        def _run_vw():
+            return vw_scan(spy_regime=regime, vix_now=vix["now"])
+        def _run_gex():
+            return gex_scan()
+
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futures = {
+                ex.submit(_run_bp):  "bp",
+                ex.submit(_run_fa):  "fa",
+                ex.submit(_run_vw):  "vw",
+                ex.submit(_run_gex): "gex",
+            }
+            for fut in as_completed(futures):
+                key = futures[fut]
+                try:
+                    result = fut.result()
+                    if key == "bp":
+                        bp_results = result
+                    elif key == "fa":
+                        fa_results = result
+                    elif key == "vw":
+                        vw_results = result
+                    elif key == "gex":
+                        gex_result = result
+                except Exception as e:
+                    logger.warning("Scanner %s failed: %s", key, e)
+
+        # Refresh bull put cache
+        with _bp_lock:
+            _bp_cache["data"] = bp_results
+            _bp_cache["ts"]   = time.time()
+
+        # -- Check if anything is actionable ---------------------------------
+        close_block, pos_block = _build_position_summary()
+
+        bp_hits = [r for r in bp_results if r.get("signal") in ("STRONG", "WATCH")]
+        fa_hits = [r for r in fa_results if r.get("signal") in ("STRONG", "WATCH")]
+        vw_hits = [r for r in vw_results if r.get("signal") in ("STRONG", "WATCH", "SELL")]
+
+        if not close_block and not bp_hits and not fa_hits and not vw_hits:
+            logger.info("Unified scan: nothing actionable — skipping Slack alert")
+            return
+
+        # -- GEX / SPY context -----------------------------------------------
         gex_block = ""
         try:
-            gex_result = gex_scan()
             if gex_result:
                 gex_block = format_gex_message(gex_result, session=session.lower())
         except Exception as e:
-            logger.warning("GEX scan failed in scan job: %s", e)
+            logger.warning("GEX format failed: %s", e)
             gex_block = (
                 f":bar_chart: *SPY Greeks*\n"
                 f"  VIX {vix['now']:.2f} ({vix['change']:+.2f})  |  "
-                f"Regime: {fc.get('regime','?').replace('_',' ').title()}"
+                f"Regime: {regime.replace('_',' ').title()}"
             )
 
-        # -- SPY trade idea block ---------------------------------------------
+        # -- SPY trade idea --------------------------------------------------
         trade_block = ""
         if t:
             direction = t.get("direction", "")
@@ -1270,73 +1327,50 @@ def _bull_put_scan_job():
                 + "\n".join(f">  - {pt}" for pt in t.get("thesis", []))
             )
 
-        # -- Position review --------------------------------------------------
-        close_block, pos_block = _build_position_summary()
-
-        # -- Bull put scan ----------------------------------------------------
-        results = bp_scan(vix_now=vix["now"], vix_prev=vix["prev"])
-        strong  = [r for r in results if r.get("signal") == "STRONG"]
-        watch   = [r for r in results if r.get("signal") == "WATCH"]
-
-        # Refresh cache
-        with _bp_lock:
-            _bp_cache["data"] = results
-            _bp_cache["ts"]   = time.time()
-
-        # -- Build open-trade command block -----------------------------------
-        open_lines = []
-        for r in strong + watch:
-            c = r.get("candidate")
+        # -- Bull put /place commands ----------------------------------------
+        bp_place_lines = []
+        for r in bp_hits:
+            c   = r.get("candidate")
             if not c:
                 continue
-            sig        = r["signal"]
-            icon       = ":white_check_mark:" if sig == "STRONG" else ":large_yellow_circle:"
-            slack_cmd  = (
-                f"/place {r['ticker']} "
-                f"{c['short_strike']} "
-                f"{c['long_strike']} "
-                f"{c['expiry']}"
-            )
-            open_lines.append(
+            sig  = r["signal"]
+            icon = ":white_check_mark:" if sig == "STRONG" else ":large_yellow_circle:"
+            cmd  = f"/place {r['ticker']} {c['short_strike']} {c['long_strike']} {c['expiry']}"
+            bp_place_lines.append(
                 f"{icon} *{r['ticker']} ${r['spot']:.2f}* ({r.get('change_pct',0):+.1f}%)  "
                 f"[{sig} {c['score']:.0f}/9]\n"
                 f"  SELL ${c['short_strike']}P / BUY ${c['long_strike']}P  "
                 f"{c['dte']}DTE  Credit +${c['credit']:.2f} ({c['credit_pct']:.0f}%)  "
                 f"Max loss -${c['max_loss_usd']}\n"
-                f"  :point_right: `{slack_cmd}`"
+                f"  :point_right: `{cmd}`"
             )
 
-        # -- Assemble message -------------------------------------------------
+        # -- Assemble message ------------------------------------------------
         sections = [f":mag: *{session} Scan — {ts}*"]
 
-        # SPY / VIX / GEX analysis
         if gex_block:
             sections += ["", gex_block]
-
-        # SPY trade idea
         if trade_block:
             sections += ["", "*--- SPY TRADE IDEA ---*", trade_block]
-
-        # Close suggestions
         if close_block:
             sections += ["", "*--- CLOSE / ACTION ---*", close_block]
-
-        # Open positions snapshot
         if pos_block:
             sections += ["", "*--- OPEN POSITIONS ---*", pos_block]
-
-        # New trade setups
-        if open_lines:
-            sections += ["", "*--- NEW SETUPS (place trade) ---*"] + open_lines
-        else:
-            sections += ["", "_No qualifying bull put setups right now._"]
+        if fa_hits:
+            sections += ["", fa_fmt(fa_results, ts)]
+        if vw_hits:
+            sections += ["", vw_fmt(vw_results, regime, vix["now"], ts)]
+        if bp_place_lines:
+            sections += ["", ":moneybag: *Bull Put Spreads — place trade*"] + bp_place_lines
 
         send_message("\n".join(sections))
-        logger.info("Scan alert sent — %d STRONG, %d WATCH, close_tips=%s",
-                    len(strong), len(watch), bool(close_block))
+        logger.info(
+            "Unified scan alert sent — BP:%d FA:%d VW:%d close=%s",
+            len(bp_hits), len(fa_hits), len(vw_hits), bool(close_block),
+        )
 
     except Exception as e:
-        logger.error("_bull_put_scan_job error: %s", e)
+        logger.error("_unified_scan_job error: %s", e)
 
 
 # ── EOD Report + Close Suggestions ───────────────────────────────────────────
@@ -1613,7 +1647,7 @@ def _cmd_place(args: str, resp_url: str):
 
 
 def _cmd_scan(resp_url: str):
-    _bull_put_scan_job()
+    _unified_scan_job()
     # scan job sends its own Slack message; no need to double-post
 
 
@@ -1680,14 +1714,14 @@ def _start_scheduler():
     from apscheduler.schedulers.background import BackgroundScheduler
 
     sched = BackgroundScheduler(timezone=ET)
-    sched.add_job(_bull_put_scan_job, "cron", day_of_week="mon-fri", hour=9,  minute=45,
-                  id="bull_put_morning",   replace_existing=True)
-    sched.add_job(_bull_put_scan_job, "cron", day_of_week="mon-fri", hour=12, minute=30,
-                  id="bull_put_midday",    replace_existing=True)
+    sched.add_job(_unified_scan_job, "cron", day_of_week="mon-fri", hour=9,  minute=45,
+                  id="scan_morning",       replace_existing=True)
+    sched.add_job(_unified_scan_job, "cron", day_of_week="mon-fri", hour=12, minute=30,
+                  id="scan_midday",        replace_existing=True)
     sched.add_job(_eod_report_job,   "cron", day_of_week="mon-fri", hour=16, minute=5,
                   id="eod_report",         replace_existing=True)
     sched.start()
-    logger.info("Scheduler started: bull put 9:45/12:30, EOD report 4:05 PM ET (Mon-Fri)")
+    logger.info("Scheduler started: unified scan 9:45/12:30, EOD report 4:05 PM ET (Mon-Fri)")
     return sched
 
 
