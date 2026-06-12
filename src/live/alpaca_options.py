@@ -328,7 +328,15 @@ def fetch_chain_for_gex(underlying: str = "SPY",
             if oi < 5:
                 continue
 
-            rows.append(dict(strike=strike, oi=oi, iv=iv, T=T, is_call=is_call))
+            # Include Alpaca's pre-computed gamma so compute_exposures() can skip Black-Scholes
+            native_gamma = None
+            if greeks:
+                g = float(getattr(greeks, "gamma", 0) or 0)
+                if g > 0:
+                    native_gamma = g
+
+            rows.append(dict(strike=strike, oi=oi, iv=iv, T=T, is_call=is_call,
+                             gamma=native_gamma))
 
         except Exception as e:
             logger.debug("Skipping contract %s: %s", symbol, e)

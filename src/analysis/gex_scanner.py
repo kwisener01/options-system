@@ -277,7 +277,10 @@ def compute_exposures(spot: float, vix: float, vix_prev: float,
         dte = round(T * 365)
         dte_nearest = min(dte_nearest, dte)
 
-        gx  = _gamma_bs(spot, K, T, iv) * oi * _SHARES * (spot ** 2) / 1e9
+        # Use Alpaca's pre-computed gamma when available (more accurate than BS recalc)
+        native_gamma = c.get("gamma")
+        gx = (native_gamma if native_gamma and native_gamma > 0
+              else _gamma_bs(spot, K, T, iv)) * oi * _SHARES * (spot ** 2) / 1e9
         vn  = _vanna_bs(spot, K, T, iv) * oi * _SHARES * spot / 1e9
         ch  = _charm_bs(spot, K, T, iv, is_call) * oi * _SHARES
 

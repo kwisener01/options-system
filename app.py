@@ -15,7 +15,7 @@ import sys
 import threading
 import time
 import warnings
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 import pytz
 from flask import Flask, jsonify, render_template, request
@@ -1209,6 +1209,125 @@ def _build_position_summary() -> tuple[str, str]:
     return close_block, pos_block
 
 
+def _premarket_prep_job():
+    """Runs at 8:30 AM ET Mon-Fri.
+    Uses prior-day cached GEX (real OI, HIGH confidence) + fresh pre-market
+    prices from yfinance. No options chain fetch needed — walls from yesterday
+    remain valid until the market opens and new OI prints.
+    """
+    try:
+        from src.analysis.gex_scanner import load_chain, compute_exposures, format_gex_message
+        from src.notifications.slack_notifier import send_message
+
+        ts = datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
+
+        # -- Most recent cached chain (prior trading day) ---------------------
+        contracts  = None
+        chain_date = None
+        for offset in range(5):
+            d = date.today() - timedelta(days=offset + 1)
+            c = load_chain(d)
+            if c:
+                contracts  = c
+                chain_date = d
+                break
+
+        # -- Pre-market prices via yfinance -----------------------------------
+        prices      = {}   # sym -> latest price
+        prev_closes = {}   # sym -> prior close
+        try:
+            import yfinance as yf
+            tickers = yf.download(
+                "SPY QQQ IWM ^VIX", period="3d", auto_adjust=True,
+                progress=False, threads=True
+            )
+            closes = tickers["Close"]
+            for sym in ["SPY", "QQQ", "IWM", "^VIX"]:
+                col = sym
+                if col in closes.columns and len(closes[col].dropna()) >= 2:
+                    vals = closes[col].dropna()
+                    prices[sym]      = float(vals.iloc[-1])
+                    prev_closes[sym] = float(vals.iloc[-2])
+        except Exception as e:
+            logger.warning("yfinance pre-market fetch failed: %s", e)
+
+        # Fallback: use get_data() VIX if yfinance empty
+        if not prices:
+            try:
+                d_data = get_data()
+                vx = d_data.get("vix", {})
+                prices["^VIX"]      = vx.get("now", 0)
+                prev_closes["^VIX"] = vx.get("prev", 0)
+                sp = d_data.get("spy", {}).get("spot", 0)
+                if sp:
+                    prices["SPY"] = sp
+            except Exception:
+                pass
+
+        spy_spot = prices.get("SPY", 0)
+        vix_now  = prices.get("^VIX", 0)
+        vix_prev = prev_closes.get("^VIX", vix_now)
+
+        # -- GEX from cached chain --------------------------------------------
+        gex_block = ""
+        if contracts and spy_spot:
+            try:
+                result     = compute_exposures(spy_spot, vix_now, vix_prev, contracts)
+                result.regime_confidence = "HIGH"
+                gex_block  = format_gex_message(result, session="morning")
+                gex_block += f"\n  _GEX from {chain_date} cache (real OI)_"
+            except Exception as e:
+                logger.warning("GEX compute in prep job failed: %s", e)
+
+        # -- Index price lines ------------------------------------------------
+        index_lines = []
+        for sym in ["SPY", "QQQ", "IWM"]:
+            px   = prices.get(sym)
+            prev = prev_closes.get(sym)
+            if px and prev:
+                chg  = (px - prev) / prev * 100
+                icon = ":green_circle:" if chg >= 0 else ":red_circle:"
+                index_lines.append(f"  {icon} *{sym}* ${px:.2f}  ({chg:+.1f}% prev close)")
+            elif px:
+                index_lines.append(f"  *{sym}* ${px:.2f}")
+
+        if vix_now:
+            vix_chg   = vix_now - vix_prev if vix_prev else 0
+            vix_icon  = (":green_circle:" if vix_now < 18
+                         else ":large_yellow_circle:" if vix_now < 25
+                         else ":red_circle:")
+            vix_label = ("LOW — favorable for credit spreads" if vix_now < 18
+                         else "ELEVATED — reduce size" if vix_now < 25
+                         else "HIGH — caution, widen strikes")
+            index_lines.append(
+                f"  {vix_icon} *VIX* {vix_now:.1f} ({vix_chg:+.1f})  _{vix_label}_"
+            )
+
+        # -- Open positions snapshot ------------------------------------------
+        _, pos_block = _build_position_summary()
+
+        # -- Assemble message -------------------------------------------------
+        sections = [f":clipboard: *Pre-Market Prep — {ts}*"]
+
+        if index_lines:
+            sections += ["", "*--- MARKET ---*"] + index_lines
+
+        if gex_block:
+            sections += ["", "*--- GEX WALLS (prior close, HIGH confidence) ---*", gex_block]
+
+        if pos_block:
+            sections += ["", "*--- POSITIONS (pre-market) ---*", pos_block]
+
+        sections.append("\n_Live options scan fires at 9:45 AM ET._")
+
+        send_message("\n".join(sections))
+        logger.info("Pre-market prep sent — spy=%.2f vix=%.2f gex_cached=%s",
+                    spy_spot, vix_now, bool(contracts))
+
+    except Exception as e:
+        logger.error("_premarket_prep_job error: %s", e)
+
+
 def _unified_scan_job():
     """Runs at 9:45 AM and 12:30 PM ET Mon-Fri.
     Runs all strategy scanners in parallel. Only sends Slack when there is
@@ -1714,6 +1833,8 @@ def _start_scheduler():
     from apscheduler.schedulers.background import BackgroundScheduler
 
     sched = BackgroundScheduler(timezone=ET)
+    sched.add_job(_premarket_prep_job, "cron", day_of_week="mon-fri", hour=8, minute=30,
+                  id="premarket_prep",     replace_existing=True)
     sched.add_job(_unified_scan_job, "cron", day_of_week="mon-fri", hour=9,  minute=45,
                   id="scan_0945",          replace_existing=True)
     sched.add_job(_unified_scan_job, "cron", day_of_week="mon-fri", hour=10, minute=0,
@@ -1725,7 +1846,7 @@ def _start_scheduler():
     sched.add_job(_eod_report_job,   "cron", day_of_week="mon-fri", hour=16, minute=5,
                   id="eod_report",         replace_existing=True)
     sched.start()
-    logger.info("Scheduler started: unified scan 9:45/10:00/10:30/12:30, EOD 4:05 PM ET (Mon-Fri)")
+    logger.info("Scheduler started: prep 8:30 / scan 9:45/10:00/10:30/12:30 / EOD 4:05 PM ET (Mon-Fri)")
     return sched
 
 
