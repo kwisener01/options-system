@@ -1902,6 +1902,116 @@ def _unified_scan_job():
         logger.error("_unified_scan_job error: %s", e)
 
 
+# ── Manage-at-50% (3:30 PM ET) ───────────────────────────────────────────────
+
+def _occ_parse(sym: str):
+    """Return (underlying, expiry_date, strike, 'C'|'P') from an OCC symbol, or None."""
+    try:
+        tp  = len(sym) - 9
+        raw = sym[tp - 6:tp]
+        exp = date(2000 + int(raw[0:2]), int(raw[2:4]), int(raw[4:6]))
+        return sym[:tp - 6], exp, int(sym[-8:]) / 1000.0, sym[tp]
+    except Exception:
+        return None
+
+
+def _profit_targets():
+    """Group open option legs into structures and compute profit vs. the 50%
+    target. Returns a list of flagged structures that have hit it.
+
+    - credit structures (condors, BWBs, credit spreads): target = 50% of credit
+    - long butterflies (3 legs, 1/2/1, net debit): target = 50% of max profit
+    - other long debit: target = +50% on the debit paid
+
+    Legs are grouped by (underlying, expiry); Alpaca doesn't tag which legs
+    belong to which strategy, so multiple structures on the same underlying AND
+    expiry are treated as one net book (the net-credit % is still a sane signal).
+    """
+    from src.live.alpaca_options import _trading
+    client    = _trading()
+    positions = client.get_all_positions()
+    opts = [p for p in positions
+            if getattr(p, "asset_class", "") in ("us_option", "option") or len(p.symbol) > 10]
+
+    groups: dict = {}
+    for p in opts:
+        parsed = _occ_parse(p.symbol)
+        if not parsed:
+            continue
+        underlying, exp, strike, otype = parsed
+        leg = {
+            "sym":    p.symbol,
+            "qty":    float(p.qty),
+            "entry":  float(getattr(p, "avg_entry_price", 0) or 0),
+            "unreal": float(getattr(p, "unrealized_pl", 0) or 0),
+            "strike": strike, "otype": otype,
+        }
+        groups.setdefault((underlying, exp), []).append(leg)
+
+    flagged = []
+    today = date.today()
+    for (underlying, exp), legs in groups.items():
+        dte    = (exp - today).days
+        net_cf = sum(-lg["qty"] * lg["entry"] * 100 for lg in legs)   # + = credit
+        unreal = sum(lg["unreal"] for lg in legs)
+        n      = len(legs)
+
+        if net_cf > 0:                                   # credit structure
+            maxp, kind = net_cf, "credit"
+        else:                                            # debit structure
+            debit = -net_cf
+            maxp, kind = debit, "debit"                  # default: 50% on premium
+            if n == 3:                                   # maybe a long butterfly
+                sl     = sorted(legs, key=lambda x: x["strike"])
+                qtys   = [abs(x["qty"]) for x in sl]
+                strks  = [x["strike"] for x in sl]
+                even   = abs((strks[1] - strks[0]) - (strks[2] - strks[1])) < 0.01
+                ratio  = qtys[1] >= 2 * qtys[0] - 1e-6
+                if even and ratio:
+                    wing = strks[1] - strks[0]
+                    base = qtys[0]
+                    mp   = wing * 100 * base - debit
+                    if mp > 0:
+                        maxp, kind = mp, "fly"
+
+        target = 0.5 * maxp
+        if maxp > 0 and unreal >= target:
+            flagged.append({
+                "underlying": underlying, "exp": str(exp), "dte": dte,
+                "unreal": round(unreal), "maxp": round(maxp),
+                "pct": round(unreal / maxp * 100), "kind": kind,
+                "n_legs": n, "single": legs[0]["sym"] if n == 1 else None,
+            })
+    return flagged
+
+
+def _manage_5050_job():
+    """3:30 PM ET Mon-Fri. Flags open structures that have hit the 50% profit
+    target so winners are closed before the EOD gamma tail. Silent if none."""
+    try:
+        if not _market_is_open():
+            return
+        from src.notifications.slack_notifier import send_message
+        flags = _profit_targets()
+        if not flags:
+            logger.info("Manage-3:30: no structures at 50% target")
+            return
+        ts = datetime.now(ET).strftime("%H:%M ET")
+        lines = [f":dart: *3:30 Profit Check — {ts}*  _take winners before the gamma tail_"]
+        for f in sorted(flags, key=lambda x: -x["pct"]):
+            close = (f"`/close_position {f['single']}`" if f["single"]
+                     else f"`python close_bwb.py --ticker {f['underlying']}`")
+            lines.append(
+                f"  :white_check_mark: *{f['underlying']}* {f['exp']} ({f['dte']}DTE, "
+                f"{f['kind']})  +${f['unreal']} of ${f['maxp']} max  *{f['pct']}%*\n"
+                f"    :point_right: {close}"
+            )
+        send_message("\n".join(lines))
+        logger.info("Manage-3:30 alert: %d structure(s) at 50%%+", len(flags))
+    except Exception as e:
+        logger.error("_manage_5050_job error: %s", e)
+
+
 # ── EOD Report + Close Suggestions ───────────────────────────────────────────
 
 def _eod_report_job():
@@ -2240,6 +2350,27 @@ def _cmd_condor(resp_url: str):
         _slack_respond(resp_url, f":rotating_light: Condor scan failed: {e}")
 
 
+def _cmd_manage(resp_url: str):
+    """On-demand 50% profit check across open structures."""
+    try:
+        flags = _profit_targets()
+        if not flags:
+            _slack_respond(resp_url, ":hourglass_flowing_sand: No open structures at the 50% target yet.")
+            return
+        lines = [":dart: *50% Profit Check*"]
+        for f in sorted(flags, key=lambda x: -x["pct"]):
+            close = (f"`/close_position {f['single']}`" if f["single"]
+                     else f"`python close_bwb.py --ticker {f['underlying']}`")
+            lines.append(
+                f"  :white_check_mark: *{f['underlying']}* {f['exp']} ({f['dte']}DTE, "
+                f"{f['kind']})  +${f['unreal']} of ${f['maxp']} max  *{f['pct']}%*\n"
+                f"    :point_right: {close}"
+            )
+        _slack_respond(resp_url, "\n".join(lines))
+    except Exception as e:
+        _slack_respond(resp_url, f":rotating_light: Manage check failed: {e}")
+
+
 def _cmd_eod(resp_url: str):
     _eod_report_job()
 
@@ -2255,6 +2386,7 @@ HELP_TEXT = (
     "`/spy`   — current SPY trade signal + stock-rotation check\n"
     "`/fly`   — GEX-pinned butterfly (positive-gamma pin play)\n"
     "`/condor` — GEX-anchored iron condor (high-POP premium play)\n"
+    "`/manage` — check open structures at the 50% profit target\n"
     "`/eod`   — generate EOD P&L report now\n"
     "`/help`  — show this message"
 )
@@ -2282,6 +2414,7 @@ def slack_command():
         "spy":       ":hourglass: Checking SPY trade + rotation...",
         "fly":       ":hourglass: Scanning GEX-pinned butterflies...",
         "condor":    ":hourglass: Scanning GEX-anchored condors...",
+        "manage":    ":hourglass: Checking 50% profit targets...",
         "eod":       ":hourglass: Generating EOD report...",
         "help":      None,
     }
@@ -2301,6 +2434,7 @@ def slack_command():
         "spy":       lambda: _cmd_spy(resp_url),
         "fly":       lambda: _cmd_fly(resp_url),
         "condor":    lambda: _cmd_condor(resp_url),
+        "manage":    lambda: _cmd_manage(resp_url),
         "eod":       lambda: _cmd_eod(resp_url),
     }
     threading.Thread(target=dispatch[command], daemon=True).start()
@@ -2325,11 +2459,13 @@ def _start_scheduler():
     # SPY trade + rotation monitor — every 5 min during RTH (market-open guarded)
     sched.add_job(_spy_trade_monitor_job, "cron", day_of_week="mon-fri",
                   hour="9-15", minute="*/5", id="spy_monitor", replace_existing=True)
+    sched.add_job(_manage_5050_job,  "cron", day_of_week="mon-fri", hour=15, minute=30,
+                  id="manage_1530",        replace_existing=True)
     sched.add_job(_eod_report_job,   "cron", day_of_week="mon-fri", hour=16, minute=5,
                   id="eod_report",         replace_existing=True)
     sched.start()
     logger.info("Scheduler started: prep 8:30 / scan 9:45/10:00/10:30/12:30 / "
-                "SPY monitor */5 / EOD 4:05 PM ET (Mon-Fri)")
+                "SPY monitor */5 / manage 3:30 / EOD 4:05 PM ET (Mon-Fri)")
     return sched
 
 
