@@ -9,6 +9,7 @@ Routes:
 """
 import hashlib
 import hmac
+import json
 import logging
 import os
 import sys
@@ -16,6 +17,7 @@ import threading
 import time
 import warnings
 from datetime import datetime, date, timedelta
+from datetime import time as dt_time
 
 import pytz
 from flask import Flask, jsonify, render_template, request
@@ -609,6 +611,174 @@ def _build_trade_idea(spy: dict, vix_now: float, vix_prev: float) -> dict:
         }
 
 
+# ── SPY trade idea: shared formatting + change-detection ─────────────────────────
+#
+# These power both the periodic scans and the 5-minute SPY trade monitor.  The
+# monitor alerts ONLY when the recommended high-probability trade changes to a
+# different structure/strikes, so the channel stays quiet on unchanged days.
+
+def _spy_recommended(t: dict):
+    """Return the single recommended trade dict from a trade_idea, or None."""
+    trades = (t or {}).get("trades") or []
+    return next((tr for tr in trades if tr.get("recommended")), None)
+
+
+def _spy_trade_signature(t: dict):
+    """Stable fingerprint of the recommended trade. Two ideas with the same
+    structure + strikes + direction + expiry share a signature, so re-running
+    the scan on unchanged conditions produces no new alert."""
+    rec = _spy_recommended(t)
+    if not rec:
+        return None
+    strikes = "/".join(str(lg.get("strike")) for lg in rec.get("legs", []))
+    return f"{t.get('direction','')}|{rec.get('type','')}|{strikes}|{t.get('expiry','')}"
+
+
+def _spy_trade_quality(t: dict):
+    """Grade the recommended SPY trade. Returns (tier, reasons).
+
+    tier ∈ {HIGH, MODERATE, LOW}. HIGH = high-probability setup worth an alert:
+    premium-selling structure, supportive GEX/VIX read, healthy R/R, and a
+    short strike comfortably OTM (probability-of-profit proxy)."""
+    rec = _spy_recommended(t)
+    if not rec:
+        return "LOW", ["no recommended structure"]
+
+    reasons: list[str] = []
+    score = 0
+
+    if rec.get("is_credit"):
+        score += 1
+        reasons.append("credit / positive theta")
+
+    rating = rec.get("rating")
+    if rating in ("A+", "Acceptable"):
+        score += 1
+        reasons.append(f"BWB rating {rating}")
+
+    rr = rec.get("rr_ratio") or 0
+    if rr and rr >= 0.25:
+        score += 1
+        reasons.append(f"R/R {rr:.2f}")
+
+    spot = t.get("spot") or 0
+    short_leg = next((lg for lg in rec.get("legs", []) if lg.get("action") == "SELL"), None)
+    if short_leg and spot:
+        k = short_leg.get("strike") or 0
+        otm = ((spot - k) if short_leg.get("opt") == "P" else (k - spot)) / spot * 100
+        if otm >= 0.5:
+            score += 1
+            reasons.append(f"short {otm:.1f}% OTM")
+
+    tier = "HIGH" if score >= 3 else "MODERATE" if score >= 2 else "LOW"
+    return tier, reasons
+
+
+def _fmt_spy_trade_block(t: dict) -> str:
+    """Multi-trade block used inside the GEX dashboard post and the unified scan."""
+    if not t:
+        return ""
+    direction = t.get("direction", "")
+    color     = ":red_circle:" if direction == "BEARISH" else ":green_circle:"
+    live_tag  = " _(live prices)_" if t.get("prices_live") else ""
+    trades    = t.get("trades") or []
+    rec_trade = _spy_recommended(t)
+    rec_label = rec_trade["type"] if rec_trade else "—"
+
+    trade_lines = []
+    for tr in trades:
+        star   = "★ " if tr.get("recommended") else "  "
+        legs   = "/".join(f"${lg['strike']}" for lg in tr.get("legs", []))
+        cr     = tr.get("credit", 0) or 0
+        profit = tr.get("max_profit_usd") or 0
+        risk   = tr.get("max_risk_usd") or 0
+        rating = f"  [{tr['rating']}]" if tr.get("rating") else ""
+        trade_lines.append(
+            f">  {star}{tr['type']}  {legs}  "
+            f"{'Cr' if cr >= 0 else 'Dr'} ${abs(cr):.2f}  "
+            f"Profit ${profit}  Risk ${risk}{rating}"
+        )
+
+    return (
+        f"{color} *SPY Trade Ideas — {direction}  |  Recommended: {rec_label}"
+        f"  |  Expiry {t.get('expiry','')} ({t.get('dte','')}DTE){live_tag}*\n"
+        + "\n".join(trade_lines)
+        + ("\n" if trade_lines else "")
+        + "\n".join(f">  - {pt}" for pt in t.get("thesis", []))
+    )
+
+
+def _fmt_spy_signal(t: dict, tier: str, reasons: list, changed: bool) -> str:
+    """Focused 'trade this now' alert for the 5-minute monitor — one structure,
+    full leg detail with live mids, sizing, and confidence."""
+    rec       = _spy_recommended(t)
+    direction = t.get("direction", "")
+    color     = ":red_circle:" if direction == "BEARISH" else ":green_circle:"
+    header    = ":rotating_light: *SPY Trade Changed*" if changed else ":dart: *SPY Trade Signal*"
+
+    leg_lines = []
+    for lg in rec.get("legs", []):
+        q     = lg.get("qty", 1) or 1
+        qtxt  = f"{q}x " if q != 1 else ""
+        mid   = lg.get("mid")
+        midtx = f" @ ${mid:.2f}" if mid else ""
+        leg_lines.append(f"  {lg['action']:<4} {qtxt}${lg['strike']}{lg['opt']}{midtx}")
+
+    cr     = rec.get("credit", 0) or 0
+    crtxt  = f"{'Credit' if cr >= 0 else 'Debit'} ${abs(cr):.2f}"
+    profit = rec.get("max_profit_usd") or 0
+    risk   = rec.get("max_risk_usd") or 0
+    rr     = rec.get("rr_ratio")
+    rrtxt  = f"  |  R/R {rr:.2f}" if rr else ""
+    rate   = f"  |  Rating {rec['rating']}" if rec.get("rating") else ""
+
+    lines = [
+        header,
+        f"{color} *{rec['type']} — {direction}*  ({t.get('expiry','')}, {t.get('dte','')}DTE)  "
+        f"SPY ${t.get('spot', 0):.2f}",
+        *leg_lines,
+        f"{crtxt}  |  Max profit ${profit}  |  Max risk ${risk}{rrtxt}{rate}",
+        f":dart: Confidence *{tier}* — " + ", ".join(reasons),
+    ]
+    return "\n".join(lines)
+
+
+# Persisted across Render restarts so a redeploy doesn't re-fire the same trade.
+SPY_STATE_PATH = os.path.join(os.path.dirname(__file__), "data", "spy_trade_state.json")
+_spy_state_lock = threading.Lock()
+
+
+def _load_spy_state() -> dict:
+    try:
+        with open(SPY_STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {"sig": None, "tier": None, "ts": 0}
+
+
+def _save_spy_state(state: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(SPY_STATE_PATH), exist_ok=True)
+        with open(SPY_STATE_PATH, "w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        logger.warning("Could not persist SPY trade state: %s", e)
+
+
+def _market_is_open() -> bool:
+    """Alpaca clock is authoritative (handles holidays/half-days); fall back to
+    an ET time window only if the API is unreachable."""
+    try:
+        from src.live.alpaca_options import _trading
+        return bool(_trading().get_clock().is_open)
+    except Exception as e:
+        logger.warning("Clock check failed (%s) — using ET time window", e)
+        now = datetime.now(ET)
+        if now.weekday() >= 5:
+            return False
+        return dt_time(9, 30) <= now.time() <= dt_time(16, 0)
+
+
 def _build_data() -> dict:
     spy_spot, spy_prev, qqq_spot, qqq_prev, iwm_spot, iwm_prev, vix_now, vix_prev = _fetch_prices()
     spy   = _scan_ticker("SPY", spy_spot, spy_prev, vix_now, vix_prev)
@@ -751,20 +921,8 @@ def api_bwb():
 def api_watchlist():
     force = request.args.get("force", "false").lower() == "true"
     try:
-        with _wl_lock:
-            age = time.time() - _wl_cache["ts"]
-            if force or _wl_cache["data"] is None or age > WL_CACHE_TTL:
-                logger.info("Running value watchlist scan (force=%s age=%.0fs)", force, age)
-                d   = get_data()
-                fc  = d["spy"].get("full_chain") or {}
-                from src.analysis.value_watchlist import scan_watchlist
-                _wl_cache["data"] = scan_watchlist(
-                    spy_regime = fc.get("regime", "UNKNOWN"),
-                    vix_now    = d["vix"]["now"],
-                    vix_prev   = d["vix"]["prev"],
-                )
-                _wl_cache["ts"] = time.time()
-        return jsonify({"ok": True, "signals": _wl_cache["data"],
+        signals = _get_watchlist(force=force)
+        return jsonify({"ok": True, "signals": signals,
                         "timestamp": datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")})
     except Exception as e:
         logger.exception("Watchlist scan failed")
@@ -1086,36 +1244,7 @@ def _fmt_slack(d: dict) -> str:
         lines.append(f">  Regime: {badge} {regime.replace('_', ' ').title()}")
         return "\n".join(lines)
 
-    trade_block = ""
-    if t:
-        direction = t.get("direction", "")
-        color     = ":red_circle:" if direction == "BEARISH" else ":green_circle:"
-        live_tag  = " _(live prices)_" if t.get("prices_live") else ""
-        trades    = t.get("trades") or []
-        rec_trade = next((tr for tr in trades if tr.get("recommended")), None)
-        rec_label = rec_trade["type"] if rec_trade else "—"
-
-        trade_lines = []
-        for tr in trades:
-            star  = "★ " if tr.get("recommended") else "  "
-            legs  = "/".join(f"${lg['strike']}" for lg in tr.get("legs", []))
-            cr    = tr.get("credit", 0) or 0
-            profit = tr.get("max_profit_usd") or 0
-            risk   = tr.get("max_risk_usd") or 0
-            rating = f"  [{tr['rating']}]" if tr.get("rating") else ""
-            trade_lines.append(
-                f">  {star}{tr['type']}  {legs}  "
-                f"{'Cr' if cr >= 0 else 'Dr'} ${abs(cr):.2f}  "
-                f"Profit ${profit}  Risk ${risk}{rating}"
-            )
-
-        trade_block = (
-            f"\n{color} *SPY Trade Ideas — {direction}  |  Recommended: {rec_label}"
-            f"  |  Expiry {t.get('expiry','')} ({t.get('dte','')}DTE){live_tag}*\n"
-            + "\n".join(trade_lines)
-            + ("\n" if trade_lines else "")
-            + "\n".join(f">  - {pt}" for pt in t.get("thesis", []))
-        )
+    trade_block = ("\n" + _fmt_spy_trade_block(t)) if t else ""
 
     return (
         f":bar_chart: *GEX Dashboard -- {ts}*\n"
@@ -1328,6 +1457,230 @@ def _premarket_prep_job():
         logger.error("_premarket_prep_job error: %s", e)
 
 
+# ── Stock-holding rotation: sell laggards, rotate into faster movers ────────────
+#
+# Daily-gain rotation. For each equity holding we estimate trailing daily return
+# and trend; against the best STRONG value-watchlist candidate we hold. A swap is
+# only suggested when the candidate's avg daily return beats the laggard by a
+# clear margin AND the laggard has a reason to exit (sell trigger / below trend).
+
+ROTATION_EDGE_PCT   = 0.30   # candidate must out-gain holding by ≥0.30 %/day
+ROTATION_LOOKBACK   = 10     # sessions for trailing avg daily return
+
+
+def _get_watchlist(force: bool = False) -> list:
+    """Cached value-watchlist scan (30-min TTL) — shared by the route and rotation."""
+    with _wl_lock:
+        age = time.time() - _wl_cache["ts"]
+        if force or _wl_cache["data"] is None or age > WL_CACHE_TTL:
+            d  = get_data()
+            fc = d["spy"].get("full_chain") or {}
+            from src.analysis.value_watchlist import scan_watchlist
+            _wl_cache["data"] = scan_watchlist(
+                spy_regime=fc.get("regime", "UNKNOWN"),
+                vix_now=d["vix"]["now"], vix_prev=d["vix"]["prev"],
+            )
+            _wl_cache["ts"] = time.time()
+        return _wl_cache["data"] or []
+
+
+def _stock_daily_metrics(tickers: list) -> dict:
+    """Trailing daily-return metrics from Alpaca daily bars.
+    Returns {ticker: {avg_daily_ret, mom_pct, last, above_ma}}."""
+    out: dict = {}
+    tickers = [t for t in dict.fromkeys(tickers) if t]
+    if not tickers:
+        return out
+    try:
+        from alpaca.data.historical.stock import StockHistoricalDataClient
+        from alpaca.data.requests import StockBarsRequest
+        from alpaca.data.timeframe import TimeFrame
+        from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY
+
+        client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        req = StockBarsRequest(
+            symbol_or_symbols=tickers,
+            timeframe=TimeFrame.Day,
+            start=datetime.now(ET) - timedelta(days=40),
+        )
+        bars = client.get_stock_bars(req).data
+    except Exception as e:
+        logger.warning("Rotation: daily-bar fetch failed: %s", e)
+        return out
+
+    for tk in tickers:
+        rows = bars.get(tk) or []
+        closes = [float(b.close) for b in rows if getattr(b, "close", None)]
+        if len(closes) < ROTATION_LOOKBACK + 1:
+            continue
+        rets = [(closes[i] / closes[i - 1] - 1) * 100 for i in range(1, len(closes))]
+        avg_daily = sum(rets[-ROTATION_LOOKBACK:]) / ROTATION_LOOKBACK
+        mom_pct   = (closes[-1] / closes[-min(20, len(closes))] - 1) * 100
+        ma        = sum(closes[-20:]) / min(20, len(closes))
+        out[tk] = {
+            "avg_daily_ret": round(avg_daily, 3),
+            "mom_pct":       round(mom_pct, 2),
+            "last":          round(closes[-1], 2),
+            "above_ma":      closes[-1] >= ma,
+        }
+    return out
+
+
+def _stock_rotation_analysis():
+    """Return a rotation suggestion dict or None.
+
+    {sell, buy, sell_metrics, buy_metrics, edge, reasons, sell_cmd, buy_note}"""
+    try:
+        from src.live.alpaca_options import _trading
+        client    = _trading()
+        positions = client.get_all_positions()
+    except Exception as e:
+        logger.warning("Rotation: position fetch failed: %s", e)
+        return None
+
+    holdings = [
+        p.symbol.upper() for p in positions
+        if getattr(p, "asset_class", "") in ("us_equity", "equity")
+    ]
+    if not holdings:
+        return None
+
+    # Candidate pool = STRONG/WATCH watchlist names we don't already hold.
+    vw = _get_watchlist()
+    candidates = [
+        r for r in vw
+        if r.get("signal") in ("STRONG", "WATCH") and r.get("ticker", "").upper() not in holdings
+    ]
+    if not candidates:
+        return None
+
+    cand_syms = [r["ticker"].upper() for r in candidates]
+    metrics   = _stock_daily_metrics(holdings + cand_syms)
+    if not metrics:
+        return None
+
+    held_pnl = {
+        p.symbol.upper(): float(getattr(p, "unrealized_plpc", 0) or 0) * 100
+        for p in positions
+    }
+
+    # Weakest holding by trailing daily return.
+    held_m = [(h, metrics[h]) for h in holdings if h in metrics]
+    if not held_m:
+        return None
+    sell_tk, sell_m = min(held_m, key=lambda kv: kv[1]["avg_daily_ret"])
+
+    sell_reasons = []
+    if not sell_m["above_ma"]:
+        sell_reasons.append("below 20-day trend")
+    if sell_m["mom_pct"] < 0:
+        sell_reasons.append(f"20d momentum {sell_m['mom_pct']:+.1f}%")
+    if sell_m["avg_daily_ret"] < 0:
+        sell_reasons.append(f"avg {sell_m['avg_daily_ret']:+.2f}%/day")
+    if held_pnl.get(sell_tk, 0) < -5:
+        sell_reasons.append(f"position {held_pnl[sell_tk]:+.1f}%")
+    if not sell_reasons:
+        return None   # no real reason to exit anything
+
+    # Best candidate by trailing daily return.
+    cand_m = [(c, metrics[c]) for c in cand_syms if c in metrics]
+    if not cand_m:
+        return None
+    buy_tk, buy_m = max(cand_m, key=lambda kv: kv[1]["avg_daily_ret"])
+
+    edge = round(buy_m["avg_daily_ret"] - sell_m["avg_daily_ret"], 3)
+    if edge < ROTATION_EDGE_PCT or not buy_m["above_ma"]:
+        return None   # no clear daily-gain edge
+
+    return {
+        "sell": sell_tk, "buy": buy_tk,
+        "sell_metrics": sell_m, "buy_metrics": buy_m,
+        "edge": edge, "reasons": sell_reasons,
+        "sell_cmd": f"/close_position {sell_tk}",
+        "buy_note": f"buy {buy_tk} (~+{buy_m['avg_daily_ret']:.2f}%/day, mom {buy_m['mom_pct']:+.1f}%)",
+    }
+
+
+def _fmt_rotation(rot: dict) -> str:
+    sm, bm = rot["sell_metrics"], rot["buy_metrics"]
+    return "\n".join([
+        ":arrows_counterclockwise: *Rotation Idea — higher daily gain*",
+        f"  SELL *{rot['sell']}*  ({sm['avg_daily_ret']:+.2f}%/day, mom {sm['mom_pct']:+.1f}%)",
+        f"    reasons: {', '.join(rot['reasons'])}",
+        f"  BUY  *{rot['buy']}*  ({bm['avg_daily_ret']:+.2f}%/day, mom {bm['mom_pct']:+.1f}%)",
+        f"  Edge: *+{rot['edge']:.2f}%/day*",
+        f"  :point_right: `{rot['sell_cmd']}`  then buy {rot['buy']}",
+    ])
+
+
+def _spy_trade_monitor_job():
+    """Every 5 min during RTH. Three independent, change-gated alerts:
+      1. SPY options trade   — fires only when the recommended HIGH-probability
+         structure/strikes change from the last alert.
+      2. GEX-pinned butterfly — positive-gamma pin play; fires when the best
+         fly's body/wing/expiry changes.
+      3. Stock rotation       — fires only when a new sell→buy suggestion appears.
+    Unchanged conditions stay silent."""
+    try:
+        if not _market_is_open():
+            return
+
+        from src.notifications.slack_notifier import send_message
+        state = _load_spy_state()
+        now   = datetime.now(ET).strftime("%H:%M ET")
+
+        # 1 ── SPY options trade ------------------------------------------------
+        d   = get_data()
+        t   = d.get("trade_idea") or {}
+        sig = _spy_trade_signature(t)
+        if sig:
+            tier, reasons = _spy_trade_quality(t)
+            if tier == "HIGH" and state.get("sig") != sig:
+                changed = state.get("sig") is not None
+                send_message(_fmt_spy_signal(t, tier, reasons, changed))
+                logger.info("SPY monitor: trade alert %s (prev=%s)", sig, state.get("sig"))
+                state["sig"] = sig
+                state["tier"] = tier
+            elif tier != "HIGH":
+                logger.info("SPY monitor: tier=%s — not high-probability, hold", tier)
+
+        # 2 ── GEX-pinned butterfly (positive-gamma pin play) -------------------
+        try:
+            from src.analysis.gex_scanner import scan as gex_scan
+            from src.analysis.butterfly_scanner import scan as fly_scan, fmt_slack as fly_fmt
+            gx = gex_scan()
+            fly = fly_scan(gx.spot, gx, dte_min=0, dte_max=10) if gx else {}
+            cands = fly.get("candidates") or []
+            top = cands[0] if cands else None
+            fly_sig = (f"{top['ticker']}|{top['short_body']}|{top['wing']}|{top['expiry']}"
+                       if top else None)
+            if fly_sig and state.get("fly_sig") != fly_sig:
+                send_message(f":alarm_clock: _{now}_\n" + fly_fmt(fly))
+                logger.info("SPY monitor: fly alert %s (prev=%s)", fly_sig, state.get("fly_sig"))
+                state["fly_sig"] = fly_sig
+            elif not fly_sig:
+                state["fly_sig"] = None   # no pin play (e.g. negative gamma) — reset
+        except Exception as e:
+            logger.warning("SPY monitor: fly check failed: %s", e)
+
+        # 3 ── Stock rotation ---------------------------------------------------
+        rot = _stock_rotation_analysis()
+        rot_sig = f"{rot['sell']}->{rot['buy']}" if rot else None
+        if rot_sig and state.get("rot_sig") != rot_sig:
+            send_message(f":alarm_clock: _{now}_\n" + _fmt_rotation(rot))
+            logger.info("SPY monitor: rotation alert %s (prev=%s)", rot_sig, state.get("rot_sig"))
+            state["rot_sig"] = rot_sig
+        elif not rot_sig:
+            state["rot_sig"] = None   # cleared — allow a future suggestion to re-fire
+
+        state["ts"] = time.time()
+        with _spy_state_lock:
+            _save_spy_state(state)
+
+    except Exception as e:
+        logger.error("_spy_trade_monitor_job error: %s", e)
+
+
 def _unified_scan_job():
     """Runs at 9:45 AM and 12:30 PM ET Mon-Fri.
     Runs all strategy scanners in parallel. Only sends Slack when there is
@@ -1341,6 +1694,8 @@ def _unified_scan_job():
         from src.analysis.fallen_angel_scanner   import fmt_slack as fa_fmt
         from src.analysis.value_watchlist        import scan_watchlist as vw_scan
         from src.analysis.value_watchlist        import fmt_slack as vw_fmt
+        from src.analysis.bwb_scanner            import scan as bwb_scan
+        from src.analysis.butterfly_scanner      import scan as fly_scan, fmt_slack as fly_fmt
         from src.analysis.gex_scanner            import scan as gex_scan, format_gex_message
         from src.notifications.slack_notifier    import send_message
 
@@ -1353,7 +1708,10 @@ def _unified_scan_job():
         regime  = fc.get("regime", "UNKNOWN")
 
         # -- Run all scanners in parallel -------------------------------------
-        bp_results = fa_results = vw_results = []
+        bp_results = []
+        fa_results = []
+        vw_results = []
+        bwb_results = []
         gex_result = None
 
         def _run_bp():
@@ -1362,14 +1720,17 @@ def _unified_scan_job():
             return fa_scan()
         def _run_vw():
             return vw_scan(spy_regime=regime, vix_now=vix["now"])
+        def _run_bwb():
+            return bwb_scan(tier="all", vix_now=vix["now"], vix_prev=vix["prev"])
         def _run_gex():
             return gex_scan()
 
-        with ThreadPoolExecutor(max_workers=4) as ex:
+        with ThreadPoolExecutor(max_workers=5) as ex:
             futures = {
                 ex.submit(_run_bp):  "bp",
                 ex.submit(_run_fa):  "fa",
                 ex.submit(_run_vw):  "vw",
+                ex.submit(_run_bwb): "bwb",
                 ex.submit(_run_gex): "gex",
             }
             for fut in as_completed(futures):
@@ -1382,6 +1743,8 @@ def _unified_scan_job():
                         fa_results = result
                     elif key == "vw":
                         vw_results = result
+                    elif key == "bwb":
+                        bwb_results = result
                     elif key == "gex":
                         gex_result = result
                 except Exception as e:
@@ -1392,6 +1755,14 @@ def _unified_scan_job():
             _bp_cache["data"] = bp_results
             _bp_cache["ts"]   = time.time()
 
+        # GEX-pinned butterfly (depends on the GEX result; positive-gamma only)
+        fly_result = {}
+        if gex_result:
+            try:
+                fly_result = fly_scan(gex_result.spot, gex_result, dte_min=0, dte_max=10)
+            except Exception as e:
+                logger.warning("Butterfly scan failed: %s", e)
+
         # -- Check if anything is actionable ---------------------------------
         close_block, pos_block = _build_position_summary()
 
@@ -1399,7 +1770,26 @@ def _unified_scan_job():
         fa_hits = [r for r in fa_results if r.get("signal") in ("STRONG", "WATCH")]
         vw_hits = [r for r in vw_results if r.get("signal") in ("STRONG", "WATCH", "SELL")]
 
-        if not close_block and not bp_hits and not fa_hits and not vw_hits:
+        # BWB watchlist: only high-quality, non-earnings candidates count as hits
+        bwb_hits = [
+            r for r in bwb_results
+            if r.get("candidate")
+            and (r["candidate"].get("analysis") or {}).get("rating") in ("A+", "Acceptable")
+            and r["candidate"].get("earnings_warning") is not True
+        ]
+
+        # SPY BWB: a recommended, HIGH-quality butterfly should fire on its own
+        rec_spy        = _spy_recommended(t)
+        spy_tier, _    = _spy_trade_quality(t)
+        spy_bwb_hit    = bool(
+            rec_spy
+            and rec_spy.get("type") in ("Bull BWB", "Double BWB", "Call BWB")
+            and spy_tier == "HIGH"
+        )
+
+        fly_hits = fly_result.get("candidates") or []
+
+        if not any([close_block, bp_hits, fa_hits, vw_hits, bwb_hits, spy_bwb_hit, fly_hits]):
             logger.info("Unified scan: nothing actionable — skipping Slack alert")
             return
 
@@ -1417,34 +1807,7 @@ def _unified_scan_job():
             )
 
         # -- SPY trade idea --------------------------------------------------
-        trade_block = ""
-        if t:
-            direction = t.get("direction", "")
-            color     = ":red_circle:" if direction == "BEARISH" else ":green_circle:"
-            live_tag  = " _(live prices)_" if t.get("prices_live") else ""
-            trades    = t.get("trades") or []
-            rec_trade = next((tr for tr in trades if tr.get("recommended")), None)
-            rec_label = rec_trade["type"] if rec_trade else "—"
-            trade_lines = []
-            for tr in trades:
-                star   = "★ " if tr.get("recommended") else "  "
-                legs   = "/".join(f"${lg['strike']}" for lg in tr.get("legs", []))
-                cr     = tr.get("credit", 0) or 0
-                profit = tr.get("max_profit_usd") or 0
-                risk   = tr.get("max_risk_usd") or 0
-                rating = f"  [{tr['rating']}]" if tr.get("rating") else ""
-                trade_lines.append(
-                    f">  {star}{tr['type']}  {legs}  "
-                    f"{'Cr' if cr >= 0 else 'Dr'} ${abs(cr):.2f}  "
-                    f"Profit ${profit}  Risk ${risk}{rating}"
-                )
-            trade_block = (
-                f"{color} *SPY Trade Ideas — {direction}  |  Recommended: {rec_label}"
-                f"  |  Expiry {t.get('expiry','')} ({t.get('dte','')}DTE){live_tag}*\n"
-                + "\n".join(trade_lines)
-                + ("\n" if trade_lines else "")
-                + "\n".join(f">  - {pt}" for pt in t.get("thesis", []))
-            )
+        trade_block = _fmt_spy_trade_block(t)
 
         # -- Bull put /place commands ----------------------------------------
         bp_place_lines = []
@@ -1464,6 +1827,21 @@ def _unified_scan_job():
                 f"  :point_right: `{cmd}`"
             )
 
+        # -- BWB watchlist candidates ----------------------------------------
+        bwb_lines = []
+        for r in sorted(bwb_hits, key=lambda x: x["candidate"]["analysis"]["score"], reverse=True):
+            c = r["candidate"]
+            a = c["analysis"]
+            icon = ":white_check_mark:" if a["rating"] == "A+" else ":large_yellow_circle:"
+            bwb_lines.append(
+                f"{icon} *{r['ticker']} ${r['spot']:.2f}* ({r.get('change_pct',0):+.1f}%)  "
+                f"[{a['rating']} {a['score']}/10]\n"
+                f"  BUY ${c['long_upper']:.0f}P / SELL 2x ${c['short_strike']:.0f}P / "
+                f"BUY ${c['long_lower']:.0f}P  {c['dte']}DTE  "
+                f"Credit +${c.get('credit',0):.2f}  R/R {a['rr_ratio']}  "
+                f"Max profit +${a['max_profit_usd']}  Max loss -${a['max_loss_usd']}"
+            )
+
         # -- Assemble message ------------------------------------------------
         sections = [f":mag: *{session} Scan — {ts}*"]
 
@@ -1481,11 +1859,17 @@ def _unified_scan_job():
             sections += ["", vw_fmt(vw_results, regime, vix["now"], ts)]
         if bp_place_lines:
             sections += ["", ":moneybag: *Bull Put Spreads — place trade*"] + bp_place_lines
+        if bwb_lines:
+            sections += ["", ":butterfly: *BWB Watchlist Candidates*"] + bwb_lines
+        fly_block = fly_fmt(fly_result)
+        if fly_block:
+            sections += ["", fly_block]
 
         send_message("\n".join(sections))
         logger.info(
-            "Unified scan alert sent — BP:%d FA:%d VW:%d close=%s",
-            len(bp_hits), len(fa_hits), len(vw_hits), bool(close_block),
+            "Unified scan alert sent — BP:%d FA:%d VW:%d BWB:%d spyBWB:%s fly:%d close=%s",
+            len(bp_hits), len(fa_hits), len(vw_hits), len(bwb_hits),
+            spy_bwb_hit, len(fly_hits), bool(close_block),
         )
 
     except Exception as e:
@@ -1770,6 +2154,44 @@ def _cmd_scan(resp_url: str):
     # scan job sends its own Slack message; no need to double-post
 
 
+def _cmd_spy(resp_url: str):
+    """On-demand SPY trade signal + rotation check (does not touch monitor state)."""
+    d = get_data()
+    t = d.get("trade_idea") or {}
+    sections = []
+    if _spy_recommended(t):
+        tier, reasons = _spy_trade_quality(t)
+        sections.append(_fmt_spy_signal(t, tier, reasons, changed=False))
+    else:
+        sections.append(":warning: No SPY trade idea available right now.")
+    rot = _stock_rotation_analysis()
+    if rot:
+        sections += ["", _fmt_rotation(rot)]
+    _slack_respond(resp_url, "\n".join(sections))
+
+
+def _cmd_fly(resp_url: str):
+    """On-demand GEX-pinned butterfly scan."""
+    try:
+        from src.analysis.gex_scanner import scan as gex_scan
+        from src.analysis.butterfly_scanner import scan as fly_scan, fmt_slack as fly_fmt
+        gx = gex_scan()
+        if not gx:
+            _slack_respond(resp_url, ":warning: GEX scan unavailable right now.")
+            return
+        fly = fly_scan(gx.spot, gx, dte_min=0, dte_max=10)
+        block = fly_fmt(fly)
+        if block:
+            _slack_respond(resp_url, block)
+        else:
+            _slack_respond(resp_url,
+                f":no_entry: No pin butterfly — {fly.get('note','')}\n"
+                f"  Regime: {gx.gex_regime}  |  gamma wall ${gx.gamma_wall:.0f}  "
+                f"call wall ${gx.call_wall:.0f}")
+    except Exception as e:
+        _slack_respond(resp_url, f":rotating_light: Fly scan failed: {e}")
+
+
 def _cmd_eod(resp_url: str):
     _eod_report_job()
 
@@ -1782,6 +2204,8 @@ HELP_TEXT = (
     "`/place TICKER SHORT LONG EXPIRY [QTY]`  — place bull put credit spread\n"
     "  _e.g._ `/place KO 82.5 80 2026-07-17`\n\n"
     "`/scan`  — run bull put scanner now + send results\n"
+    "`/spy`   — current SPY trade signal + stock-rotation check\n"
+    "`/fly`   — GEX-pinned butterfly (positive-gamma pin play)\n"
     "`/eod`   — generate EOD P&L report now\n"
     "`/help`  — show this message"
 )
@@ -1806,6 +2230,8 @@ def slack_command():
         "close":     f":hourglass: Closing `{text.upper()}`...",
         "place":     f":hourglass: Placing spread `{text}`...",
         "scan":      ":hourglass: Running bull put scan...",
+        "spy":       ":hourglass: Checking SPY trade + rotation...",
+        "fly":       ":hourglass: Scanning GEX-pinned butterflies...",
         "eod":       ":hourglass: Generating EOD report...",
         "help":      None,
     }
@@ -1822,6 +2248,8 @@ def slack_command():
         "close":     lambda: _cmd_close(text, resp_url),
         "place":     lambda: _cmd_place(text, resp_url),
         "scan":      lambda: _cmd_scan(resp_url),
+        "spy":       lambda: _cmd_spy(resp_url),
+        "fly":       lambda: _cmd_fly(resp_url),
         "eod":       lambda: _cmd_eod(resp_url),
     }
     threading.Thread(target=dispatch[command], daemon=True).start()
@@ -1843,10 +2271,14 @@ def _start_scheduler():
                   id="scan_1030",          replace_existing=True)
     sched.add_job(_unified_scan_job, "cron", day_of_week="mon-fri", hour=12, minute=30,
                   id="scan_1230",          replace_existing=True)
+    # SPY trade + rotation monitor — every 5 min during RTH (market-open guarded)
+    sched.add_job(_spy_trade_monitor_job, "cron", day_of_week="mon-fri",
+                  hour="9-15", minute="*/5", id="spy_monitor", replace_existing=True)
     sched.add_job(_eod_report_job,   "cron", day_of_week="mon-fri", hour=16, minute=5,
                   id="eod_report",         replace_existing=True)
     sched.start()
-    logger.info("Scheduler started: prep 8:30 / scan 9:45/10:00/10:30/12:30 / EOD 4:05 PM ET (Mon-Fri)")
+    logger.info("Scheduler started: prep 8:30 / scan 9:45/10:00/10:30/12:30 / "
+                "SPY monitor */5 / EOD 4:05 PM ET (Mon-Fri)")
     return sched
 
 
