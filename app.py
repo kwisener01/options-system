@@ -1614,12 +1614,14 @@ def _fmt_rotation(rot: dict) -> str:
 
 
 def _spy_trade_monitor_job():
-    """Every 5 min during RTH. Three independent, change-gated alerts:
+    """Every 5 min during RTH. Independent, change-gated alerts:
       1. SPY options trade   — fires only when the recommended HIGH-probability
          structure/strikes change from the last alert.
       2. GEX-pinned butterfly — positive-gamma pin play; fires when the best
          fly's body/wing/expiry changes.
-      3. Stock rotation       — fires only when a new sell→buy suggestion appears.
+      3. GEX-anchored condor  — positive-gamma premium play; fires when the
+         short put/call strikes change.
+      4. Stock rotation       — fires only when a new sell→buy suggestion appears.
     Unchanged conditions stay silent."""
     try:
         if not _market_is_open():
@@ -1644,11 +1646,13 @@ def _spy_trade_monitor_job():
             elif tier != "HIGH":
                 logger.info("SPY monitor: tier=%s — not high-probability, hold", tier)
 
-        # 2 ── GEX-pinned butterfly (positive-gamma pin play) -------------------
+        # 2 ── GEX-pinned butterfly + condor (positive-gamma plays) -------------
         try:
             from src.analysis.gex_scanner import scan as gex_scan
             from src.analysis.butterfly_scanner import scan as fly_scan, fmt_slack as fly_fmt
+            from src.analysis.condor_scanner import scan as condor_scan, fmt_slack as condor_fmt
             gx = gex_scan()
+
             fly = fly_scan(gx.spot, gx, dte_min=0, dte_max=10) if gx else {}
             cands = fly.get("candidates") or []
             top = cands[0] if cands else None
@@ -1660,8 +1664,19 @@ def _spy_trade_monitor_job():
                 state["fly_sig"] = fly_sig
             elif not fly_sig:
                 state["fly_sig"] = None   # no pin play (e.g. negative gamma) — reset
+
+            con = condor_scan(gx.spot, gx, dte_min=0, dte_max=7) if gx else {}
+            cc = con.get("candidate")
+            con_sig = (f"{cc['ticker']}|{cc['short_put']}|{cc['short_call']}|{cc['expiry']}"
+                       if cc else None)
+            if con_sig and state.get("con_sig") != con_sig:
+                send_message(f":alarm_clock: _{now}_\n" + condor_fmt(con))
+                logger.info("SPY monitor: condor alert %s (prev=%s)", con_sig, state.get("con_sig"))
+                state["con_sig"] = con_sig
+            elif not con_sig:
+                state["con_sig"] = None
         except Exception as e:
-            logger.warning("SPY monitor: fly check failed: %s", e)
+            logger.warning("SPY monitor: fly/condor check failed: %s", e)
 
         # 3 ── Stock rotation ---------------------------------------------------
         rot = _stock_rotation_analysis()
@@ -1696,6 +1711,7 @@ def _unified_scan_job():
         from src.analysis.value_watchlist        import fmt_slack as vw_fmt
         from src.analysis.bwb_scanner            import scan as bwb_scan
         from src.analysis.butterfly_scanner      import scan as fly_scan, fmt_slack as fly_fmt
+        from src.analysis.condor_scanner         import scan as condor_scan, fmt_slack as condor_fmt
         from src.analysis.gex_scanner            import scan as gex_scan, format_gex_message
         from src.notifications.slack_notifier    import send_message
 
@@ -1755,13 +1771,18 @@ def _unified_scan_job():
             _bp_cache["data"] = bp_results
             _bp_cache["ts"]   = time.time()
 
-        # GEX-pinned butterfly (depends on the GEX result; positive-gamma only)
+        # GEX-pinned butterfly + GEX-anchored condor (positive-gamma only)
         fly_result = {}
+        condor_result = {}
         if gex_result:
             try:
                 fly_result = fly_scan(gex_result.spot, gex_result, dte_min=0, dte_max=10)
             except Exception as e:
                 logger.warning("Butterfly scan failed: %s", e)
+            try:
+                condor_result = condor_scan(gex_result.spot, gex_result, dte_min=0, dte_max=7)
+            except Exception as e:
+                logger.warning("Condor scan failed: %s", e)
 
         # -- Check if anything is actionable ---------------------------------
         close_block, pos_block = _build_position_summary()
@@ -1788,8 +1809,10 @@ def _unified_scan_job():
         )
 
         fly_hits = fly_result.get("candidates") or []
+        condor_hit = condor_result.get("candidate")
 
-        if not any([close_block, bp_hits, fa_hits, vw_hits, bwb_hits, spy_bwb_hit, fly_hits]):
+        if not any([close_block, bp_hits, fa_hits, vw_hits, bwb_hits,
+                    spy_bwb_hit, fly_hits, condor_hit]):
             logger.info("Unified scan: nothing actionable — skipping Slack alert")
             return
 
@@ -1864,12 +1887,15 @@ def _unified_scan_job():
         fly_block = fly_fmt(fly_result)
         if fly_block:
             sections += ["", fly_block]
+        condor_block = condor_fmt(condor_result)
+        if condor_block:
+            sections += ["", condor_block]
 
         send_message("\n".join(sections))
         logger.info(
-            "Unified scan alert sent — BP:%d FA:%d VW:%d BWB:%d spyBWB:%s fly:%d close=%s",
+            "Unified scan alert sent — BP:%d FA:%d VW:%d BWB:%d spyBWB:%s fly:%d condor:%s close=%s",
             len(bp_hits), len(fa_hits), len(vw_hits), len(bwb_hits),
-            spy_bwb_hit, len(fly_hits), bool(close_block),
+            spy_bwb_hit, len(fly_hits), bool(condor_hit), bool(close_block),
         )
 
     except Exception as e:
@@ -2192,6 +2218,28 @@ def _cmd_fly(resp_url: str):
         _slack_respond(resp_url, f":rotating_light: Fly scan failed: {e}")
 
 
+def _cmd_condor(resp_url: str):
+    """On-demand GEX-anchored iron condor. Optional arg: delta (0.10 / 0.16)."""
+    try:
+        from src.analysis.gex_scanner import scan as gex_scan
+        from src.analysis.condor_scanner import scan as condor_scan, fmt_slack as condor_fmt
+        gx = gex_scan()
+        if not gx:
+            _slack_respond(resp_url, ":warning: GEX scan unavailable right now.")
+            return
+        con = condor_scan(gx.spot, gx, dte_min=0, dte_max=7)
+        block = condor_fmt(con)
+        if block:
+            _slack_respond(resp_url, block)
+        else:
+            _slack_respond(resp_url,
+                f":no_entry: No condor — {con.get('note','')}\n"
+                f"  Regime: {gx.gex_regime}  |  put wall ${gx.put_wall:.0f}  "
+                f"call wall ${gx.call_wall:.0f}")
+    except Exception as e:
+        _slack_respond(resp_url, f":rotating_light: Condor scan failed: {e}")
+
+
 def _cmd_eod(resp_url: str):
     _eod_report_job()
 
@@ -2206,6 +2254,7 @@ HELP_TEXT = (
     "`/scan`  — run bull put scanner now + send results\n"
     "`/spy`   — current SPY trade signal + stock-rotation check\n"
     "`/fly`   — GEX-pinned butterfly (positive-gamma pin play)\n"
+    "`/condor` — GEX-anchored iron condor (high-POP premium play)\n"
     "`/eod`   — generate EOD P&L report now\n"
     "`/help`  — show this message"
 )
@@ -2232,6 +2281,7 @@ def slack_command():
         "scan":      ":hourglass: Running bull put scan...",
         "spy":       ":hourglass: Checking SPY trade + rotation...",
         "fly":       ":hourglass: Scanning GEX-pinned butterflies...",
+        "condor":    ":hourglass: Scanning GEX-anchored condors...",
         "eod":       ":hourglass: Generating EOD report...",
         "help":      None,
     }
@@ -2250,6 +2300,7 @@ def slack_command():
         "scan":      lambda: _cmd_scan(resp_url),
         "spy":       lambda: _cmd_spy(resp_url),
         "fly":       lambda: _cmd_fly(resp_url),
+        "condor":    lambda: _cmd_condor(resp_url),
         "eod":       lambda: _cmd_eod(resp_url),
     }
     threading.Thread(target=dispatch[command], daemon=True).start()

@@ -33,7 +33,8 @@ src/
 │   ├── value_watchlist.py
 │   ├── bwb_analyzer.py       Broken Wing Butterfly analysis
 │   ├── bwb_scanner.py        Multi-ticker BWB watchlist screen
-│   └── butterfly_scanner.py  GEX-pinned long butterfly (positive-gamma pin play)
+│   ├── butterfly_scanner.py  GEX-pinned long butterfly (positive-gamma pin play)
+│   └── condor_scanner.py     GEX-anchored iron condor (high-POP premium play)
 ├── live/
 │   ├── alpaca_options.py     Options chain fetch, GEX chain cache, order placement
 │   └── leading_indicators.py
@@ -65,6 +66,11 @@ Unequal-wing put butterfly on SPX/XSP. Structures analyzed:
 ### GEX-Pinned Butterfly (`butterfly_scanner.py`)
 Symmetric long butterfly (BUY 1 / SELL 2 / BUY 1) centered on the GEX pin level — the mirror of the premium-collection strategies. **Risk = the debit (small); reward = wing − debit (often 5–20×).** Only fires in `POSITIVE_GAMMA` regime (dealers suppress vol toward a strike into expiry), centered on the gamma wall / call wall / flip level. Filters: debit ≤ $2.50, R/R ≥ 4:1, body within 2.5% of spot. Stands down in negative/unknown gamma — there's no pin to target. `/fly` runs it on demand.
 
+### GEX-Anchored Iron Condor (`condor_scanner.py`)
+The high-win-percentage premium play and the mirror of the butterfly. Sells an OTM put spread + OTM call spread; keeps the full credit if price finishes between the shorts. **Delta = the win-rate dial:** shorts targeted to ~16Δ (≈84%/side) or ~10Δ (≈90%/side). Only fires in `POSITIVE_GAMMA` (price pins between the walls), shorts anchored to the GEX put/call walls (or the delta target, whichever is further OTM). VIX bands flag thin-premium days (soft floor at VIX 11). Reports POP, breakevens, R/R, and a "manage at 50%" reminder to cut the gamma tail. `/condor` runs it on demand.
+
+**Strategy barbell:** butterfly = low-win / high-reward (pin bet); condor = high-win / modest-reward (premium). High win % ≠ high expectancy — the edge is selling when IV > realized, wall-anchored strikes, and managing winners early.
+
 ### GEX (Gamma Exposure)
 Computed as `Gamma × OI × 100 × Spot²`, **calls positive / puts negative** (SqueezeMetrics convention). `net_gex > 0` → POSITIVE_GAMMA (pinning); `< 0` → NEGATIVE_GAMMA (trending). Uses Yahoo Finance OI (high confidence) cached daily; Alpaca greeks/chain as fallback.
 
@@ -92,7 +98,8 @@ Runs every 5 minutes during regular trading hours (market-open guarded via Alpac
 
 1. **SPY options trade** — recomputes the recommended structure from live GEX + VIX. Fires only when the trade passes a **HIGH-probability** quality gate *and* the structure/strikes differ from the last alert. Quality gate scores: credit/positive-theta, BWB rating (A+/Acceptable), R/R ≥ 0.25, and short strike ≥ 0.5% OTM (POP proxy). Needs ≥ 3 to alert.
 2. **GEX-pinned butterfly** — on positive-gamma days, the best pin fly; fires when its body/wing/expiry changes.
-3. **Stock rotation** — checks equity holdings; if the weakest holding (lowest trailing daily return) has a reason to exit (below 20-day trend / negative momentum / losing position) *and* a STRONG/WATCH watchlist candidate out-gains it by ≥ 0.30 %/day, it suggests a sell→buy swap. Fires only when the sell→buy pair changes.
+3. **GEX-anchored condor** — on positive-gamma days, the delta-targeted condor; fires when the short put/call strikes change.
+4. **Stock rotation** — checks equity holdings; if the weakest holding (lowest trailing daily return) has a reason to exit (below 20-day trend / negative momentum / losing position) *and* a STRONG/WATCH watchlist candidate out-gains it by ≥ 0.30 %/day, it suggests a sell→buy swap. Fires only when the sell→buy pair changes.
 
 State persists to `data/spy_trade_state.json` so a Render restart doesn't re-fire the same trade. Tunables: `ROTATION_EDGE_PCT`, `ROTATION_LOOKBACK` in `app.py`.
 
@@ -168,6 +175,7 @@ Set all `.env` variables in Render's Environment dashboard. No redeploy needed f
 | `/scan` | Run unified scan now |
 | `/spy` | Current SPY trade signal + stock-rotation check |
 | `/fly` | GEX-pinned butterfly (positive-gamma pin play) |
+| `/condor` | GEX-anchored iron condor (high-POP premium play) |
 | `/positions` | Current open positions |
 | `/place TICKER SHORT LONG EXPIRY [QTY]` | Place a bull put credit spread |
 | `/close_position TICKER` | Market-sell a stock/ETF position |
