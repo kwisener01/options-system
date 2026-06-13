@@ -35,7 +35,8 @@ src/
 │   ├── bwb_analyzer.py       Broken Wing Butterfly analysis
 │   ├── bwb_scanner.py        Multi-ticker BWB watchlist screen
 │   ├── butterfly_scanner.py  GEX-pinned long butterfly (positive-gamma pin play)
-│   └── condor_scanner.py     GEX-anchored iron condor (high-POP premium play)
+│   ├── condor_scanner.py     GEX-anchored iron condor (high-POP premium play)
+│   └── batman_scanner.py     GEX-anchored Batman / double BWB for XSP (positive-cowl)
 ├── live/
 │   ├── alpaca_options.py     Options chain fetch, GEX chain cache, order placement
 │   └── leading_indicators.py
@@ -69,6 +70,9 @@ Symmetric long butterfly (BUY 1 / SELL 2 / BUY 1) centered on the GEX pin level 
 
 ### GEX-Anchored Iron Condor (`condor_scanner.py`)
 The high-win-percentage premium play and the mirror of the butterfly. Sells an OTM put spread + OTM call spread; keeps the full credit if price finishes between the shorts. **Delta = the win-rate dial:** shorts targeted to ~16Δ (≈84%/side) or ~10Δ (≈90%/side). Only fires in `POSITIVE_GAMMA` (price pins between the walls), shorts anchored to the GEX put/call walls (or the delta target, whichever is further OTM). VIX bands flag thin-premium days (soft floor at VIX 11). Reports POP, breakevens, R/R, and a "manage at 50%" reminder to cut the gamma tail. `/condor` runs it on demand.
+
+### GEX-Anchored Batman (`batman_scanner.py`)
+Double broken-wing butterfly = a put BWB (left ear) + a call BWB (right ear) sharing one expiry, ears anchored to the GEX put/call walls. **Key constraint: positive cowl.** When both ears are OTM, P&L at spot = the net credit, so a *positive cowl* (profit even if price sits at spot) means the whole structure is a *net credit* — which broken wings make possible but symmetric butterflies never do. The scanner searches inner/outer wing widths to find a positive-cowl structure with defined tail risk (≤ $1,500), only in `POSITIVE_GAMMA`. Priced off the SPY chain (SPY ≈ XSP numerically) and **presented for XSP execution** at a European/cash-settled broker (no assignment, no pin risk — XSP isn't on Alpaca). `/batman` runs it on demand.
 
 **Strategy barbell:** butterfly = low-win / high-reward (pin bet); condor = high-win / modest-reward (premium). High win % ≠ high expectancy — the edge is selling when IV > realized, wall-anchored strikes, and managing winners early.
 
@@ -105,7 +109,8 @@ Runs every 5 minutes during regular trading hours (market-open guarded via Alpac
 1. **SPY options trade** — recomputes the recommended structure from live GEX + VIX. Fires only when the trade passes a **HIGH-probability** quality gate *and* the structure/strikes differ from the last alert. Quality gate scores: credit/positive-theta, BWB rating (A+/Acceptable), R/R ≥ 0.25, and short strike ≥ 0.5% OTM (POP proxy). Needs ≥ 3 to alert.
 2. **GEX-pinned butterfly** — on positive-gamma days, the best pin fly; fires when its body/wing/expiry changes.
 3. **GEX-anchored condor** — on positive-gamma days, the delta-targeted condor; fires when the short put/call strikes change.
-4. **Stock rotation** — checks equity holdings; if the weakest holding (lowest trailing daily return) has a reason to exit (below 20-day trend / negative momentum / losing position) *and* a STRONG/WATCH watchlist candidate out-gains it by ≥ 0.30 %/day, it suggests a sell→buy swap. Fires only when the sell→buy pair changes.
+4. **GEX-anchored Batman** — on positive-gamma days, the positive-cowl XSP double BWB; fires when the ears/outer-wing change.
+5. **Stock rotation** — checks equity holdings; if the weakest holding (lowest trailing daily return) has a reason to exit (below 20-day trend / negative momentum / losing position) *and* a STRONG/WATCH watchlist candidate out-gains it by ≥ 0.30 %/day, it suggests a sell→buy swap. Fires only when the sell→buy pair changes.
 
 State persists to `data/spy_trade_state.json` so a Render restart doesn't re-fire the same trade. Tunables: `ROTATION_EDGE_PCT`, `ROTATION_LOOKBACK` in `app.py`.
 
@@ -182,6 +187,7 @@ Set all `.env` variables in Render's Environment dashboard. No redeploy needed f
 | `/spy` | Current SPY trade signal + stock-rotation check |
 | `/fly` | GEX-pinned butterfly (positive-gamma pin play) |
 | `/condor` | GEX-anchored iron condor (high-POP premium play) |
+| `/batman` | GEX-anchored Batman for XSP (positive-cowl double BWB) |
 | `/manage` | Check open structures at the 50% profit target |
 | `/positions` | Current open positions |
 | `/place TICKER SHORT LONG EXPIRY [QTY]` | Place a bull put credit spread |

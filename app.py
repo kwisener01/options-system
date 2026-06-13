@@ -1675,8 +1675,20 @@ def _spy_trade_monitor_job():
                 state["con_sig"] = con_sig
             elif not con_sig:
                 state["con_sig"] = None
+
+            from src.analysis.batman_scanner import scan as batman_scan, fmt_slack as batman_fmt
+            bat = batman_scan(gx.spot, gx, dte_min=5, dte_max=21) if gx else {}
+            bc = bat.get("candidate")
+            bat_sig = (f"{bc['put_short']}|{bc['call_short']}|{bc['outer_wing']}|{bc['expiry']}"
+                       if bc else None)
+            if bat_sig and state.get("bat_sig") != bat_sig:
+                send_message(f":alarm_clock: _{now}_\n" + batman_fmt(bat))
+                logger.info("SPY monitor: batman alert %s (prev=%s)", bat_sig, state.get("bat_sig"))
+                state["bat_sig"] = bat_sig
+            elif not bat_sig:
+                state["bat_sig"] = None
         except Exception as e:
-            logger.warning("SPY monitor: fly/condor check failed: %s", e)
+            logger.warning("SPY monitor: fly/condor/batman check failed: %s", e)
 
         # 3 ── Stock rotation ---------------------------------------------------
         rot = _stock_rotation_analysis()
@@ -1712,6 +1724,7 @@ def _unified_scan_job():
         from src.analysis.bwb_scanner            import scan as bwb_scan
         from src.analysis.butterfly_scanner      import scan as fly_scan, fmt_slack as fly_fmt
         from src.analysis.condor_scanner         import scan as condor_scan, fmt_slack as condor_fmt
+        from src.analysis.batman_scanner         import scan as batman_scan, fmt_slack as batman_fmt
         from src.analysis.gex_scanner            import scan as gex_scan, format_gex_message
         from src.notifications.slack_notifier    import send_message
 
@@ -1774,6 +1787,7 @@ def _unified_scan_job():
         # GEX-pinned butterfly + GEX-anchored condor (positive-gamma only)
         fly_result = {}
         condor_result = {}
+        batman_result = {}
         if gex_result:
             try:
                 fly_result = fly_scan(gex_result.spot, gex_result, dte_min=0, dte_max=10)
@@ -1783,6 +1797,11 @@ def _unified_scan_job():
                 condor_result = condor_scan(gex_result.spot, gex_result, dte_min=0, dte_max=7)
             except Exception as e:
                 logger.warning("Condor scan failed: %s", e)
+            try:
+                batman_result = batman_scan(gex_result.spot, gex_result, dte_min=5, dte_max=21)
+            except Exception as e:
+                logger.warning("Batman scan failed: %s", e)
+                batman_result = {}
 
         # -- Check if anything is actionable ---------------------------------
         close_block, pos_block = _build_position_summary()
@@ -1810,9 +1829,10 @@ def _unified_scan_job():
 
         fly_hits = fly_result.get("candidates") or []
         condor_hit = condor_result.get("candidate")
+        batman_hit = batman_result.get("candidate")
 
         if not any([close_block, bp_hits, fa_hits, vw_hits, bwb_hits,
-                    spy_bwb_hit, fly_hits, condor_hit]):
+                    spy_bwb_hit, fly_hits, condor_hit, batman_hit]):
             logger.info("Unified scan: nothing actionable — skipping Slack alert")
             return
 
@@ -1890,12 +1910,16 @@ def _unified_scan_job():
         condor_block = condor_fmt(condor_result)
         if condor_block:
             sections += ["", condor_block]
+        batman_block = batman_fmt(batman_result)
+        if batman_block:
+            sections += ["", batman_block]
 
         send_message("\n".join(sections))
         logger.info(
-            "Unified scan alert sent — BP:%d FA:%d VW:%d BWB:%d spyBWB:%s fly:%d condor:%s close=%s",
+            "Unified scan alert sent — BP:%d FA:%d VW:%d BWB:%d spyBWB:%s fly:%d "
+            "condor:%s batman:%s close=%s",
             len(bp_hits), len(fa_hits), len(vw_hits), len(bwb_hits),
-            spy_bwb_hit, len(fly_hits), bool(condor_hit), bool(close_block),
+            spy_bwb_hit, len(fly_hits), bool(condor_hit), bool(batman_hit), bool(close_block),
         )
 
     except Exception as e:
@@ -2350,6 +2374,28 @@ def _cmd_condor(resp_url: str):
         _slack_respond(resp_url, f":rotating_light: Condor scan failed: {e}")
 
 
+def _cmd_batman(resp_url: str):
+    """On-demand GEX-anchored Batman (double broken-wing butterfly) for XSP."""
+    try:
+        from src.analysis.gex_scanner import scan as gex_scan
+        from src.analysis.batman_scanner import scan as batman_scan, fmt_slack as batman_fmt
+        gx = gex_scan()
+        if not gx:
+            _slack_respond(resp_url, ":warning: GEX scan unavailable right now.")
+            return
+        bat = batman_scan(gx.spot, gx, dte_min=5, dte_max=21)
+        block = batman_fmt(bat)
+        if block:
+            _slack_respond(resp_url, block)
+        else:
+            _slack_respond(resp_url,
+                f":no_entry: No Batman — {bat.get('note','')}\n"
+                f"  Regime: {gx.gex_regime}  |  put wall ${gx.put_wall:.0f}  "
+                f"call wall ${gx.call_wall:.0f}")
+    except Exception as e:
+        _slack_respond(resp_url, f":rotating_light: Batman scan failed: {e}")
+
+
 def _cmd_manage(resp_url: str):
     """On-demand 50% profit check across open structures."""
     try:
@@ -2386,6 +2432,7 @@ HELP_TEXT = (
     "`/spy`   — current SPY trade signal + stock-rotation check\n"
     "`/fly`   — GEX-pinned butterfly (positive-gamma pin play)\n"
     "`/condor` — GEX-anchored iron condor (high-POP premium play)\n"
+    "`/batman` — GEX-anchored Batman for XSP (positive-cowl double BWB)\n"
     "`/manage` — check open structures at the 50% profit target\n"
     "`/eod`   — generate EOD P&L report now\n"
     "`/help`  — show this message"
@@ -2414,6 +2461,7 @@ def slack_command():
         "spy":       ":hourglass: Checking SPY trade + rotation...",
         "fly":       ":hourglass: Scanning GEX-pinned butterflies...",
         "condor":    ":hourglass: Scanning GEX-anchored condors...",
+        "batman":    ":hourglass: Scanning XSP Batman setups...",
         "manage":    ":hourglass: Checking 50% profit targets...",
         "eod":       ":hourglass: Generating EOD report...",
         "help":      None,
@@ -2434,6 +2482,7 @@ def slack_command():
         "spy":       lambda: _cmd_spy(resp_url),
         "fly":       lambda: _cmd_fly(resp_url),
         "condor":    lambda: _cmd_condor(resp_url),
+        "batman":    lambda: _cmd_batman(resp_url),
         "manage":    lambda: _cmd_manage(resp_url),
         "eod":       lambda: _cmd_eod(resp_url),
     }
