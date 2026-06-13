@@ -279,8 +279,10 @@ def fetch_chain_for_gex(underlying: str = "SPY",
             if contract:
                 option_type = getattr(contract, "type", None) or getattr(contract, "option_type", None)
             if not option_type:
-                # parse from OCC symbol
-                option_type = "call" if len(symbol) > 15 and symbol[12] == "C" else "put"
+                # parse from OCC symbol: the C/P flag is always the char
+                # immediately before the 8-digit strike, i.e. symbol[-9]
+                # (e.g. SPY260117C00580000 -> index -9 == 'C').
+                option_type = "call" if len(symbol) >= 15 and symbol[-9].upper() == "C" else "put"
             is_call = str(option_type).lower() in ("call", "c")
 
             # expiry / T

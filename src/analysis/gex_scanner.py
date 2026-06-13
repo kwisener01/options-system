@@ -33,16 +33,38 @@ def _cache_path(as_of: date) -> str:
     return os.path.join(GEX_CHAIN_DIR, f"spy_chain_{as_of}.pkl")
 
 
+def chain_is_balanced(contracts: list[dict]) -> bool:
+    """A valid SPY chain near the money has real OI on BOTH calls and puts.
+
+    A one-sided chain (e.g. yfinance silently dropping calls — the June 2026 bug)
+    makes net GEX = call_gex − put_gex collapse to −put_gex, pinning the regime
+    to NEGATIVE_GAMMA forever. Reject such chains everywhere."""
+    if not contracts:
+        return False
+    call_n = sum(1 for c in contracts if c.get("is_call"))
+    put_n  = sum(1 for c in contracts if not c.get("is_call"))
+    call_oi = sum(c.get("oi", 0) for c in contracts if c.get("is_call"))
+    put_oi  = sum(c.get("oi", 0) for c in contracts if not c.get("is_call"))
+    return call_n >= 5 and put_n >= 5 and call_oi > 0 and put_oi > 0
+
+
 def save_chain(contracts: list[dict], as_of: date | None = None) -> None:
     """Persist a fetched options chain so subsequent calls skip the API."""
     as_of = as_of or date.today()
+    if not chain_is_balanced(contracts):
+        logger.error("Refusing to cache one-sided chain for %s "
+                     "(calls=%d puts=%d) — would corrupt GEX regime",
+                     as_of,
+                     sum(1 for c in contracts if c.get("is_call")),
+                     sum(1 for c in contracts if not c.get("is_call")))
+        return
     with open(_cache_path(as_of), "wb") as f:
         pickle.dump({"date": as_of, "contracts": contracts}, f)
     logger.info("Chain cached: %d contracts for %s", len(contracts), as_of)
 
 
 def load_chain(as_of: date | None = None) -> list[dict] | None:
-    """Return cached contracts for as_of date, or None if not cached."""
+    """Return cached contracts for as_of date, or None if not cached / corrupt."""
     as_of = as_of or date.today()
     p = _cache_path(as_of)
     if not os.path.exists(p):
@@ -51,6 +73,9 @@ def load_chain(as_of: date | None = None) -> list[dict] | None:
         with open(p, "rb") as f:
             data = pickle.load(f)
         contracts = data.get("contracts", [])
+        if not chain_is_balanced(contracts):
+            logger.warning("Cached chain %s is one-sided (corrupt) — ignoring, will re-fetch", p)
+            return None
         logger.info("Chain loaded from cache: %d contracts for %s", len(contracts), as_of)
         return contracts
     except Exception as e:
@@ -305,7 +330,17 @@ def compute_exposures(spot: float, vix: float, vix_prev: float,
 
     net_gex    = sum(gex_by_strike.values())
     net_vanna  = sum(vanna_by_strike.values())
-    gex_regime = "POSITIVE_GAMMA" if net_gex > 0 else "NEGATIVE_GAMMA"
+
+    # Guard: a one-sided chain (missing calls or puts) makes net_gex meaningless
+    # and would falsely report NEGATIVE_GAMMA. Report UNKNOWN instead.
+    total_call_oi = sum(c["oi"] for c in contracts if c["is_call"])
+    total_put_oi  = sum(c["oi"] for c in contracts if not c["is_call"])
+    if total_call_oi <= 0 or total_put_oi <= 0:
+        logger.error("One-sided chain (callOI=%d putOI=%d) — regime set UNKNOWN, not NEGATIVE",
+                     total_call_oi, total_put_oi)
+        gex_regime = "UNKNOWN"
+    else:
+        gex_regime = "POSITIVE_GAMMA" if net_gex > 0 else "NEGATIVE_GAMMA"
 
     # Gamma wall: strongest positive-GEX strike near spot (pin level)
     near_pos = {k: v for k, v in gex_by_strike.items()
