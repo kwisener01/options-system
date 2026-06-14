@@ -826,6 +826,37 @@ def api_gex():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+_news_lock = threading.Lock()
+_news_cache: dict = {"data": None, "ts": 0.0}
+NEWS_CACHE_TTL = 300  # 5 minutes
+
+
+@app.route("/api/news")
+def api_news():
+    """Recent scored headlines for held symbols + SPY, for the dashboard."""
+    with _news_lock:
+        if _news_cache["data"] is not None and time.time() - _news_cache["ts"] < NEWS_CACHE_TTL:
+            return jsonify({"ok": True, "data": _news_cache["data"], "cached": True})
+    try:
+        from src.live.news import news_for
+        symbols = ["SPY"]
+        try:
+            from src.live.alpaca_options import _trading
+            for p in _trading().get_all_positions():
+                base = p.symbol if len(p.symbol) <= 6 else _occ_parse(p.symbol)[0] if _occ_parse(p.symbol) else None
+                if base and base not in symbols:
+                    symbols.append(base)
+        except Exception as e:
+            logger.warning("api_news positions fetch failed: %s", e)
+        data = news_for(symbols, limit_each=5)
+        with _news_lock:
+            _news_cache["data"], _news_cache["ts"] = data, time.time()
+        return jsonify({"ok": True, "data": data, "cached": False})
+    except Exception as e:
+        logger.exception("api_news failed")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/slack", methods=["POST"])
 def api_slack():
     try:
@@ -1836,6 +1867,22 @@ def _unified_scan_job():
             logger.info("Unified scan: nothing actionable — skipping Slack alert")
             return
 
+        # -- News / earnings guard (equity premium plays) --------------------
+        earn_flags: dict = {}
+        try:
+            from src.live.news import earnings_guard
+            for r in bp_hits + bwb_hits:
+                tk = r.get("ticker")
+                if tk and tk not in earn_flags:
+                    earn_flags[tk] = earnings_guard(tk)
+        except Exception as e:
+            logger.warning("News guard failed: %s", e)
+
+        def _earn_note(tk: str) -> str:
+            g = earn_flags.get(tk) or {}
+            return ("\n  :warning: _news: " + g["reason"] +
+                    " — verify before selling premium_") if g.get("flagged") else ""
+
         # -- GEX / SPY context -----------------------------------------------
         gex_block = ""
         try:
@@ -1867,7 +1914,7 @@ def _unified_scan_job():
                 f"  SELL ${c['short_strike']}P / BUY ${c['long_strike']}P  "
                 f"{c['dte']}DTE  Credit +${c['credit']:.2f} ({c['credit_pct']:.0f}%)  "
                 f"Max loss -${c['max_loss_usd']}\n"
-                f"  :point_right: `{cmd}`"
+                f"  :point_right: `{cmd}`" + _earn_note(r['ticker'])
             )
 
         # -- BWB watchlist candidates ----------------------------------------
@@ -1883,6 +1930,7 @@ def _unified_scan_job():
                 f"BUY ${c['long_lower']:.0f}P  {c['dte']}DTE  "
                 f"Credit +${c.get('credit',0):.2f}  R/R {a['rr_ratio']}  "
                 f"Max profit +${a['max_profit_usd']}  Max loss -${a['max_loss_usd']}"
+                + _earn_note(r['ticker'])
             )
 
         # -- Assemble message ------------------------------------------------
@@ -1915,6 +1963,65 @@ def _unified_scan_job():
             sections += ["", batman_block]
 
         send_message("\n".join(sections))
+
+        # -- Interactive entry approvals (Alpaca-executable structures) -------
+        try:
+            entry_cands = []
+            for r in bp_hits:
+                c = r.get("candidate")
+                if not c:
+                    continue
+                legs = [
+                    {"action": "SELL", "strike": c["short_strike"], "opt": "P", "qty": 1},
+                    {"action": "BUY",  "strike": c["long_strike"],  "opt": "P", "qty": 1},
+                ]
+                label = f"Bull put {r['ticker']} {c['short_strike']}/{c['long_strike']} {c['expiry']}"
+                tid = register_entry("bull_put", r["ticker"], c["expiry"], legs,
+                                     qty=1, ref_net=float(c["credit"]), label=label,
+                                     text=f"*{label}*  {c['dte']}DTE  credit +${c['credit']:.2f} "
+                                          f"({c['credit_pct']:.0f}%)  max loss -${c['max_loss_usd']}"
+                                          + _earn_note(r["ticker"]))
+                entry_cands.append({"tid": tid,
+                                    "text": f"*{label}*  {c['dte']}DTE  credit +${c['credit']:.2f} "
+                                            f"({c['credit_pct']:.0f}%)  max loss -${c['max_loss_usd']}"
+                                            + _earn_note(r["ticker"]),
+                                    "label": label})
+            for r in sorted(bwb_hits, key=lambda x: x["candidate"]["analysis"]["score"], reverse=True):
+                c = r["candidate"]
+                legs = [
+                    {"action": "BUY",  "strike": c["long_upper"],   "opt": "P", "qty": 1},
+                    {"action": "SELL", "strike": c["short_strike"], "opt": "P", "qty": 2},
+                    {"action": "BUY",  "strike": c["long_lower"],   "opt": "P", "qty": 1},
+                ]
+                label = f"BWB {r['ticker']} {c['long_upper']:.0f}/{c['short_strike']:.0f}/{c['long_lower']:.0f} {c['expiry']}"
+                tid = register_entry("bwb", r["ticker"], c["expiry"], legs, qty=1,
+                                     ref_net=float(c.get("credit", 0)), label=label,
+                                     text=f"*{label}*  {c['dte']}DTE" + _earn_note(r["ticker"]))
+                entry_cands.append({"tid": tid, "text": f"*{label}*  {c['dte']}DTE", "label": label})
+            for c in fly_hits[:3]:
+                label = f"Pin fly {c['ticker']} {c['long_upper']:.0f}/{c['short_body']:.0f}/{c['long_lower']:.0f} {c['expiry']}"
+                tid = register_entry("fly", c["ticker"], c["expiry"], c["legs"], qty=1,
+                                     ref_net=-float(c["debit"]), label=label,
+                                     text=f"*{label}*  {c['dte']}DTE  debit -${c['debit']:.2f}  "
+                                          f"R/R {c['rr']}  max profit +${c['max_profit_usd']}")
+                entry_cands.append({"tid": tid,
+                                    "text": f"*{label}*  debit -${c['debit']:.2f}  R/R {c['rr']}",
+                                    "label": label})
+            if condor_hit:
+                c = condor_hit
+                label = (f"Condor {c['ticker']} {c['short_put']:.0f}/{c['long_put']:.0f}P "
+                         f"{c['short_call']:.0f}/{c['long_call']:.0f}C {c['expiry']}")
+                tid = register_entry("condor", c["ticker"], c["expiry"], c["legs"], qty=1,
+                                     ref_net=float(c["credit"]), label=label,
+                                     text=f"*{label}*  {c['dte']}DTE  credit +${c['credit']:.2f}  "
+                                          f"POP {c.get('pop_pct','?')}%")
+                entry_cands.append({"tid": tid,
+                                    "text": f"*{label}*  credit +${c['credit']:.2f}  POP {c.get('pop_pct','?')}%",
+                                    "label": label})
+            _post_entry_approvals(entry_cands)
+        except Exception as e:
+            logger.warning("Entry-approval post failed: %s", e)
+
         logger.info(
             "Unified scan alert sent — BP:%d FA:%d VW:%d BWB:%d spyBWB:%s fly:%d "
             "condor:%s batman:%s close=%s",
@@ -2031,6 +2138,20 @@ def _manage_5050_job():
                 f"    :point_right: {close}"
             )
         send_message("\n".join(lines))
+
+        # -- Interactive close approvals -------------------------------------
+        try:
+            exit_cands = []
+            for f in sorted(flags, key=lambda x: -x["pct"]):
+                label = f"{f['underlying']} {f['exp']} ({f['kind']})"
+                text = (f"*{label}*  +${f['unreal']} of ${f['maxp']} max  *{f['pct']}%*  "
+                        f"({f['dte']}DTE)")
+                tid = register_exit("structure", f["underlying"], label, text)
+                exit_cands.append({"tid": tid, "text": text, "label": label})
+            _post_exit_approvals(exit_cands)
+        except Exception as e:
+            logger.warning("Exit-approval post failed: %s", e)
+
         logger.info("Manage-3:30 alert: %d structure(s) at 50%%+", len(flags))
     except Exception as e:
         logger.error("_manage_5050_job error: %s", e)
@@ -2170,6 +2291,301 @@ def _eod_report_job():
         logger.error("_eod_report_job error: %s", e)
         from src.notifications.slack_notifier import send_message as _sm
         _sm(f":rotating_light: EOD report error: {e}")
+
+
+# ── Interactive trade approvals (Slack buttons) ──────────────────────────────
+#
+# Scans/manage jobs post an approval message with Take/Skip (entry) or
+# Close/Hold (exit) buttons. A tap hits /slack/interactive, which re-prices the
+# structure live, confirms it hasn't drifted past tolerance, and only then
+# submits. Pending trades live in data/pending_trades.json (survive restarts).
+
+REPRICE_TOLERANCE = 0.20   # reject if net credit/debit drifts >20% against us
+
+
+def _as_date(v):
+    """Coerce a scanner 'expiry' (date or 'YYYY-MM-DD' string) to a date."""
+    if isinstance(v, date):
+        return v
+    return date.fromisoformat(str(v)[:10])
+
+
+def _legs_to_occ(underlying: str, expiry, legs: list) -> list:
+    """Convert scanner legs [{action,strike,opt,qty}] to stored order legs with
+    OCC symbols. opt is 'P'/'C' (or PUT/CALL)."""
+    from src.live.alpaca_options import occ_symbol
+    exp = _as_date(expiry)
+    out = []
+    for lg in legs:
+        opt = str(lg.get("opt", "P")).upper()
+        otype = "CALL" if opt.startswith("C") else "PUT"
+        out.append({
+            "symbol": occ_symbol(underlying, exp, otype, float(lg["strike"])),
+            "side":   str(lg["action"]).upper(),       # BUY / SELL
+            "ratio":  int(lg.get("qty", 1)),
+            "ref_mid": float(lg.get("mid", 0) or 0),
+        })
+    return out
+
+
+def _reprice_net(legs: list):
+    """Re-fetch live mids and return (net_per_lot, priced_legs) using the same
+    slip convention as /place and close_bwb (SELL ×0.97, BUY ×1.03). net > 0 is
+    a credit. Returns (None, []) if any leg can't be priced."""
+    from src.live.alpaca_options import get_mid_price
+    net = 0.0
+    priced = []
+    for lg in legs:
+        mid = get_mid_price(lg["symbol"])
+        if mid is None:
+            return None, []
+        if lg["side"] == "SELL":
+            limit = round(mid * 0.97, 2)
+            net  += limit * lg["ratio"]
+        else:
+            limit = round(mid * 1.03, 2)
+            net  -= limit * lg["ratio"]
+        priced.append({**lg, "mid": mid, "limit": limit})
+    return round(net, 2), priced
+
+
+def register_entry(strategy: str, underlying: str, expiry, legs: list,
+                   qty: int, ref_net: float, label: str, text: str) -> str:
+    """Store a pending ENTRY and return its id. ref_net > 0 = credit per lot."""
+    from src.notifications import pending_store
+    order_legs = _legs_to_occ(underlying, expiry, legs)
+    return pending_store.add({
+        "kind": "entry", "strategy": strategy, "underlying": underlying.upper(),
+        "label": label, "text": text,
+        "order": {"legs": order_legs, "qty": int(qty),
+                  "ref_net": round(float(ref_net), 2), "tolerance": REPRICE_TOLERANCE},
+    })
+
+
+def register_exit(kind: str, underlying: str, label: str, text: str,
+                  symbol: str | None = None) -> str:
+    """Store a pending EXIT. kind='equity' (market-sell `symbol`) or
+    kind='structure' (multi-leg close of all option legs for `underlying`)."""
+    from src.notifications import pending_store
+    return pending_store.add({
+        "kind": "exit", "exit_kind": kind, "underlying": underlying.upper(),
+        "symbol": symbol, "label": label, "text": text, "order": {},
+    })
+
+
+def _drifted(ref_net: float, live_net: float, tol: float) -> bool:
+    """True if the live net moved against us beyond tolerance, or flipped sign."""
+    if ref_net >= 0:                                   # expected a credit
+        return live_net <= 0 or live_net < ref_net * (1 - tol)
+    else:                                              # expected a debit
+        return live_net >= 0 or abs(live_net) > abs(ref_net) * (1 + tol)
+
+
+def _execute_entry(rec: dict, resp_url: str):
+    """Re-price + confirm + submit a pending entry, then update the Slack msg."""
+    from src.notifications import pending_store
+    from src.live.alpaca_options import _trading
+    from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    tid = rec["id"]
+    try:
+        order   = rec["order"]
+        qty     = int(order["qty"])
+        ref_net = float(order["ref_net"])
+        tol     = float(order.get("tolerance", REPRICE_TOLERANCE))
+
+        live_net, priced = _reprice_net(order["legs"])
+        if live_net is None:
+            pending_store.update_status(tid, "failed", note="no_quotes")
+            _slack_replace(resp_url, f":x: *Skipped {rec['label']}* — could not re-price (no live quotes).")
+            return
+        if _drifted(ref_net, live_net, tol):
+            pending_store.update_status(tid, "skipped", note="drift", live_net=live_net)
+            kind = "credit" if ref_net >= 0 else "debit"
+            _slack_replace(resp_url,
+                f":no_entry: *Stood down — {rec['label']}*\n"
+                f"  {kind} moved from ${abs(ref_net):.2f} to ${abs(live_net):.2f} "
+                f"(past {tol:.0%} tolerance). Not submitted.")
+            return
+
+        is_credit = live_net > 0
+        leg_objs = [
+            OptionLegRequest(
+                symbol=lg["symbol"], ratio_qty=lg["ratio"] * qty,
+                side=OrderSide.SELL if lg["side"] == "SELL" else OrderSide.BUY,
+                position_intent=(PositionIntent.SELL_TO_OPEN if lg["side"] == "SELL"
+                                 else PositionIntent.BUY_TO_OPEN),
+            )
+            for lg in priced
+        ]
+        client = _trading()
+        order_obj = client.submit_order(LimitOrderRequest(
+            symbol=rec["underlying"], qty=1,
+            side=OrderSide.SELL if is_credit else OrderSide.BUY,
+            type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
+            limit_price=round(abs(live_net), 2), legs=leg_objs,
+        ))
+        pending_store.update_status(tid, "taken", order_id=str(order_obj.id), live_net=live_net)
+        word = "credit" if is_credit else "debit"
+        _slack_replace(resp_url,
+            f":white_check_mark: *Placed — {rec['label']}*  (qty {qty})\n"
+            f"  Net {word} ${abs(live_net):.2f}  _(alert ${abs(ref_net):.2f})_\n"
+            f"  Order ID: `{order_obj.id}`")
+    except Exception as e:
+        pending_store.update_status(tid, "failed", note=str(e))
+        _slack_replace(resp_url, f":rotating_light: *Place failed — {rec['label']}*: {e}")
+
+
+def _execute_exit(rec: dict, resp_url: str):
+    """Submit a pending exit (equity market-sell or multi-leg structure close)."""
+    from src.notifications import pending_store
+    from src.live.alpaca_options import _trading, get_mid_price
+    from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, OptionLegRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    tid = rec["id"]
+    try:
+        client = _trading()
+        if rec.get("exit_kind") == "equity":
+            sym = rec.get("symbol") or rec["underlying"]
+            pos = next((p for p in client.get_all_positions() if p.symbol == sym), None)
+            if pos is None:
+                pending_store.update_status(tid, "failed", note="no_position")
+                _slack_replace(resp_url, f":x: No open position for `{sym}` — nothing to close.")
+                return
+            unreal = float(getattr(pos, "unrealized_pl", 0) or 0)
+            order_obj = client.submit_order(MarketOrderRequest(
+                symbol=sym, qty=float(pos.qty), side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
+            pending_store.update_status(tid, "taken", order_id=str(order_obj.id))
+            icon = ":green_circle:" if unreal >= 0 else ":red_circle:"
+            _slack_replace(resp_url,
+                f"{icon} *Closed `{sym}`*  P&L ${unreal:+,.2f}\n  Order ID: `{order_obj.id}`")
+            return
+
+        # structure: close every open option leg for the underlying as one order
+        underlying = rec["underlying"]
+        opt_legs = [p for p in client.get_all_positions()
+                    if getattr(p, "asset_class", "") in ("us_option", "option")
+                    and p.symbol.upper().startswith(underlying)]
+        if not opt_legs:
+            pending_store.update_status(tid, "failed", note="no_legs")
+            _slack_replace(resp_url, f":x: No open option legs for `{underlying}` — nothing to close.")
+            return
+        net_debit, leg_objs, total_unreal = 0.0, [], 0.0
+        for pos in opt_legs:
+            mid = get_mid_price(pos.symbol)
+            if mid is None:
+                continue
+            qn    = float(pos.qty)
+            ratio = int(abs(qn))
+            total_unreal += float(getattr(pos, "unrealized_pl", 0) or 0)
+            if qn > 0:
+                side, intent, limit = OrderSide.SELL, PositionIntent.SELL_TO_CLOSE, round(mid * 0.95, 2)
+                net_debit -= limit * ratio * 100
+            else:
+                side, intent, limit = OrderSide.BUY, PositionIntent.BUY_TO_CLOSE, round(mid * 1.05, 2)
+                net_debit += limit * ratio * 100
+            leg_objs.append(OptionLegRequest(symbol=pos.symbol, ratio_qty=ratio,
+                                             side=side, position_intent=intent))
+        if not leg_objs:
+            pending_store.update_status(tid, "failed", note="no_quotes")
+            _slack_replace(resp_url, f":x: Could not price any `{underlying}` legs — not submitted.")
+            return
+        is_debit = net_debit > 0
+        net_share = round(abs(net_debit) / 100, 2)
+        order_obj = client.submit_order(LimitOrderRequest(
+            symbol=underlying, qty=1,
+            side=OrderSide.BUY if is_debit else OrderSide.SELL,
+            type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
+            limit_price=net_share, legs=leg_objs))
+        pending_store.update_status(tid, "taken", order_id=str(order_obj.id))
+        icon = ":green_circle:" if total_unreal >= 0 else ":red_circle:"
+        _slack_replace(resp_url,
+            f"{icon} *Closed structure `{underlying}`*  ({len(leg_objs)} legs)\n"
+            f"  Net {'debit' if is_debit else 'credit'} ${net_share:.2f}  |  "
+            f"P&L ${total_unreal:+,.2f}\n  Order ID: `{order_obj.id}`")
+    except Exception as e:
+        pending_store.update_status(tid, "failed", note=str(e))
+        _slack_replace(resp_url, f":rotating_light: *Close failed — {rec.get('label','')}*: {e}")
+
+
+def _slack_replace(url: str, text: str):
+    """Replace the original interactive message (drops the buttons)."""
+    import requests as _r
+    from src.notifications.slack_blocks import resolved_blocks
+    try:
+        _r.post(url, json={"replace_original": True, "text": text,
+                           "blocks": resolved_blocks(text)}, timeout=10)
+    except Exception as e:
+        logger.error("Slack replace_original failed: %s", e)
+
+
+def _post_entry_approvals(candidates: list):
+    """candidates: [{"tid","text","label"}]. Posts one approval message."""
+    if not candidates:
+        return
+    from src.notifications.slack_blocks import entry_blocks
+    from src.notifications.slack_notifier import send_blocks
+    header = ":inbox_tray: *Take these trades?*  _re-priced live on tap; auto-skipped if it drifts >20%_"
+    blocks, fallback = entry_blocks(header, candidates)
+    send_blocks(blocks, fallback)
+
+
+def _post_exit_approvals(candidates: list):
+    if not candidates:
+        return
+    from src.notifications.slack_blocks import exit_blocks
+    from src.notifications.slack_notifier import send_blocks
+    header = ":outbox_tray: *Close these?*  _taps submit a live closing order_"
+    blocks, fallback = exit_blocks(header, candidates)
+    send_blocks(blocks, fallback)
+
+
+@app.route("/slack/interactive", methods=["POST"])
+def slack_interactive():
+    if not _verify_slack(request):
+        return "", 403
+    from src.notifications import pending_store
+    from src.notifications.slack_blocks import ACTION_TAKE, ACTION_SKIP, ACTION_CLOSE, ACTION_HOLD
+    try:
+        payload = json.loads(request.form.get("payload", "{}"))
+    except Exception:
+        return "", 200
+    action   = (payload.get("actions") or [{}])[0]
+    aid      = action.get("action_id", "")
+    tid      = action.get("value", "")
+    resp_url = payload.get("response_url", "")
+
+    pending_store.purge_expired()
+    rec = pending_store.get(tid)
+    if rec is None:
+        if resp_url:
+            _slack_replace(resp_url, ":grey_question: That trade is no longer available.")
+        return "", 200
+
+    if aid == ACTION_SKIP:
+        pending_store.update_status(tid, "skipped")
+        threading.Thread(target=lambda: _slack_replace(resp_url, f":x: *Skipped — {rec['label']}*"),
+                         daemon=True).start()
+        return "", 200
+    if aid == ACTION_HOLD:
+        pending_store.update_status(tid, "held")
+        threading.Thread(target=lambda: _slack_replace(resp_url, f":pause_button: *Holding — {rec['label']}*"),
+                         daemon=True).start()
+        return "", 200
+
+    ok, reason = pending_store.is_actionable(tid)
+    if not ok:
+        nice = {"expired": "expired (alert went stale)", "already_taken": "already placed",
+                "already_skipped": "already skipped", "already_held": "already held"}.get(reason, reason)
+        threading.Thread(target=lambda: _slack_replace(resp_url, f":hourglass: *{rec['label']}* — {nice}."),
+                         daemon=True).start()
+        return "", 200
+
+    if aid == ACTION_TAKE:
+        threading.Thread(target=lambda: _execute_entry(rec, resp_url), daemon=True).start()
+    elif aid == ACTION_CLOSE:
+        threading.Thread(target=lambda: _execute_exit(rec, resp_url), daemon=True).start()
+    return "", 200
 
 
 # ── Slack Slash Commands ──────────────────────────────────────────────────────

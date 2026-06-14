@@ -33,6 +33,15 @@ def send_message(text: str) -> bool:
     return _post({"text": text})
 
 
+def send_blocks(blocks: list, fallback_text: str = "") -> bool:
+    """Post a Block Kit message (sections + interactive buttons). `fallback_text`
+    is shown in notifications and on clients that can't render blocks."""
+    payload = {"blocks": blocks}
+    if fallback_text:
+        payload["text"] = fallback_text
+    return _post(payload)
+
+
 def send_trade_alert(action: str, symbol: str, amount: float, price: float, reason: str = "") -> bool:
     emoji = ":green_circle:" if action == "BUY" else ":red_circle:"
     text = (

@@ -17,6 +17,9 @@ data/*.pkl
 data/gex_chain/
 data/options_paper_state.json
 data/rotating_paper_state.json
+data/pending_trades.json
+data/spy_trade_state.json
+data/futures_alert_state.json
 
 # Reports (large images/csvs)
 reports/

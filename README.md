@@ -12,9 +12,11 @@ Runs automated scans every trading day, fires Slack alerts only when actionable 
 
 ```
 app.py              Flask web server + APScheduler (single process)
-├── /                Dashboard HTML (GEX levels, positions, market status)
+├── /                Dashboard HTML (GEX levels, positions, market status, news)
 ├── /api/gex         Live GEX JSON (5-min cache)
+├── /api/news        Recent scored headlines for holdings + SPY (5-min cache)
 ├── /slack/command   Slack slash commands (/scan, /positions, /gex, etc.)
+├── /slack/interactive  Trade approval button taps (Take/Skip, Close/Hold)
 ├── /health          Render health check (pinged by UptimeRobot every 5 min)
 │
 ├── 8:30 AM ET     → _premarket_prep_job()      Pre-market brief (cached GEX + prices)
@@ -39,9 +41,12 @@ src/
 │   └── batman_scanner.py     GEX-anchored Batman / double BWB for XSP (positive-cowl)
 ├── live/
 │   ├── alpaca_options.py     Options chain fetch, GEX chain cache, order placement
+│   ├── news.py               Alpaca news feed: earnings guard + headline sentiment
 │   └── leading_indicators.py
 ├── notifications/
-│   └── slack_notifier.py
+│   ├── slack_notifier.py     Outbound Slack (text + Block Kit button messages)
+│   ├── slack_blocks.py       Block Kit builders for Take/Skip & Close/Hold
+│   └── pending_store.py      JSON-backed pending-trade store (approval TTL/state)
 └── signals/
     └── ml_selector.py        LightGBM stock selector
 ```
@@ -101,6 +106,42 @@ Computed as `Gamma × OI × 100 × Spot²`, **calls positive / puts negative** (
 Captures the win-rate edge so you don't hold short premium into the closing gamma tail. Groups open option legs by (underlying, expiry) and flags any structure that has hit its target — **50% of credit** for credit structures (condors, BWBs, spreads), **50% of max profit** for long butterflies (max profit reconstructed from the leg strikes). Silent if nothing qualifies. Each flag includes the exact close command. `/manage` runs it on demand.
 
 Unified scan is **silent if nothing actionable** — no noise.
+
+### Interactive Trade Approvals (Slack buttons)
+
+Scans and the 3:30 manage job don't just *show* trades — they ask. After the
+normal alert, a follow-up message offers a button per candidate:
+
+- **Entry** — `✅ Take #N` / `✖ Skip`, numbered when there are several. Tapping
+  *Take* re-prices the structure off **live** quotes, rejects it if the net
+  credit/debit has drifted more than **20%** against you (or the alert has gone
+  stale — 30-min TTL), and only then submits. So a tap is a confirmation, not a
+  blind fire of a stale price.
+- **Exit** — `💰 Close #N` / `✋ Hold` on each structure flagged at the 50%
+  target; *Close* submits a single multi-leg closing order (same logic as
+  `close_bwb.py`).
+
+Pending approvals live in `data/pending_trades.json` so a Render restart doesn't
+lose them. Auto-executable structures: bull put spreads, BWBs, GEX pin
+butterflies, and iron condors. Batman is XSP-only (not on Alpaca), so it stays
+informational.
+
+**One-time Slack setup:** in api.slack.com → your app → *Interactivity &
+Shortcuts* → turn on and set the Request URL to
+`https://<your-render-app>.onrender.com/slack/interactive`. Clicks are verified
+with the same `SLACK_SIGNING_SECRET` the slash commands already use — no new
+token or secret required.
+
+### News & Catalyst Awareness
+
+Recent headlines (Alpaca's Benzinga news feed — included with your existing API
+keys, no new secret) are surfaced two ways:
+
+- **Analysis guard** — equity premium plays (bull put, BWB) are checked for an
+  earnings/guidance catalyst in recent headlines; a hit annotates the alert with
+  a `⚠️ news` warning so you don't sell defined-risk premium blind into a print.
+- **Dashboard** — a *📰 News & Catalysts* panel shows scored (🟢/🔴/⚪)
+  headlines for SPY + your holdings, served by `/api/news` (5-min cache).
 
 ### SPY Trade Monitor (every 5 min)
 

@@ -287,6 +287,28 @@
   </div>
 </div>
 
+<!-- ── News Panel ── -->
+<div class="mx-4 mb-4 bg-gray-900 rounded-lg border border-sky-900/60 overflow-hidden">
+  <div class="px-3 py-2.5 bg-gray-800/50 flex items-center gap-2 flex-wrap">
+    <span class="text-sky-400 font-bold text-sm shrink-0">📰 News &amp; Catalysts</span>
+    <span class="text-gray-600 text-xs hidden sm:inline">SPY + your holdings · last 48h</span>
+    <div class="flex items-center gap-1.5 ml-auto">
+      <span id="news-ts" class="text-gray-600 text-xs hidden sm:inline"></span>
+      <button onclick="loadNews(true)"
+        class="px-2.5 py-1 text-xs bg-gray-800 hover:bg-gray-700 rounded border border-gray-700 transition-colors">
+        ↻ Refresh
+      </button>
+    </div>
+  </div>
+  <div id="news-loading" class="hidden text-center py-8 text-gray-500 text-sm">
+    <div class="pulse inline-block mr-2">⟳</div>Fetching headlines…
+  </div>
+  <div id="news-body" class="divide-y divide-gray-800"></div>
+  <div id="news-empty" class="text-center py-6 text-gray-600 text-xs">
+    Click <strong class="text-sky-400">📰 Refresh</strong> to load recent headlines.
+  </div>
+</div>
+
 <!-- ── Slack toast ── -->
 <div id="toast" class="hidden fixed bottom-6 right-6 px-4 py-2 rounded-lg text-sm font-semibold shadow-lg transition-all"></div>
 
@@ -1541,6 +1563,64 @@ async function sendFallenAngelsSlack() {
     showToast('✗ ' + err.message, false);
   } finally {
     btn.disabled = false; btn.textContent = '→ Slack';
+  }
+}
+
+function newsSentiment(s) {
+  if (s === 'positive') return { dot: '🟢', cls: 'text-green-400' };
+  if (s === 'negative') return { dot: '🔴', cls: 'text-rose-400' };
+  return { dot: '⚪', cls: 'text-gray-400' };
+}
+
+function newsEsc(t) {
+  const d = document.createElement('div');
+  d.textContent = t == null ? '' : t;
+  return d.innerHTML;
+}
+
+async function loadNews(force = false) {
+  $('news-loading').classList.remove('hidden');
+  $('news-empty').classList.add('hidden');
+  $('news-body').innerHTML = '';
+  try {
+    const resp = await fetch('/api/news');
+    const json = await resp.json();
+    if (!json.ok) throw new Error(json.error || 'News fetch failed');
+    const data = json.data || {};
+    const syms = Object.keys(data);
+    if (!syms.length) {
+      $('news-empty').classList.remove('hidden');
+      $('news-empty').textContent = 'No recent headlines.';
+    } else {
+      $('news-body').innerHTML = syms.map(sym => {
+        const items = data[sym].map(n => {
+          const s = newsSentiment(n.sentiment);
+          const when = n.created_at ? new Date(n.created_at).toLocaleString() : '';
+          const link = n.url
+            ? `<a href="${newsEsc(n.url)}" target="_blank" rel="noopener" class="hover:underline">${newsEsc(n.headline)}</a>`
+            : newsEsc(n.headline);
+          return `<div class="py-1.5 text-xs flex gap-2">
+                    <span title="${n.sentiment}">${s.dot}</span>
+                    <div class="min-w-0">
+                      <div class="${s.cls} truncate">${link}</div>
+                      <div class="text-gray-600">${newsEsc(n.source)} · ${when}</div>
+                    </div>
+                  </div>`;
+        }).join('');
+        return `<div class="px-4 py-2">
+                  <div class="text-sky-300 font-bold text-xs mb-1">${newsEsc(sym)}</div>
+                  ${items}
+                </div>`;
+      }).join('');
+    }
+    const ts = $('news-ts');
+    if (ts) ts.textContent = `Updated: ${new Date().toLocaleTimeString()}`;
+  } catch(err) {
+    showToast('News error: ' + err.message, false);
+    $('news-empty').classList.remove('hidden');
+    $('news-empty').textContent = 'News failed: ' + err.message;
+  } finally {
+    $('news-loading').classList.add('hidden');
   }
 }
 
