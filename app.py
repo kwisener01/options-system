@@ -857,6 +857,18 @@ def api_news():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/mode")
+def api_mode():
+    """LIVE vs PAPER, derived from ALPACA_BASE_URL. No account number exposed."""
+    try:
+        from config.settings import IS_PAPER, ALPACA_BASE_URL
+        host = ALPACA_BASE_URL.split("//")[-1]
+        return jsonify({"ok": True, "mode": "PAPER" if IS_PAPER else "LIVE",
+                        "paper": IS_PAPER, "host": host})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
 @app.route("/api/slack", methods=["POST"])
 def api_slack():
     try:
@@ -2885,8 +2897,11 @@ def _cmd_risk(resp_url: str):
         budget = cfg["risk_pct_per_trade"] * snap["equity"]
         dl, dd = abs(cfg["daily_loss_limit_pct"]), abs(cfg["max_drawdown_pct"])
         state = ":green_circle: *clear to trade*" if allowed else f":octagonal_sign: *HALTED* — {reason}"
+        am = _account_mode()
+        mode_icon = ":red_circle:" if am["mode"] == "LIVE" else ":large_blue_circle:"
         _slack_respond(resp_url, "\n".join([
             ":shield: *Risk status*",
+            f"  Account: {mode_icon} *{am['mode']}* {am['acct'] or ''}",
             f"  {state}",
             f"  Equity: ${snap['equity']:,.2f}",
             f"  Today: ${snap['day_pl']:+,.2f} ({snap['day_pl_pct']*100:+.1f}%)  _halt at -{dl*100:.0f}%_",
@@ -3036,6 +3051,21 @@ def _risk_config() -> dict:
     except Exception:
         pass
     return cfg
+
+
+def _account_mode() -> dict:
+    """Whether we're pointed at the LIVE or PAPER Alpaca account, with a masked
+    account number for confirmation. Derived from ALPACA_BASE_URL."""
+    from config.settings import IS_PAPER, ALPACA_BASE_URL
+    out = {"paper": IS_PAPER, "mode": "PAPER" if IS_PAPER else "LIVE",
+           "base": ALPACA_BASE_URL, "acct": None}
+    try:
+        from src.live.alpaca_options import _trading
+        num = str(getattr(_trading().get_account(), "account_number", "") or "")
+        out["acct"] = ("…" + num[-4:]) if num else None
+    except Exception as e:
+        logger.warning("account mode fetch failed: %s", e)
+    return out
 
 
 def _risk_snapshot() -> dict:
@@ -3576,6 +3606,15 @@ def _auto_trade_job():
         from src.notifications.slack_notifier import send_message
         max_loss = float(cfg.get("max_loss", 100))
 
+        # Safety: refuse to fire on a paper account when require_live is set
+        from config.settings import IS_PAPER
+        if cfg.get("require_live", True) and IS_PAPER:
+            if dt_time(10, 0) <= now < dt_time(10, 5):
+                send_message(":octagonal_sign: *Auto-trade halted* — account is *PAPER*, not LIVE "
+                             "(`require_live`). Set `ALPACA_BASE_URL=https://api.alpaca.markets` "
+                             "in Render to go live. No trade.")
+            return
+
         # Risk engine: portfolio circuit breakers + %-of-equity sizing
         try:
             snap = _risk_snapshot()
@@ -3593,7 +3632,8 @@ def _auto_trade_job():
 
         # arming notice once, on the first (10:00) tick
         if dt_time(10, 0) <= now < dt_time(10, 5):
-            send_message(f":robot_face: *Auto-trade armed* — scanning for the best defined-risk "
+            _m = "LIVE" if not IS_PAPER else "PAPER"
+            send_message(f":robot_face: *Auto-trade armed* ({_m}) — scanning for the best defined-risk "
                          f"setup ≤ ${max_loss:.0f} max loss until 12:30 ET. One shot.")
 
         cand = _auto_pick_candidate(max_loss)

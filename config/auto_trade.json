@@ -1,5 +1,6 @@
 {
   "enabled": true,
+  "require_live": true,
   "armed_date": "2026-06-17",
   "max_loss": 100,
   "fire_start": "10:00",
