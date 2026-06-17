@@ -2389,6 +2389,11 @@ def _execute_entry(rec: dict, resp_url: str):
     from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
     tid = rec["id"]
     try:
+        allowed, reason = _risk_check_entry(None)
+        if not allowed:
+            pending_store.update_status(tid, "skipped", note=f"risk: {reason}")
+            _slack_replace(resp_url, f":octagonal_sign: *Blocked by risk rule* — {reason}. Not placed.")
+            return
         order   = rec["order"]
         qty     = int(order["qty"])
         ref_net = float(order["ref_net"])
@@ -2850,6 +2855,27 @@ def _cmd_eod(resp_url: str):
     _eod_report_job()
 
 
+def _cmd_risk(resp_url: str):
+    """`/risk` — fund risk status: equity, today's P&L vs limit, drawdown, budget."""
+    try:
+        snap = _risk_snapshot()
+        cfg  = _risk_config()
+        allowed, reason = _risk_gate(snap, cfg, None)
+        budget = cfg["risk_pct_per_trade"] * snap["equity"]
+        dl, dd = abs(cfg["daily_loss_limit_pct"]), abs(cfg["max_drawdown_pct"])
+        state = ":green_circle: *clear to trade*" if allowed else f":octagonal_sign: *HALTED* — {reason}"
+        _slack_respond(resp_url, "\n".join([
+            ":shield: *Risk status*",
+            f"  {state}",
+            f"  Equity: ${snap['equity']:,.2f}",
+            f"  Today: ${snap['day_pl']:+,.2f} ({snap['day_pl_pct']*100:+.1f}%)  _halt at -{dl*100:.0f}%_",
+            f"  Drawdown: {snap['drawdown_pct']*100:.1f}% below HWM ${snap['hwm']:,.0f}  _halt at {dd*100:.0f}%_",
+            f"  Per-trade budget: ${budget:,.0f}  ({cfg['risk_pct_per_trade']*100:.0f}% of equity)",
+        ]))
+    except Exception as e:
+        _slack_respond(resp_url, f":rotating_light: Risk status failed: {e}")
+
+
 def _cmd_autotrade(arg: str, resp_url: str):
     """`/autotrade on|off|status` — toggle or inspect the one-shot auto-trade."""
     arg = (arg or "").strip().lower()
@@ -2906,6 +2932,7 @@ HELP_TEXT = (
     "`/batman` — GEX-anchored Batman for XSP (positive-cowl double BWB)\n"
     "`/manage` — check open structures at the 50% profit target\n"
     "`/autotrade on|off|status` — toggle / inspect the one-shot auto-trade\n"
+    "`/risk`  — fund risk status (equity, day P&L vs limit, drawdown, budget)\n"
     "`/eod`   — generate EOD P&L report now\n"
     "`/help`  — show this message"
 )
@@ -2936,6 +2963,7 @@ def slack_command():
         "batman":    ":hourglass: Scanning XSP Batman setups...",
         "manage":    ":hourglass: Checking 50% profit targets...",
         "autotrade": ":hourglass: Auto-trade...",
+        "risk":      ":hourglass: Checking risk status...",
         "eod":       ":hourglass: Generating EOD report...",
         "help":      None,
     }
@@ -2958,10 +2986,84 @@ def slack_command():
         "batman":    lambda: _cmd_batman(resp_url),
         "manage":    lambda: _cmd_manage(resp_url),
         "autotrade": lambda: _cmd_autotrade(text, resp_url),
+        "risk":      lambda: _cmd_risk(resp_url),
         "eod":       lambda: _cmd_eod(resp_url),
     }
     threading.Thread(target=dispatch[command], daemon=True).start()
     return jsonify({"text": ack_map[command], "response_type": "in_channel"}), 200
+
+
+# ── Risk engine (fund-style capital protection) ──────────────────────────────
+#
+# Gates EVERY new entry (auto-trade and button) on portfolio-level circuit
+# breakers, and sizes the auto-trade as a % of equity so it scales as the fund
+# grows. Equity / today's P&L / high-water mark all come from Alpaca, so the
+# numbers are durable and restart-proof.
+
+def _risk_config() -> dict:
+    path = os.path.join(os.path.dirname(__file__), "config", "risk.json")
+    cfg = {"enabled": True, "risk_pct_per_trade": 0.05,
+           "daily_loss_limit_pct": 0.05, "max_drawdown_pct": 0.15}
+    try:
+        with open(path) as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    return cfg
+
+
+def _risk_snapshot() -> dict:
+    """Equity, today's P&L, and drawdown from high-water mark — all from Alpaca."""
+    from src.live.alpaca_options import _trading
+    from alpaca.trading.requests import GetPortfolioHistoryRequest
+    client = _trading()
+    acct   = client.get_account()
+    equity = float(acct.equity)
+    last   = float(getattr(acct, "last_equity", equity) or equity)
+    day_pl = equity - last
+    hwm    = equity
+    try:
+        h  = client.get_portfolio_history(GetPortfolioHistoryRequest(period="1A", timeframe="1D"))
+        eq = [float(e) for e in (h.equity or []) if e]
+        if eq:
+            hwm = max(max(eq), equity)
+    except Exception as e:
+        logger.warning("risk: portfolio history failed: %s", e)
+    return {
+        "equity": equity, "last_equity": last, "day_pl": day_pl,
+        "day_pl_pct": (day_pl / last) if last else 0.0,
+        "hwm": hwm, "drawdown_pct": ((hwm - equity) / hwm) if hwm else 0.0,
+    }
+
+
+def _risk_gate(snap: dict, cfg: dict, max_loss: float | None = None) -> tuple[bool, str]:
+    """Pure rule check given a snapshot + config. Returns (allowed, reason)."""
+    if not cfg.get("enabled", True):
+        return True, "risk checks disabled"
+    dl = abs(cfg["daily_loss_limit_pct"])
+    if snap["day_pl_pct"] <= -dl:
+        return False, (f"daily loss limit — down {snap['day_pl_pct']*100:.1f}% today "
+                       f"(limit {dl*100:.0f}%)")
+    dd = abs(cfg["max_drawdown_pct"])
+    if snap["drawdown_pct"] >= dd:
+        return False, (f"drawdown guard — {snap['drawdown_pct']*100:.1f}% below high-water "
+                       f"mark (limit {dd*100:.0f}%)")
+    if max_loss is not None:
+        budget = cfg["risk_pct_per_trade"] * snap["equity"]
+        if max_loss > budget + 1e-9:
+            return False, (f"trade risk ${max_loss:.0f} exceeds per-trade budget "
+                           f"${budget:.0f} ({cfg['risk_pct_per_trade']*100:.0f}% of "
+                           f"${snap['equity']:,.0f})")
+    return True, "ok"
+
+
+def _risk_check_entry(max_loss: float | None = None) -> tuple[bool, str]:
+    """Convenience: fetch snapshot + config and apply the gate (button path)."""
+    try:
+        return _risk_gate(_risk_snapshot(), _risk_config(), max_loss)
+    except Exception as e:
+        logger.warning("risk check failed (allowing): %s", e)
+        return True, "risk check unavailable"
 
 
 # ── One-shot auto-trade ──────────────────────────────────────────────────────
@@ -3167,6 +3269,21 @@ def _auto_trade_job():
 
         from src.notifications.slack_notifier import send_message
         max_loss = float(cfg.get("max_loss", 100))
+
+        # Risk engine: portfolio circuit breakers + %-of-equity sizing
+        try:
+            snap = _risk_snapshot()
+            rcfg = _risk_config()
+            allowed, reason = _risk_gate(snap, rcfg, None)
+            if not allowed:
+                if dt_time(10, 0) <= now < dt_time(10, 5):
+                    send_message(f":octagonal_sign: *Auto-trade halted by risk rule* — {reason}. "
+                                 f"No trade today.")
+                return
+            budget   = rcfg["risk_pct_per_trade"] * snap["equity"]
+            max_loss = min(max_loss, budget)   # tighter of the hard cap and %-equity
+        except Exception as e:
+            logger.warning("Auto-trade risk gate failed (using hard cap): %s", e)
 
         # arming notice once, on the first (10:00) tick
         if dt_time(10, 0) <= now < dt_time(10, 5):

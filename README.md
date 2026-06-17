@@ -116,6 +116,16 @@ Silent if nothing qualifies. `/manage` runs the profit-target half on demand.
 
 Unified scan is **silent if nothing actionable** — no noise.
 
+### Risk Engine (config/risk.json)
+
+Fund-style capital protection that gates **every** new entry — the auto-trade *and* the Slack Take buttons. Equity, today's P&L, and the high-water mark all come from Alpaca, so the rules are durable and restart-proof.
+
+- **%-of-equity sizing** — the auto-trade's max-loss budget is `risk_pct_per_trade × equity` (default 5%), so position size scales as the account grows. The committed `$` cap still applies; effective risk = the tighter of the two.
+- **Daily-loss circuit breaker** — blocks new entries once today's P&L is down `daily_loss_limit_pct` (default 5%) vs. yesterday's close.
+- **Drawdown guard** — blocks new entries while equity is `max_drawdown_pct` (default 15%) below its high-water mark.
+
+A blocked button entry replies `🛑 Blocked by risk rule — …`; the auto-trade posts a halt and stands down. `/risk` shows live status (equity, day P&L vs limit, drawdown, per-trade budget). Defaults are starting values for a small account — tune in `config/risk.json`.
+
 ### One-Shot Auto-Trade (config/auto_trade.json)
 
 Places **at most one** defined-risk structure automatically on a single armed date — no button tap. Guardrails:
@@ -253,6 +263,7 @@ Set all `.env` variables in Render's Environment dashboard. No redeploy needed f
 | `/batman` | GEX-anchored Batman for XSP (positive-cowl double BWB) |
 | `/manage` | Check open structures at the 50% profit target |
 | `/autotrade on\|off\|status` | Toggle or inspect the one-shot auto-trade (env `AUTO_TRADE_KILL` is the hard override) |
+| `/risk` | Fund risk status: equity, day P&L vs limit, drawdown vs high-water mark, per-trade budget |
 | `/positions` | Current open positions |
 | `/place TICKER SHORT LONG EXPIRY [QTY]` | Place a bull put credit spread |
 | `/close_position TICKER` | Market-sell a stock/ETF position |

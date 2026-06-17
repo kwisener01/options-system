@@ -114,10 +114,29 @@ def test_auto_trade_config():
     print("ok  auto-trade config (file + env overrides + kill switch)")
 
 
+def test_risk_gate():
+    import app
+    cfg = {"enabled": True, "risk_pct_per_trade": 0.05,
+           "daily_loss_limit_pct": 0.05, "max_drawdown_pct": 0.15}
+    ok_snap = {"equity": 2000, "day_pl_pct": -0.01, "drawdown_pct": 0.02}
+    assert app._risk_gate(ok_snap, cfg, None)[0] is True
+    # daily loss breaker
+    assert app._risk_gate({**ok_snap, "day_pl_pct": -0.06}, cfg, None)[0] is False
+    # drawdown breaker
+    assert app._risk_gate({**ok_snap, "drawdown_pct": 0.20}, cfg, None)[0] is False
+    # per-trade size: budget = 5% * 2000 = 100
+    assert app._risk_gate(ok_snap, cfg, 100)[0] is True
+    assert app._risk_gate(ok_snap, cfg, 101)[0] is False
+    # disabled → always allowed
+    assert app._risk_gate({**ok_snap, "day_pl_pct": -0.5}, {**cfg, "enabled": False}, None)[0] is True
+    print("ok  risk gate (daily-loss / drawdown / per-trade budget)")
+
+
 if __name__ == "__main__":
     test_pending_store()
     test_blocks()
     test_news_sentiment()
     test_app_logic()
     test_auto_trade_config()
+    test_risk_gate()
     print("\nALL PASS")
