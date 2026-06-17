@@ -25,8 +25,10 @@ app.py              Flask web server + APScheduler (single process)
 ├── 10:30 AM ET    → _unified_scan_job()
 ├── 12:30 PM ET    → _unified_scan_job()
 ├── every 5 min    → _spy_trade_monitor_job()   SPY trade + rotation (alert on CHANGE only)
-├── 3:30 PM ET     → _manage_5050_job()          Flag open structures at 50% profit target
-└── 4:05 PM ET     → _eod_report_job()           EOD P&L + position summary
+├── 3:30 PM ET     → _manage_5050_job()          Actionable sweep: 50% targets + stock trim/stop + expiry (buttons)
+├── 4:05 PM ET     → _eod_report_job()           Post-close P&L recap (no actions — market's closed)
+├── 10:00-12:30    → _auto_trade_job()           One-shot auto-trade on the armed date (best passing, ≤ max_loss)
+└── every 5 min    → _auto_manage_job()          Auto-exit the auto-trade: 50% profit / 1-DTE force-close
 
 src/
 ├── analysis/
@@ -98,14 +100,34 @@ Computed as `Gamma × OI × 100 × Spot²`, **calls positive / puts negative** (
 | 10:30 AM | Unified scan | |
 | 12:30 PM | Unified scan | Midday check |
 | every 5 min | SPY trade monitor | High-prob SPY trade + stock rotation |
-| 3:30 PM | Profit check | Flags open structures at the 50% profit target |
-| 4:05 PM | EOD report | P&L + positions + close suggestions |
+| 3:30 PM | Position check | 50% profit targets + stock trim/stop-loss + near-expiry options, each with a Close/Trim button (market still open) |
+| 4:05 PM | EOD report | Post-close P&L + position recap only — actions already fired at 3:30 |
+| 10:00 AM–12:30 PM | Auto-trade | One-shot defined-risk entry on the armed date; stands down at 12:30 if nothing qualifies |
+| every 5 min | Auto-manage | Auto-exits the auto-trade at 50% profit or force-closes at 1 DTE / 3:30 PM |
 
-### Manage-at-50% (3:30 PM ET)
+### 3:30 PM Position Check (was Manage-at-50%)
 
-Captures the win-rate edge so you don't hold short premium into the closing gamma tail. Groups open option legs by (underlying, expiry) and flags any structure that has hit its target — **50% of credit** for credit structures (condors, BWBs, spreads), **50% of max profit** for long butterflies (max profit reconstructed from the leg strikes). Silent if nothing qualifies. Each flag includes the exact close command. `/manage` runs it on demand.
+The end-of-day **actionable** sweep, run while the market is still open so every flag can actually be traded before the close (the 4:05 EOD report is post-close, so its old suggestions were useless — they moved here). It flags two things, each with a Close/Trim button:
+
+1. **Profit targets** — groups open option legs by (underlying, expiry) and flags any structure that hit its target: **50% of credit** for credit structures (condors, BWBs, spreads), **50% of max profit** for long butterflies (reconstructed from leg strikes). Captures the win-rate edge so you don't hold short premium into the closing gamma tail.
+2. **Position adjustments** — stock **down ≤ −8%** → CLOSE (stop-loss), stock **up ≥ +20%** → TRIM (sells half), option **≤ 3 DTE** → REVIEW (close structure or let expire).
+
+Silent if nothing qualifies. `/manage` runs the profit-target half on demand.
 
 Unified scan is **silent if nothing actionable** — no noise.
+
+### One-Shot Auto-Trade (config/auto_trade.json)
+
+Places **at most one** defined-risk structure automatically on a single armed date — no button tap. Guardrails:
+
+- **Armed per date.** Fires only when `armed_date` (or env `AUTO_TRADE_DATE`) equals today. After that day it never fires again until re-armed. Committed config survives Render restarts.
+- **Window:** re-checks every 5 min from **10:00 AM** and places the first qualifying setup; **stands down at 12:30** if nothing clears the gate.
+- **Best passing candidate**, priority **condor → bull put → fly**, capped at `max_loss` (default **$100**), **no 0DTE**, bull puts skipped on an earnings catalyst (news guard).
+- **Re-priced + drift-guarded at fill** (same 20% gate as the buttons) and **idempotent** via Alpaca `client_order_id` (`auto-YYYYMMDD`) — a restart can't double-fire.
+- **Automatic exit** (`_auto_manage_job`, every 5 min): auto-closes at the **50% profit target**, and **force-closes at 1 DTE, 3:30 PM ET** so it never holds into expiration. The open structure is re-identified from Alpaca each tick (durable across restarts); only the auto-trade's own legs are closed.
+- **Kill switch:** env `AUTO_TRADE_KILL=1` (or `enabled:false`) disables it before it fires. Every action is posted to Slack.
+
+To re-arm another day, change `armed_date` (commit/redeploy) or set `AUTO_TRADE_DATE` in Render.
 
 ### Interactive Trade Approvals (Slack buttons)
 

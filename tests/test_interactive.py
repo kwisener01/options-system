@@ -91,9 +91,33 @@ def test_app_logic():
     print("ok  app logic (_drifted / _legs_to_occ)")
 
 
+def test_auto_trade_config():
+    import os
+    import app
+    base = app._auto_trade_config()
+    assert base["max_loss"] == 100 and base["enabled"] is True
+    assert base["armed_date"]  # a date string is set
+
+    # env overrides
+    os.environ["AUTO_TRADE_DATE"] = "2030-01-02"
+    os.environ["AUTO_TRADE_MAX_LOSS"] = "250"
+    cfg = app._auto_trade_config()
+    assert cfg["armed_date"] == "2030-01-02"
+    assert cfg["max_loss"] == 250.0
+
+    # kill switch disables regardless
+    os.environ["AUTO_TRADE_KILL"] = "1"
+    assert app._auto_trade_config()["enabled"] is False
+
+    for k in ("AUTO_TRADE_DATE", "AUTO_TRADE_MAX_LOSS", "AUTO_TRADE_KILL"):
+        os.environ.pop(k, None)
+    print("ok  auto-trade config (file + env overrides + kill switch)")
+
+
 if __name__ == "__main__":
     test_pending_store()
     test_blocks()
     test_news_sentiment()
     test_app_logic()
+    test_auto_trade_config()
     print("\nALL PASS")

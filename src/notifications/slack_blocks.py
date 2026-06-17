@@ -57,11 +57,12 @@ def exit_blocks(header: str, candidates: list[dict]) -> tuple[list, str]:
     for i, c in enumerate(candidates, 1):
         blocks.append({"type": "divider"})
         blocks.append(_section(f"*{i}.* {c['text']}"))
+        close_label = c.get("close_label") or f"💰 Close #{i}"
         blocks.append({
             "type": "actions",
             "block_id": f"exit_{c['tid']}",
             "elements": [
-                _button(f"💰 Close #{i}", ACTION_CLOSE, c["tid"], "primary"),
+                _button(close_label, ACTION_CLOSE, c["tid"], "primary"),
                 _button("✋ Hold", ACTION_HOLD, c["tid"]),
             ],
         })

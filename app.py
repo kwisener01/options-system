@@ -2116,19 +2116,71 @@ def _profit_targets():
     return flagged
 
 
+def _position_adjustments():
+    """During-market-hours actionable position flags (so they can actually be
+    traded before the close, unlike the post-close EOD report):
+      - stock down ≤ -8%   → CLOSE (stop-loss)
+      - stock up   ≥ +20%  → TRIM (sell half)
+      - option ≤ 3 DTE     → REVIEW (close structure or let expire)
+    Returns a list of dicts ready to render as text + an exit button.
+    """
+    from src.live.alpaca_options import _trading
+    positions = _trading().get_all_positions()
+    today = date.today()
+    out = []
+    for p in positions:
+        sym    = p.symbol
+        unreal = float(getattr(p, "unrealized_pl", 0) or 0)
+        pct    = float(getattr(p, "unrealized_plpc", 0) or 0) * 100
+        if len(sym) <= 6:                                  # stock / ETF
+            if pct <= -8:
+                out.append({"underlying": sym, "symbol": sym, "exit_kind": "equity",
+                            "action": "CLOSE", "icon": ":rotating_light:", "pct": pct,
+                            "btn": "🛑 Close", "reason": f"down {pct:.1f}% — stop-loss zone"})
+            elif pct >= 20:
+                out.append({"underlying": sym, "symbol": sym, "exit_kind": "equity_trim",
+                            "action": "TRIM", "icon": ":moneybag:", "pct": pct,
+                            "btn": "✂️ Trim ½", "reason": f"up {pct:.1f}% — take partial profit"})
+        else:                                              # option leg
+            parsed = _occ_parse(sym)
+            if not parsed:
+                continue
+            underlying, exp, _, _ = parsed
+            dte = (exp - today).days
+            if dte <= 3:
+                out.append({"underlying": underlying, "symbol": None, "exit_kind": "structure",
+                            "action": "REVIEW", "icon": ":warning:", "pct": pct,
+                            "btn": "💰 Close", "reason": f"{dte} DTE — expires soon"})
+    # de-dupe option REVIEWs by underlying (one structure close covers all its legs)
+    seen, deduped = set(), []
+    for a in out:
+        key = (a["underlying"], a["exit_kind"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(a)
+    return deduped
+
+
 def _manage_5050_job():
-    """3:30 PM ET Mon-Fri. Flags open structures that have hit the 50% profit
-    target so winners are closed before the EOD gamma tail. Silent if none."""
+    """3:30 PM ET Mon-Fri. End-of-day actionable sweep, done while the market is
+    still open so flags can be traded before the close:
+      - option structures at the 50% profit target (take winners)
+      - stock stop-loss / trim and options near expiry
+    Each flag carries a Close/Trim button. Silent if nothing qualifies."""
     try:
         if not _market_is_open():
             return
         from src.notifications.slack_notifier import send_message
-        flags = _profit_targets()
-        if not flags:
-            logger.info("Manage-3:30: no structures at 50% target")
+        flags       = _profit_targets()
+        adjustments = _position_adjustments()
+        if not flags and not adjustments:
+            logger.info("Manage-3:30: nothing to flag")
             return
         ts = datetime.now(ET).strftime("%H:%M ET")
-        lines = [f":dart: *3:30 Profit Check — {ts}*  _take winners before the gamma tail_"]
+        lines = [f":dart: *3:30 Position Check — {ts}*  _act before the close_"]
+        exit_cands = []
+
         for f in sorted(flags, key=lambda x: -x["pct"]):
             close = (f"`/close_position {f['single']}`" if f["single"]
                      else f"`python close_bwb.py --ticker {f['underlying']}`")
@@ -2137,22 +2189,28 @@ def _manage_5050_job():
                 f"{f['kind']})  +${f['unreal']} of ${f['maxp']} max  *{f['pct']}%*\n"
                 f"    :point_right: {close}"
             )
+            label = f"{f['underlying']} {f['exp']} ({f['kind']})"
+            text  = (f"*{label}*  +${f['unreal']} of ${f['maxp']} max  *{f['pct']}%*  "
+                     f"({f['dte']}DTE)")
+            tid = register_exit("structure", f["underlying"], label, text)
+            exit_cands.append({"tid": tid, "text": text, "label": label})
+
+        for a in adjustments:
+            lines.append(f"  {a['icon']} *{a['action']} `{a['underlying']}`* — {a['reason']}")
+            label = f"{a['action']} {a['underlying']}"
+            text  = f"*{a['action']} `{a['underlying']}`* — {a['reason']}"
+            tid = register_exit(a["exit_kind"], a["underlying"], label, text, symbol=a["symbol"])
+            exit_cands.append({"tid": tid, "text": text, "label": label, "close_label": a["btn"]})
+
         send_message("\n".join(lines))
 
-        # -- Interactive close approvals -------------------------------------
         try:
-            exit_cands = []
-            for f in sorted(flags, key=lambda x: -x["pct"]):
-                label = f"{f['underlying']} {f['exp']} ({f['kind']})"
-                text = (f"*{label}*  +${f['unreal']} of ${f['maxp']} max  *{f['pct']}%*  "
-                        f"({f['dte']}DTE)")
-                tid = register_exit("structure", f["underlying"], label, text)
-                exit_cands.append({"tid": tid, "text": text, "label": label})
             _post_exit_approvals(exit_cands)
         except Exception as e:
             logger.warning("Exit-approval post failed: %s", e)
 
-        logger.info("Manage-3:30 alert: %d structure(s) at 50%%+", len(flags))
+        logger.info("Manage-3:30 alert: %d profit-target, %d adjustment(s)",
+                    len(flags), len(adjustments))
     except Exception as e:
         logger.error("_manage_5050_job error: %s", e)
 
@@ -2160,7 +2218,8 @@ def _manage_5050_job():
 # ── EOD Report + Close Suggestions ───────────────────────────────────────────
 
 def _eod_report_job():
-    """Runs at 4:05 PM ET Mon-Fri. Sends daily P&L, full P&L, and close suggestions."""
+    """Runs at 4:05 PM ET Mon-Fri. Pure post-close recap: daily P&L, 30-day P&L,
+    and positions. Actionable trims/stops live in the 3:30 PM manage check."""
     try:
         from src.live.alpaca_options import _trading
         from src.notifications.slack_notifier import send_message
@@ -2206,69 +2265,10 @@ def _eod_report_job():
         stock_lines  = "\n".join(_fmt_pos(p) for p in stocks)  or "  _none_"
         option_lines = "\n".join(_fmt_pos(p) for p in options) or "  _none_"
 
-        # -- Close suggestions ------------------------------------------------
-        suggestions = []
-        today = date.today()
-
-        for p in stocks:
-            pct = float(getattr(p, "unrealized_plpc", 0) or 0) * 100
-            if pct <= -8:
-                suggestions.append(
-                    f":rotating_light: *CLOSE `{p.symbol}`* — down {pct:.1f}% from cost. Stop-loss zone.\n"
-                    f"  > `python close_position.py --ticker {p.symbol}`"
-                )
-            elif pct >= 20:
-                suggestions.append(
-                    f":moneybag: *TRIM `{p.symbol}`* — up {pct:.1f}%. Consider taking partial profit.\n"
-                    f"  > `python close_position.py --ticker {p.symbol}`"
-                )
-
-        for p in options:
-            unreal = float(getattr(p, "unrealized_pl", 0) or 0)
-            mkt    = float(getattr(p, "market_value",  0) or 0)
-            qty    = float(p.qty)
-            sym    = p.symbol
-            # Parse DTE from OCC symbol
-            try:
-                type_pos = len(sym) - 9
-                raw_date = sym[type_pos - 6: type_pos]
-                exp_date = date(2000 + int(raw_date[0:2]), int(raw_date[2:4]), int(raw_date[4:6]))
-                dte = (exp_date - today).days
-            except Exception:
-                dte = 99
-
-            # Parse strike and type for close_bwb-style display
-            try:
-                strike = int(sym[-8:]) / 1000.0
-                opt_type = sym[len(sym) - 9]  # C or P
-                type_pos = len(sym) - 9
-                raw_date = sym[type_pos - 6: type_pos]
-                expiry_str = f"20{raw_date[0:2]}-{raw_date[2:4]}-{raw_date[4:6]}"
-                underlying = sym[:type_pos - 6]
-            except Exception:
-                strike, opt_type, expiry_str, underlying = 0, "P", "", sym
-
-            if dte <= 3:
-                suggestions.append(
-                    f":warning: *REVIEW `{sym}`* — {dte} DTE. Expires soon.\n"
-                    f"  > `python close_bwb.py --ticker {underlying}`  _(or let expire — spread is defined-risk)_"
-                )
-
-            cost_basis = float(getattr(p, "cost_basis", 0) or 0)
-            if qty < 0 and cost_basis != 0:
-                profit_pct = (abs(cost_basis) - abs(mkt)) / abs(cost_basis) * 100
-                if profit_pct >= 50:
-                    suggestions.append(
-                        f":white_check_mark: *CLOSE `{sym}`* — {profit_pct:.0f}% of max profit captured. Lock it in.\n"
-                        f"  > `python close_bwb.py --ticker {underlying}`"
-                    )
-
-        if not suggestions:
-            suggestion_block = "  _No action needed — hold current positions._"
-        else:
-            suggestion_block = "\n\n".join(suggestions)
-
         # -- Build message ----------------------------------------------------
+        # Actionable close/trim/stop suggestions are NOT here — they fire at the
+        # 3:30 PM manage check (with buttons) while the market is still open, so
+        # they can actually be traded. The EOD report is a pure post-close recap.
         d_icon = ":chart_with_upwards_trend:" if daily_pl >= 0 else ":chart_with_downwards_trend:"
         f_icon = ":chart_with_upwards_trend:" if full_pl  >= 0 else ":chart_with_downwards_trend:"
 
@@ -2282,7 +2282,7 @@ def _eod_report_job():
             f"_(start ${start_eq:,.2f})_\n\n"
             f"*Stocks ({len(stocks)}):*\n{stock_lines}\n\n"
             f"*Options ({len(options)}):*\n{option_lines}\n\n"
-            f"*Close / Action Suggestions:*\n{suggestion_block}"
+            f"_Actionable trims/stops fire at the 3:30 PM check (market open)._"
         )
         send_message(msg)
         logger.info("EOD report sent")
@@ -2445,20 +2445,33 @@ def _execute_exit(rec: dict, resp_url: str):
     tid = rec["id"]
     try:
         client = _trading()
-        if rec.get("exit_kind") == "equity":
+        if rec.get("exit_kind") in ("equity", "equity_trim"):
             sym = rec.get("symbol") or rec["underlying"]
             pos = next((p for p in client.get_all_positions() if p.symbol == sym), None)
             if pos is None:
                 pending_store.update_status(tid, "failed", note="no_position")
                 _slack_replace(resp_url, f":x: No open position for `{sym}` — nothing to close.")
                 return
-            unreal = float(getattr(pos, "unrealized_pl", 0) or 0)
+            unreal   = float(getattr(pos, "unrealized_pl", 0) or 0)
+            full_qty = float(pos.qty)
+            if rec["exit_kind"] == "equity_trim":
+                # sell half; keep whole shares whole, allow fractional for fractionable assets
+                sell_qty = float(int(full_qty) // 2) if full_qty == int(full_qty) else round(full_qty / 2, 4)
+                if sell_qty <= 0:
+                    pending_store.update_status(tid, "failed", note="too_small_to_trim")
+                    _slack_replace(resp_url,
+                        f":x: `{sym}` is only {full_qty:g} share(s) — too small to trim; use a full close.")
+                    return
+                verb = f"Trimmed {sell_qty:g} of {full_qty:g}"
+            else:
+                sell_qty = full_qty
+                verb = "Closed"
             order_obj = client.submit_order(MarketOrderRequest(
-                symbol=sym, qty=float(pos.qty), side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
+                symbol=sym, qty=sell_qty, side=OrderSide.SELL, time_in_force=TimeInForce.DAY))
             pending_store.update_status(tid, "taken", order_id=str(order_obj.id))
             icon = ":green_circle:" if unreal >= 0 else ":red_circle:"
             _slack_replace(resp_url,
-                f"{icon} *Closed `{sym}`*  P&L ${unreal:+,.2f}\n  Order ID: `{order_obj.id}`")
+                f"{icon} *{verb} `{sym}`*  P&L ${unreal:+,.2f}\n  Order ID: `{order_obj.id}`")
             return
 
         # structure: close every open option leg for the underlying as one order
@@ -2906,6 +2919,333 @@ def slack_command():
     return jsonify({"text": ack_map[command], "response_type": "in_channel"}), 200
 
 
+# ── One-shot auto-trade ──────────────────────────────────────────────────────
+#
+# Fires AT MOST ONE defined-risk structure on the armed date (config/auto_trade.json),
+# during [fire_start, fire_end] ET, re-checking every 5 min. Best passing candidate
+# in priority condor > bull put > fly, capped at max_loss. Re-priced + drift-guarded
+# at fill (same gate as the buttons). Idempotent via Alpaca client_order_id so a
+# Render restart can't double-fire. Kill switch: env AUTO_TRADE_KILL=1.
+
+def _auto_trade_config() -> dict:
+    path = os.path.join(os.path.dirname(__file__), "config", "auto_trade.json")
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {"enabled": False}
+    if os.environ.get("AUTO_TRADE_DATE"):
+        cfg["armed_date"] = os.environ["AUTO_TRADE_DATE"]
+    if os.environ.get("AUTO_TRADE_MAX_LOSS"):
+        try:
+            cfg["max_loss"] = float(os.environ["AUTO_TRADE_MAX_LOSS"])
+        except ValueError:
+            pass
+    if os.environ.get("AUTO_TRADE_KILL"):
+        cfg["enabled"] = False
+    return cfg
+
+
+def _auto_already_fired(coid: str) -> bool:
+    """True if an order with this client_order_id already exists at Alpaca — the
+    durable, restart-proof 'already traded today' check."""
+    from src.live.alpaca_options import _trading
+    try:
+        return _trading().get_order_by_client_id(coid) is not None
+    except Exception:
+        return False   # not found (or transient) → treat as not yet fired
+
+
+def _auto_pick_candidate(max_loss: float):
+    """Return the single best structure clearing the $max_loss gate, or None.
+    Priority: GEX condor (high POP) > bull put (STRONG first, earnings-clear) > pin fly."""
+    from src.analysis.gex_scanner    import scan as gex_scan
+    from src.analysis.condor_scanner  import scan as condor_scan
+    from src.analysis.butterfly_scanner import scan as fly_scan
+    from src.analysis.bull_put_scanner import scan as bp_scan
+
+    d   = get_data()
+    vix = d["vix"]
+    try:
+        gx = gex_scan()
+    except Exception:
+        gx = None
+
+    # 1) Iron condor (no 0DTE — dte_min=1)
+    if gx:
+        try:
+            con = condor_scan(gx.spot, gx, dte_min=1, dte_max=7).get("candidate")
+            if con and float(con.get("max_loss_usd", 1e9)) <= max_loss and int(con.get("dte", 0)) >= 1:
+                return {
+                    "strategy": "condor", "underlying": con["ticker"], "expiry": con["expiry"],
+                    "legs": con["legs"], "ref_net": float(con["credit"]),
+                    "max_loss": con["max_loss_usd"],
+                    "label": (f"Condor {con['ticker']} {con['short_put']:.0f}/{con['long_put']:.0f}P "
+                              f"{con['short_call']:.0f}/{con['long_call']:.0f}C {con['expiry']}"),
+                    "detail": f"credit +${con['credit']:.2f}  POP {con.get('pop_pct','?')}%  max loss ${con['max_loss_usd']}",
+                }
+        except Exception as e:
+            logger.warning("Auto-trade condor check failed: %s", e)
+
+    # 2) Bull put (STRONG before WATCH, higher score first, no earnings catalyst)
+    try:
+        bp = bp_scan(vix_now=vix["now"], vix_prev=vix["prev"])
+    except Exception as e:
+        logger.warning("Auto-trade bull-put scan failed: %s", e)
+        bp = []
+    hits = [r for r in bp if r.get("signal") in ("STRONG", "WATCH") and r.get("candidate")]
+    hits.sort(key=lambda r: (r["signal"] != "STRONG", -float(r["candidate"].get("score", 0))))
+    for r in hits:
+        c = r["candidate"]
+        if float(c.get("max_loss_usd", 1e9)) > max_loss:
+            continue
+        if int(c.get("dte", 0)) < 1:          # no 0DTE
+            continue
+        try:
+            from src.live.news import earnings_guard
+            if earnings_guard(r["ticker"]).get("flagged"):
+                logger.info("Auto-trade skip %s — earnings catalyst", r["ticker"])
+                continue
+        except Exception:
+            pass
+        return {
+            "strategy": "bull_put", "underlying": r["ticker"], "expiry": c["expiry"],
+            "legs": [{"action": "SELL", "strike": c["short_strike"], "opt": "P", "qty": 1},
+                     {"action": "BUY",  "strike": c["long_strike"],  "opt": "P", "qty": 1}],
+            "ref_net": float(c["credit"]), "max_loss": c["max_loss_usd"],
+            "label": f"Bull put {r['ticker']} {c['short_strike']}/{c['long_strike']} {c['expiry']}",
+            "detail": f"credit +${c['credit']:.2f} ({c['credit_pct']:.0f}%)  max loss ${c['max_loss_usd']}",
+        }
+
+    # 3) Pin fly (cheapest defined risk; no 0DTE — dte_min=1)
+    if gx:
+        try:
+            flies = fly_scan(gx.spot, gx, dte_min=1, dte_max=10).get("candidates") or []
+            flies = [f for f in flies
+                     if float(f.get("debit_usd", 1e9)) <= max_loss and int(f.get("dte", 0)) >= 1]
+            if flies:
+                f0 = sorted(flies, key=lambda f: -f["rr"])[0]
+                return {
+                    "strategy": "fly", "underlying": f0["ticker"], "expiry": f0["expiry"],
+                    "legs": f0["legs"], "ref_net": -float(f0["debit"]), "max_loss": f0["debit_usd"],
+                    "label": (f"Pin fly {f0['ticker']} {f0['long_upper']:.0f}/{f0['short_body']:.0f}/"
+                              f"{f0['long_lower']:.0f} {f0['expiry']}"),
+                    "detail": f"debit -${f0['debit']:.2f}  R/R {f0['rr']}  max loss ${f0['debit_usd']}",
+                }
+        except Exception as e:
+            logger.warning("Auto-trade fly check failed: %s", e)
+    return None
+
+
+def _auto_place(cand: dict, client_order_id: str) -> dict:
+    """Re-price + drift-guard + submit the chosen structure (qty 1) with a fixed
+    client_order_id for idempotency. Returns {ok, reason|order_id, live_net, is_credit}."""
+    from src.live.alpaca_options import _trading
+    from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    try:
+        legs = _legs_to_occ(cand["underlying"], cand["expiry"], cand["legs"])
+        live_net, priced = _reprice_net(legs)
+        if live_net is None:
+            return {"ok": False, "reason": "no live quotes to re-price"}
+        ref_net = float(cand["ref_net"])
+        if _drifted(ref_net, live_net, REPRICE_TOLERANCE):
+            return {"ok": False,
+                    "reason": f"price drifted (alert ${abs(ref_net):.2f} → live ${abs(live_net):.2f}, past {REPRICE_TOLERANCE:.0%})"}
+        is_credit = live_net > 0
+        leg_objs = [
+            OptionLegRequest(
+                symbol=lg["symbol"], ratio_qty=lg["ratio"],
+                side=OrderSide.SELL if lg["side"] == "SELL" else OrderSide.BUY,
+                position_intent=(PositionIntent.SELL_TO_OPEN if lg["side"] == "SELL"
+                                 else PositionIntent.BUY_TO_OPEN))
+            for lg in priced
+        ]
+        order = _trading().submit_order(LimitOrderRequest(
+            symbol=cand["underlying"], qty=1,
+            side=OrderSide.SELL if is_credit else OrderSide.BUY,
+            type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
+            limit_price=round(abs(live_net), 2), legs=leg_objs,
+            client_order_id=client_order_id))
+        return {"ok": True, "order_id": str(order.id), "live_net": live_net, "is_credit": is_credit}
+    except Exception as e:
+        return {"ok": False, "reason": f"submit error: {e}"}
+
+
+def _auto_trade_job():
+    """Every 5 min 10:00–12:55 ET (gated to the armed window). Places at most one
+    structure on the armed date, then is idempotent for the rest of the day."""
+    try:
+        cfg = _auto_trade_config()
+        if not cfg.get("enabled"):
+            return
+        today = datetime.now(ET).strftime("%Y-%m-%d")
+        if cfg.get("armed_date") != today:
+            return
+        if not _market_is_open():
+            return
+        now = datetime.now(ET).time()
+        if now < dt_time(10, 0) or now >= dt_time(12, 35):
+            return
+
+        coid = f"auto-{today.replace('-', '')}"
+        if _auto_already_fired(coid):
+            return   # already placed today (survives restarts via Alpaca)
+
+        from src.notifications.slack_notifier import send_message
+        max_loss = float(cfg.get("max_loss", 100))
+
+        # arming notice once, on the first (10:00) tick
+        if dt_time(10, 0) <= now < dt_time(10, 5):
+            send_message(f":robot_face: *Auto-trade armed* — scanning for the best defined-risk "
+                         f"setup ≤ ${max_loss:.0f} max loss until 12:30 ET. One shot.")
+
+        cand = _auto_pick_candidate(max_loss)
+        if not cand:
+            if now >= dt_time(12, 30):
+                send_message(f":robot_face: *Auto-trade stood down* — no setup cleared the "
+                             f"${max_loss:.0f} max-loss gate by 12:30 ET. No trade today.")
+            return   # otherwise keep checking next tick
+
+        res = _auto_place(cand, coid)
+        if not res["ok"]:
+            logger.info("Auto-trade: stood down this tick — %s", res["reason"])
+            return   # drift may resolve; retry next tick (idempotency still holds)
+
+        word = "credit" if res["is_credit"] else "debit"
+        send_message(
+            f":robot_face: *AUTO-TRADE PLACED* — {cand['strategy']}\n"
+            f"  *{cand['label']}*\n"
+            f"  {cand['detail']}\n"
+            f"  filled net {word} ${abs(res['live_net']):.2f}  (max loss ≤ ${max_loss:.0f})\n"
+            f"  Order ID: `{res['order_id']}`  ·  one-shot — disarmed for today")
+        logger.info("Auto-trade FILLED: %s | %s | order=%s",
+                    cand["strategy"], cand["label"], res["order_id"])
+    except Exception as e:
+        logger.error("_auto_trade_job error: %s", e)
+        try:
+            from src.notifications.slack_notifier import send_message
+            send_message(f":rotating_light: Auto-trade error: {e}")
+        except Exception:
+            pass
+
+
+def _auto_open_structures():
+    """Find still-open auto-trade structures, restart-proof. Queries Alpaca for
+    filled entry orders tagged client_order_id 'auto-*' (NOT 'autoclose-*') whose
+    legs are still open positions. Alpaca is the durable source of truth, so this
+    survives any Render restart. Returns [{coid, underlying, expiry(date), legs}]."""
+    from src.live.alpaca_options import _trading
+    from alpaca.trading.requests import GetOrdersRequest
+    from alpaca.trading.enums import QueryOrderStatus
+    client = _trading()
+    try:
+        orders = client.get_orders(filter=GetOrdersRequest(
+            status=QueryOrderStatus.ALL, limit=300,
+            after=datetime.now(ET) - timedelta(days=21)))
+    except Exception as e:
+        logger.warning("auto-manage: get_orders failed: %s", e)
+        return []
+    open_syms = {p.symbol for p in client.get_all_positions()}
+    out = []
+    for o in orders:
+        coid = getattr(o, "client_order_id", "") or ""
+        if not coid.startswith("auto-") or coid.startswith("autoclose"):
+            continue
+        legs = getattr(o, "legs", None) or []
+        leg_syms = [getattr(lg, "symbol", None) for lg in legs]
+        still_open = [s for s in leg_syms if s and s in open_syms]
+        if not still_open:
+            continue
+        parsed = _occ_parse(still_open[0])
+        if not parsed:
+            continue
+        out.append({"coid": coid, "underlying": parsed[0], "expiry": parsed[1], "legs": still_open})
+    return out
+
+
+def _auto_close_structure(st: dict, reason: str):
+    """Close exactly the auto-trade's open legs (not other positions on the same
+    underlying) as one multi-leg order, idempotent via client_order_id."""
+    from src.live.alpaca_options import _trading, get_mid_price
+    from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    from src.notifications.slack_notifier import send_message
+    client = _trading()
+    coid = f"autoclose-{st['underlying']}-{st['expiry']}"
+    try:
+        if client.get_order_by_client_id(coid):
+            return   # close already submitted
+    except Exception:
+        pass
+    positions = {p.symbol: p for p in client.get_all_positions()}
+    net_debit, leg_objs, unreal = 0.0, [], 0.0
+    for sym in st["legs"]:
+        pos = positions.get(sym)
+        if not pos:
+            continue
+        mid = get_mid_price(sym)
+        if mid is None:
+            continue
+        qn    = float(pos.qty)
+        ratio = int(abs(qn))
+        unreal += float(getattr(pos, "unrealized_pl", 0) or 0)
+        if qn > 0:
+            side, intent, limit = OrderSide.SELL, PositionIntent.SELL_TO_CLOSE, round(mid * 0.95, 2)
+            net_debit -= limit * ratio * 100
+        else:
+            side, intent, limit = OrderSide.BUY, PositionIntent.BUY_TO_CLOSE, round(mid * 1.05, 2)
+            net_debit += limit * ratio * 100
+        leg_objs.append(OptionLegRequest(symbol=sym, ratio_qty=ratio, side=side, position_intent=intent))
+    if not leg_objs:
+        return
+    is_debit  = net_debit > 0
+    net_share = round(abs(net_debit) / 100, 2)
+    order = client.submit_order(LimitOrderRequest(
+        symbol=st["underlying"], qty=1,
+        side=OrderSide.BUY if is_debit else OrderSide.SELL,
+        type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
+        limit_price=net_share, legs=leg_objs, client_order_id=coid))
+    icon = ":green_circle:" if unreal >= 0 else ":red_circle:"
+    send_message(
+        f"{icon} *AUTO-CLOSE `{st['underlying']}`* — {reason}\n"
+        f"  {len(leg_objs)} legs, net {'debit' if is_debit else 'credit'} ${net_share:.2f}  |  "
+        f"P&L ${unreal:+,.2f}\n  Order ID: `{order.id}`")
+    logger.info("Auto-close %s %s — %s order=%s", st["underlying"], st["expiry"], reason, order.id)
+
+
+def _auto_manage_job():
+    """Every 5 min during RTH. Manages open auto-trade structures:
+      - take profit automatically at the 50% target
+      - force-close at 1 DTE, 3:30 PM ET (never hold into expiration)
+    Only ever touches the auto-trade's own legs."""
+    try:
+        if not _market_is_open():
+            return
+        structs = _auto_open_structures()
+        if not structs:
+            return
+        now    = datetime.now(ET)
+        today  = date.today()
+        # 50% targets reconstructed from leg strikes (credit/debit/fly aware)
+        pflags = {(f["underlying"], str(f["exp"])): f for f in _profit_targets()}
+        for st in structs:
+            try:
+                dte    = (st["expiry"] - today).days
+                reason = None
+                f = pflags.get((st["underlying"], str(st["expiry"])))
+                if f and f["pct"] >= 50:
+                    reason = f"50% profit target ({f['pct']}%)"
+                elif dte <= 1 and now.time() >= dt_time(15, 30):
+                    reason = f"1 DTE force-close — {dte} DTE, 3:30 ET (no holding into expiry)"
+                if reason:
+                    _auto_close_structure(st, reason)
+            except Exception as e:
+                logger.warning("auto-manage: close %s failed: %s", st.get("underlying"), e)
+    except Exception as e:
+        logger.error("_auto_manage_job error: %s", e)
+
+
 def _start_scheduler():
     """Start background scheduler once — guarded against double-start in reloaders."""
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -2928,9 +3268,15 @@ def _start_scheduler():
                   id="manage_1530",        replace_existing=True)
     sched.add_job(_eod_report_job,   "cron", day_of_week="mon-fri", hour=16, minute=5,
                   id="eod_report",         replace_existing=True)
+    # One-shot auto-trade: enters 10:00–12:30 (armed date in config), exit 50%/1-DTE
+    sched.add_job(_auto_trade_job,   "cron", day_of_week="mon-fri", hour="10-12", minute="*/5",
+                  id="auto_trade",         replace_existing=True)
+    sched.add_job(_auto_manage_job,  "cron", day_of_week="mon-fri", hour="9-15", minute="*/5",
+                  id="auto_manage",        replace_existing=True)
     sched.start()
     logger.info("Scheduler started: prep 8:30 / scan 9:45/10:00/10:30/12:30 / "
-                "SPY monitor */5 / manage 3:30 / EOD 4:05 PM ET (Mon-Fri)")
+                "SPY monitor */5 / manage 3:30 / EOD 4:05 / auto-trade 10:00-12:30 + "
+                "auto-manage */5 PM ET (Mon-Fri)")
     return sched
 
 

@@ -1,0 +1,8 @@
+{
+  "enabled": true,
+  "armed_date": "2026-06-17",
+  "max_loss": 100,
+  "fire_start": "10:00",
+  "fire_end": "12:30",
+  "note": "One-shot live auto-trade. Fires at most ONE defined-risk structure on armed_date: best passing candidate in priority order condor > bull put > fly, max loss <= max_loss, re-priced + drift-guarded at fill, idempotent via Alpaca client_order_id. To re-arm another day, change armed_date (or set env AUTO_TRADE_DATE). Kill switch: set env AUTO_TRADE_KILL=1, or enabled=false."
+}
