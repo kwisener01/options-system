@@ -167,6 +167,7 @@ class CreditSpreadEngine:
 
                 # Take-profit check (not applicable on 0DTE — no time left to check)
                 tp_hit = False
+                tp_close_val = 0.0
                 if (not expired) and (self.take_profit_pct is not None) and self.dte > 0:
                     days_elapsed = (date - open_pos.entry_date).days
                     if days_elapsed >= 1:   # don't check same day as entry
@@ -175,9 +176,13 @@ class CreditSpreadEngine:
                         current_val = self._spread_value(spot, K1, K2, t_remain, open_sigma)
                         if current_val <= cr * (1 - self.take_profit_pct):
                             tp_hit = True
+                            tp_close_val = current_val
 
                 if expired or tp_hit:
-                    pnl = self._settle_pnl(spot, K1, K2, cr, contracts)
+                    if tp_hit:
+                        pnl = (cr - tp_close_val) * _SHARES * contracts
+                    else:
+                        pnl = self._settle_pnl(spot, K1, K2, cr, contracts)
                     account += pnl
 
                     if tp_hit:
