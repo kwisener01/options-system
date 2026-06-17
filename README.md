@@ -116,6 +116,16 @@ Silent if nothing qualifies. `/manage` runs the profit-target half on demand.
 
 Unified scan is **silent if nothing actionable** — no noise.
 
+### Performance Reporting (fund metrics)
+
+Fund-grade metrics computed from Alpaca's **durable** daily equity series (no local storage — always reconciles to the broker, survives restarts):
+
+- **Returns:** total, ~30-day, and annualized **CAGR**.
+- **Risk-adjusted:** **max drawdown**, **Sharpe**, **Sortino**.
+- **Consistency:** daily **win rate**, **profit factor**, best/worst day.
+
+`/performance` (alias `/perf`) shows it on demand; a **Monthly NAV statement** posts to Slack on the 1st of each month at 8 AM ET. Short-history figures are flagged as noisy. Per-trade and per-strategy attribution is the next layer (tag `client_order_id` by strategy + reconcile Alpaca fills).
+
 ### Risk Engine (config/risk.json)
 
 Fund-style capital protection that gates **every** new entry — the auto-trade *and* the Slack Take buttons. Equity, today's P&L, and the high-water mark all come from Alpaca, so the rules are durable and restart-proof.
@@ -264,6 +274,7 @@ Set all `.env` variables in Render's Environment dashboard. No redeploy needed f
 | `/manage` | Check open structures at the 50% profit target |
 | `/autotrade on\|off\|status` | Toggle or inspect the one-shot auto-trade (env `AUTO_TRADE_KILL` is the hard override) |
 | `/risk` | Fund risk status: equity, day P&L vs limit, drawdown vs high-water mark, per-trade budget |
+| `/performance` (`/perf`) | Fund metrics: total/30d/CAGR returns, max drawdown, Sharpe, Sortino, win rate, profit factor |
 | `/positions` | Current open positions |
 | `/place TICKER SHORT LONG EXPIRY [QTY]` | Place a bull put credit spread |
 | `/close_position TICKER` | Market-sell a stock/ETF position |

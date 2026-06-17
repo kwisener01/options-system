@@ -132,6 +132,30 @@ def test_risk_gate():
     print("ok  risk gate (daily-loss / drawdown / per-trade budget)")
 
 
+def test_performance_metrics():
+    import app
+    # steady 1%/day climb over 10 days
+    eq = [1000 * (1.01 ** i) for i in range(11)]
+    ts = [i * 86400 for i in range(11)]
+    m = app._perf_from_series(eq, ts)
+    assert m["points"] == 11
+    assert abs(m["total_return"] - (eq[-1] / eq[0] - 1)) < 1e-9
+    assert m["max_dd"] == 0.0                      # monotonic up → no drawdown
+    assert m["day_win_rate"] == 1.0                # every day green
+    assert m["profit_factor"] == float("inf")      # no losing days
+    assert m["best_day"] > 0 and m["worst_day"] > 0
+
+    # a drawdown in the middle is detected
+    eq2 = [100, 110, 121, 90, 99]                  # peak 121 → trough 90
+    m2 = app._perf_from_series(eq2)
+    assert abs(m2["max_dd"] - (121 - 90) / 121) < 1e-9
+    assert 0 < m2["day_win_rate"] < 1
+
+    # too little history → safe empty
+    assert app._perf_from_series([1000])["points"] == 1
+    print("ok  performance metrics (returns / drawdown / win rate)")
+
+
 if __name__ == "__main__":
     test_pending_store()
     test_blocks()
@@ -139,4 +163,5 @@ if __name__ == "__main__":
     test_app_logic()
     test_auto_trade_config()
     test_risk_gate()
+    test_performance_metrics()
     print("\nALL PASS")

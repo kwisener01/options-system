@@ -2933,6 +2933,7 @@ HELP_TEXT = (
     "`/manage` — check open structures at the 50% profit target\n"
     "`/autotrade on|off|status` — toggle / inspect the one-shot auto-trade\n"
     "`/risk`  — fund risk status (equity, day P&L vs limit, drawdown, budget)\n"
+    "`/performance` — fund metrics: CAGR, max DD, Sharpe, win rate, profit factor\n"
     "`/eod`   — generate EOD P&L report now\n"
     "`/help`  — show this message"
 )
@@ -2964,6 +2965,8 @@ def slack_command():
         "manage":    ":hourglass: Checking 50% profit targets...",
         "autotrade": ":hourglass: Auto-trade...",
         "risk":      ":hourglass: Checking risk status...",
+        "performance": ":hourglass: Computing performance...",
+        "perf":      ":hourglass: Computing performance...",
         "eod":       ":hourglass: Generating EOD report...",
         "help":      None,
     }
@@ -2987,6 +2990,8 @@ def slack_command():
         "manage":    lambda: _cmd_manage(resp_url),
         "autotrade": lambda: _cmd_autotrade(text, resp_url),
         "risk":      lambda: _cmd_risk(resp_url),
+        "performance": lambda: _cmd_performance(resp_url),
+        "perf":      lambda: _cmd_performance(resp_url),
         "eod":       lambda: _cmd_eod(resp_url),
     }
     threading.Thread(target=dispatch[command], daemon=True).start()
@@ -3064,6 +3069,102 @@ def _risk_check_entry(max_loss: float | None = None) -> tuple[bool, str]:
     except Exception as e:
         logger.warning("risk check failed (allowing): %s", e)
         return True, "risk check unavailable"
+
+
+# ── Performance reporting (fund metrics) ─────────────────────────────────────
+#
+# Fund-grade metrics computed from Alpaca's durable daily equity series — CAGR,
+# max drawdown, Sharpe/Sortino, daily win rate / profit factor, period returns.
+# No local storage, so it's restart-proof and always reconciles to the broker.
+
+def _perf_from_series(eq: list, ts: list | None = None) -> dict:
+    """Pure metrics from a daily equity series (and optional epoch timestamps)."""
+    import math
+    eq = [float(e) for e in eq if e]
+    out = {"points": len(eq)}
+    if len(eq) < 2:
+        return out
+    start, equity = eq[0], eq[-1]
+    rets = [(eq[i] - eq[i - 1]) / eq[i - 1] for i in range(1, len(eq)) if eq[i - 1]]
+
+    out["start_equity"] = start
+    out["equity"]       = equity
+    out["total_return"] = (equity / start - 1) if start > 0 else 0.0
+
+    # CAGR from elapsed calendar time (fallback to trading-day count)
+    days = ((ts[-1] - ts[0]) / 86400.0) if (ts and len(ts) >= 2) else float(len(eq))
+    out["days"] = days
+    yrs = max(days / 365.0, 1e-9)
+    out["cagr"] = ((equity / start) ** (1 / yrs) - 1) if start > 0 else 0.0
+
+    # max drawdown
+    peak, mdd = -1e18, 0.0
+    for v in eq:
+        peak = max(peak, v)
+        if peak > 0:
+            mdd = max(mdd, (peak - v) / peak)
+    out["max_dd"] = mdd
+
+    if rets:
+        mean = sum(rets) / len(rets)
+        sd   = (sum((r - mean) ** 2 for r in rets) / len(rets)) ** 0.5
+        downs = [r for r in rets if r < 0]
+        dsd  = (sum(r * r for r in downs) / len(downs)) ** 0.5 if downs else 0.0
+        green, red = [r for r in rets if r > 0], [r for r in rets if r < 0]
+        out["sharpe"]        = (mean / sd * math.sqrt(252)) if sd > 1e-9 else 0.0
+        out["sortino"]       = (mean / dsd * math.sqrt(252)) if dsd > 1e-9 else 0.0
+        out["day_win_rate"]  = len(green) / len(rets)
+        out["profit_factor"] = (sum(green) / abs(sum(red))) if (red and sum(red) != 0) else float("inf")
+        out["best_day"]      = max(rets)
+        out["worst_day"]     = min(rets)
+        # ~30-trading-day return
+        k = min(22, len(eq) - 1)
+        out["ret_30d"] = (equity / eq[-1 - k] - 1) if eq[-1 - k] else 0.0
+    return out
+
+
+def _performance_metrics() -> dict:
+    from src.live.alpaca_options import _trading
+    from alpaca.trading.requests import GetPortfolioHistoryRequest
+    client = _trading()
+    h = client.get_portfolio_history(GetPortfolioHistoryRequest(period="1A", timeframe="1D"))
+    return _perf_from_series(list(h.equity or []), list(h.timestamp or []))
+
+
+def _fmt_performance(m: dict, title: str = "Performance") -> str:
+    if m.get("points", 0) < 2:
+        return f":chart_with_upwards_trend: *{title}* — not enough history yet."
+    def pct(x): return f"{x*100:+.1f}%"
+    pf = m.get("profit_factor", 0)
+    pf_s = "∞" if pf == float("inf") else f"{pf:.2f}"
+    young = "  _(short history — annualized figures are noisy)_" if m.get("days", 0) < 60 else ""
+    return "\n".join([
+        f":chart_with_upwards_trend: *{title}*  _({int(m['days'])}d, {m['points']} pts)_{young}",
+        f"  Equity ${m['equity']:,.2f}   Total {pct(m['total_return'])}   "
+        f"30d {pct(m.get('ret_30d',0))}",
+        f"  CAGR {pct(m['cagr'])}   Max DD {m['max_dd']*100:.1f}%",
+        f"  Sharpe {m.get('sharpe',0):.2f}   Sortino {m.get('sortino',0):.2f}",
+        f"  Daily win {m.get('day_win_rate',0)*100:.0f}%   Profit factor {pf_s}   "
+        f"best {pct(m.get('best_day',0))} / worst {pct(m.get('worst_day',0))}",
+    ])
+
+
+def _cmd_performance(resp_url: str):
+    try:
+        _slack_respond(resp_url, _fmt_performance(_performance_metrics()))
+    except Exception as e:
+        _slack_respond(resp_url, f":rotating_light: Performance report failed: {e}")
+
+
+def _monthly_nav_job():
+    """1st of the month, 8 AM ET — fund NAV statement to Slack."""
+    try:
+        from src.notifications.slack_notifier import send_message
+        m = _performance_metrics()
+        send_message(_fmt_performance(m, title=f"Monthly NAV — {datetime.now(ET):%B %Y}"))
+        logger.info("Monthly NAV report sent")
+    except Exception as e:
+        logger.error("_monthly_nav_job error: %s", e)
 
 
 # ── One-shot auto-trade ──────────────────────────────────────────────────────
@@ -3463,6 +3564,9 @@ def _start_scheduler():
                   id="auto_trade",         replace_existing=True)
     sched.add_job(_auto_manage_job,  "cron", day_of_week="mon-fri", hour="9-15", minute="*/5",
                   id="auto_manage",        replace_existing=True)
+    # Monthly NAV statement — 1st of the month, 8 AM ET
+    sched.add_job(_monthly_nav_job,  "cron", day=1, hour=8, minute=0,
+                  id="monthly_nav",        replace_existing=True)
     sched.start()
     logger.info("Scheduler started: prep 8:30 / scan 9:45/10:00/10:30/12:30 / "
                 "SPY monitor */5 / manage 3:30 / EOD 4:05 / auto-trade 10:00-12:30 + "
