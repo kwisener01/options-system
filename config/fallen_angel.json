@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "conviction": "STRONG",
+  "risk_pct_per_position": 0.01,
+  "stop_drawdown_pct": 0.12,
+  "stop_below_52w_low_pct": 0.01,
+  "max_position_pct": 0.15,
+  "max_positions": 4,
+  "max_category_pct": 0.40,
+  "trim_at_gain_pct": 0.20,
+  "trail_pct": 0.15,
+  "note": "Fallen-angel stock rules. Act on STRONG signals (score >= 8/13) via a Slack Buy button. Risk-based sizing: shares = (risk_pct_per_position * equity) / (entry - stop), capped at max_position_pct of equity, max_positions concurrent, and total category exposure <= max_category_pct of equity. Stop = the HIGHER (first-triggered) of entry*(1-stop_drawdown_pct) and 52w_low*(1-stop_below_52w_low_pct) -> encodes 'new 52w low OR -12%'. A protective sell-stop is placed at the broker on entry. Exit (trim half at +trim_at_gain_pct, then trail_pct trailing stop) is managed by _fa_manage_job."
+}

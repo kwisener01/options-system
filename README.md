@@ -61,7 +61,13 @@ src/
 Scans S&P 500 universe for high-IV stocks with GEX put-wall support. Sells put spreads below the GEX put wall. Filters: credit ≥ $0.30, risk/reward ≥ 1:3, stock above 200-day MA.
 
 ### Fallen Angels
-Stocks down 20–50% from 52-week high with strong fundamentals (low P/E, high ROE). Mean-reversion candidates for stock purchases.
+Stocks down 30%+ from 52-week high, near their multi-year floor, with early institutional-accumulation signals (RSI bottoming, volume expansion, call-heavy options flow). 13-point screen; STRONG ≥ 8, WATCH ≥ 5.
+
+**Trading rules (`config/fallen_angel.json`):** STRONG signals post a Slack **🪂 Buy** button. A tap:
+- **risk-sizes** the position — shares = `1% of equity ÷ (entry − stop)`, capped at 15% of equity per name, `max_positions` (4) concurrent, and total category exposure ≤ 40% of equity (the stock sleeve);
+- buys, then places a **protective sell-stop** at the broker — stop = the higher (first-triggered) of **−12%** or **just below the 52-week low**, so a held name is never unprotected.
+
+Exit (trim half at +20%, then a 15% trailing stop on the remainder) is handled by the fallen-angel position manager.
 
 ### Value Watchlist
 Pre-defined watchlist of quality companies monitored for entry signals.

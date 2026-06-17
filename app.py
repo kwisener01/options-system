@@ -2022,6 +2022,24 @@ def _unified_scan_job():
         except Exception as e:
             logger.warning("Entry-approval post failed: %s", e)
 
+        # -- Fallen-angel Buy approvals (STRONG conviction only) -------------
+        try:
+            facfg = _fa_config()
+            if facfg.get("enabled"):
+                conv = facfg.get("conviction", "STRONG")
+                fa_cands = []
+                for a in fa_results:
+                    if a.get("signal") != conv:
+                        continue
+                    label = f"{a['ticker']} ${a['spot']:.2f} ({a['pct_from_high']:.0f}% from high)"
+                    text  = (f"*{label}*  score {a['score']}/13  RSI {a.get('rsi','?')}  "
+                             f"P/C {a.get('put_call_ratio','?')}")
+                    tid = register_fa_buy(a["ticker"], a["spot"], a.get("low_52w"), label, text)
+                    fa_cands.append({"tid": tid, "text": text, "label": label})
+                _post_fa_approvals(fa_cands)
+        except Exception as e:
+            logger.warning("FA-approval post failed: %s", e)
+
         logger.info(
             "Unified scan alert sent — BP:%d FA:%d VW:%d BWB:%d spyBWB:%s fly:%d "
             "condor:%s batman:%s close=%s",
@@ -2563,7 +2581,8 @@ def slack_interactive():
     if not _verify_slack(request):
         return "", 403
     from src.notifications import pending_store
-    from src.notifications.slack_blocks import ACTION_TAKE, ACTION_SKIP, ACTION_CLOSE, ACTION_HOLD
+    from src.notifications.slack_blocks import (ACTION_TAKE, ACTION_SKIP, ACTION_CLOSE,
+                                                 ACTION_HOLD, ACTION_BUY)
     try:
         payload = json.loads(request.form.get("payload", "{}"))
     except Exception:
@@ -2603,6 +2622,8 @@ def slack_interactive():
         threading.Thread(target=lambda: _execute_entry(rec, resp_url), daemon=True).start()
     elif aid == ACTION_CLOSE:
         threading.Thread(target=lambda: _execute_exit(rec, resp_url), daemon=True).start()
+    elif aid == ACTION_BUY:
+        threading.Thread(target=lambda: _execute_stock_buy(rec, resp_url), daemon=True).start()
     return "", 200
 
 
@@ -3165,6 +3186,190 @@ def _monthly_nav_job():
         logger.info("Monthly NAV report sent")
     except Exception as e:
         logger.error("_monthly_nav_job error: %s", e)
+
+
+# ── Fallen-angel stock rules ─────────────────────────────────────────────────
+#
+# STRONG fallen-angel signals get a Slack Buy button. A tap risk-sizes the
+# position (1% of equity at the stop), buys, and places a protective sell-stop
+# at the broker — stop = the higher of -12% or just below the 52-week low, so a
+# bought name is never unprotected. Concentration caps: max positions + total
+# category exposure ≤ the stock sleeve (~40%).
+
+def _fa_config() -> dict:
+    path = os.path.join(os.path.dirname(__file__), "config", "fallen_angel.json")
+    cfg = {"enabled": True, "conviction": "STRONG", "risk_pct_per_position": 0.01,
+           "stop_drawdown_pct": 0.12, "stop_below_52w_low_pct": 0.01,
+           "max_position_pct": 0.15, "max_positions": 4, "max_category_pct": 0.40,
+           "trim_at_gain_pct": 0.20, "trail_pct": 0.15}
+    try:
+        with open(path) as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    return cfg
+
+
+def _fa_stop_and_size(entry: float, low_52w: float, equity: float, cfg: dict) -> dict:
+    """Pure: stop price (higher of -drawdown% and just below 52w low) and
+    risk-based share count, capped by max_position_pct of equity."""
+    stop = max(entry * (1 - cfg["stop_drawdown_pct"]),
+               (low_52w or 0) * (1 - cfg["stop_below_52w_low_pct"]))
+    rps  = entry - stop
+    out  = {"stop": round(stop, 2), "risk_per_share": round(rps, 4),
+            "shares": 0, "notional": 0.0, "risk": 0.0, "capped_by": None}
+    if rps <= 0 or entry <= 0 or equity <= 0:
+        out["capped_by"] = "bad_stop"
+        return out
+    shares = int((cfg["risk_pct_per_position"] * equity) // rps)
+    capped = "risk"
+    max_by_notional = int((cfg["max_position_pct"] * equity) // entry)
+    if max_by_notional < shares:
+        shares, capped = max_by_notional, "position_pct"
+    out["shares"]   = max(shares, 0)
+    out["notional"] = round(out["shares"] * entry, 2)
+    out["risk"]     = round(out["shares"] * rps, 2)
+    out["capped_by"] = capped if out["shares"] > 0 else "too_small"
+    return out
+
+
+def _stock_price(ticker: str):
+    try:
+        from alpaca.data.historical import StockHistoricalDataClient
+        from alpaca.data.requests import StockLatestTradeRequest
+        from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY
+        c = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+        r = c.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=ticker.upper()))
+        return float(r[ticker.upper()].price)
+    except Exception as e:
+        logger.warning("stock price fetch failed %s: %s", ticker, e)
+        return None
+
+
+def _fa_open_tickers() -> set:
+    """Tickers currently held that were bought as fallen angels (client_order_id
+    'fa-*'), reconciled from Alpaca so it's restart-proof."""
+    from src.live.alpaca_options import _trading
+    from alpaca.trading.requests import GetOrdersRequest
+    from alpaca.trading.enums import QueryOrderStatus
+    client = _trading()
+    try:
+        orders = client.get_orders(filter=GetOrdersRequest(
+            status=QueryOrderStatus.ALL, limit=300,
+            after=datetime.now(ET) - timedelta(days=120)))
+    except Exception as e:
+        logger.warning("FA open-tickers get_orders failed: %s", e)
+        return set()
+    open_syms = {p.symbol for p in client.get_all_positions()}
+    out = set()
+    for o in orders:
+        coid = getattr(o, "client_order_id", "") or ""
+        if coid.startswith("fa-"):          # entry tag only ('fastop-'/'fatrim-' excluded)
+            sym = getattr(o, "symbol", None)
+            if sym in open_syms:
+                out.add(sym)
+    return out
+
+
+def register_fa_buy(ticker: str, entry: float, low_52w: float, label: str, text: str) -> str:
+    from src.notifications import pending_store
+    return pending_store.add({"kind": "stock_buy", "ticker": ticker.upper(),
+                              "entry": entry, "low_52w": low_52w,
+                              "label": label, "text": text})
+
+
+def _post_fa_approvals(cands: list):
+    if not cands:
+        return
+    from src.notifications.slack_blocks import buy_blocks
+    from src.notifications.slack_notifier import send_blocks
+    header = ":parachute: *Buy these fallen angels?*  _risk-sized, protective stop set on entry_"
+    blocks, fb = buy_blocks(header, cands)
+    send_blocks(blocks, fb)
+
+
+def _execute_stock_buy(rec: dict, resp_url: str):
+    """Risk-size + buy a fallen-angel name, then place a broker-side stop."""
+    from src.notifications import pending_store
+    from src.live.alpaca_options import _trading
+    from alpaca.trading.requests import MarketOrderRequest, StopOrderRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    tid = rec["id"]
+    ticker = rec["ticker"]
+    try:
+        cfg = _fa_config()
+        allowed, reason = _risk_check_entry(None)
+        if not allowed:
+            pending_store.update_status(tid, "skipped", note=f"risk:{reason}")
+            _slack_replace(resp_url, f":octagonal_sign: *Blocked by risk rule* — {reason}. Not bought.")
+            return
+        client = _trading()
+        acct   = client.get_account()
+        equity = float(acct.equity)
+        cash   = float(getattr(acct, "cash", 0) or 0)
+
+        open_fa = _fa_open_tickers()
+        if ticker in open_fa:
+            pending_store.update_status(tid, "skipped", note="already_held")
+            _slack_replace(resp_url, f":information_source: Already hold `{ticker}` — not adding.")
+            return
+        if len(open_fa) >= cfg["max_positions"]:
+            pending_store.update_status(tid, "skipped", note="max_positions")
+            _slack_replace(resp_url, f":no_entry: Max fallen-angel positions "
+                                     f"({cfg['max_positions']}) reached.")
+            return
+
+        positions = {p.symbol: p for p in client.get_all_positions()}
+        fa_val = sum(float(getattr(positions[s], "market_value", 0) or 0)
+                     for s in open_fa if s in positions)
+
+        entry = _stock_price(ticker) or rec.get("entry")
+        if not entry:
+            pending_store.update_status(tid, "failed", note="no_price")
+            _slack_replace(resp_url, f":x: Could not get a price for `{ticker}`.")
+            return
+
+        sz = _fa_stop_and_size(entry, rec.get("low_52w") or 0, equity, cfg)
+        shares = sz["shares"]
+        # category cap
+        room = max(cfg["max_category_pct"] * equity - fa_val, 0)
+        if shares * entry > room:
+            shares = int(room // entry); sz["capped_by"] = "category_pct"
+        # cash cap
+        if shares * entry > cash:
+            shares = int(cash // entry); sz["capped_by"] = "cash"
+        if shares < 1:
+            pending_store.update_status(tid, "skipped", note=f"too_small:{sz['capped_by']}")
+            _slack_replace(resp_url, f":x: *{ticker}* position too small after caps "
+                                     f"({sz['capped_by']}). Not bought.")
+            return
+
+        today = datetime.now(ET).strftime("%Y%m%d")
+        buy = client.submit_order(MarketOrderRequest(
+            symbol=ticker, qty=shares, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
+            client_order_id=f"fa-{ticker}-{today}"))
+        stop_ok = True
+        try:
+            client.submit_order(StopOrderRequest(
+                symbol=ticker, qty=shares, side=OrderSide.SELL, time_in_force=TimeInForce.GTC,
+                stop_price=sz["stop"], client_order_id=f"fastop-{ticker}-{today}"))
+        except Exception as e:
+            stop_ok = False
+            logger.warning("FA stop placement failed %s: %s", ticker, e)
+
+        pending_store.update_status(tid, "taken", order_id=str(buy.id))
+        stop_pct = (entry - sz["stop"]) / entry * 100
+        _slack_replace(resp_url,
+            f":parachute: *BOUGHT `{ticker}`* — fallen angel\n"
+            f"  {shares} sh @ ~${entry:.2f}  (${shares*entry:,.0f})\n"
+            f"  Stop ${sz['stop']:.2f} (-{stop_pct:.1f}%)  ·  risk ${sz['risk']:.0f} "
+            f"({cfg['risk_pct_per_position']*100:.0f}% of equity)"
+            f"{'' if stop_ok else '  :warning: STOP NOT PLACED — set it manually!'}\n"
+            f"  Order ID: `{buy.id}`")
+        logger.info("FA buy %s %dsh @%.2f stop %.2f (stop_ok=%s)", ticker, shares, entry, sz["stop"], stop_ok)
+    except Exception as e:
+        pending_store.update_status(tid, "failed", note=str(e))
+        _slack_replace(resp_url, f":rotating_light: *Buy failed — {ticker}*: {e}")
 
 
 # ── One-shot auto-trade ──────────────────────────────────────────────────────

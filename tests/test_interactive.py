@@ -156,6 +156,23 @@ def test_performance_metrics():
     print("ok  performance metrics (returns / drawdown / win rate)")
 
 
+def test_fa_sizing():
+    import app
+    cfg = app._fa_config()
+    # entry 30, 52w low 27 → stop = max(30*0.88=26.40, 27*0.99=26.73) = 26.73
+    s = app._fa_stop_and_size(30.0, 27.0, 2000, cfg)
+    assert abs(s["stop"] - 26.73) < 0.01
+    # budget = 1% * 2000 = $20; risk/share = 3.27 → 6 shares
+    assert s["shares"] == 6 and s["capped_by"] == "risk"
+    # tiny risk/share → capped by position notional (15% of 2000 / 10 = 30 sh)
+    s2 = app._fa_stop_and_size(10.0, 9.9, 2000, cfg)
+    assert s2["shares"] == 30 and s2["capped_by"] == "position_pct"
+    # 52w low above entry → stop >= entry → no trade
+    s3 = app._fa_stop_and_size(10.0, 11.0, 2000, cfg)
+    assert s3["shares"] == 0 and s3["capped_by"] == "bad_stop"
+    print("ok  fallen-angel sizing (stop / risk-based shares / caps)")
+
+
 if __name__ == "__main__":
     test_pending_store()
     test_blocks()
@@ -164,4 +181,5 @@ if __name__ == "__main__":
     test_auto_trade_config()
     test_risk_gate()
     test_performance_metrics()
+    test_fa_sizing()
     print("\nALL PASS")

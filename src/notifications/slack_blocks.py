@@ -13,6 +13,7 @@ ACTION_TAKE  = "trade_take"
 ACTION_SKIP  = "trade_skip"
 ACTION_CLOSE = "trade_close"
 ACTION_HOLD  = "trade_hold"
+ACTION_BUY   = "stock_buy"     # fallen-angel stock purchase
 
 
 def _section(text: str) -> dict:
@@ -64,6 +65,24 @@ def exit_blocks(header: str, candidates: list[dict]) -> tuple[list, str]:
             "elements": [
                 _button(close_label, ACTION_CLOSE, c["tid"], "primary"),
                 _button("✋ Hold", ACTION_HOLD, c["tid"]),
+            ],
+        })
+    fallback = header + "\n" + "\n".join(f"{i}. {c['label']}" for i, c in enumerate(candidates, 1))
+    return blocks, fallback
+
+
+def buy_blocks(header: str, candidates: list[dict]) -> tuple[list, str]:
+    """Fallen-angel Buy/Skip approval. candidates: [{tid, text, label}]."""
+    blocks: list = [_section(header)]
+    for i, c in enumerate(candidates, 1):
+        blocks.append({"type": "divider"})
+        blocks.append(_section(f"*{i}.* {c['text']}"))
+        blocks.append({
+            "type": "actions",
+            "block_id": f"buy_{c['tid']}",
+            "elements": [
+                _button(f"🪂 Buy #{i}", ACTION_BUY, c["tid"], "primary"),
+                _button("✖ Skip", ACTION_SKIP, c["tid"], "danger"),
             ],
         })
     fallback = header + "\n" + "\n".join(f"{i}. {c['label']}" for i, c in enumerate(candidates, 1))
