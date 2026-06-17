@@ -10,7 +10,7 @@ Auto-selects the right spread each week based on macro regime + VIX:
 
 Usage:
     python run_multi_strategy_backtest.py
-    python run_multi_strategy_backtest.py --dte 0 --take-profit 0.50
+    python run_multi_strategy_backtest.py --dte 0 --take-profit 0.75
     python run_multi_strategy_backtest.py --risk-pct 0.05 --max-vix 20
 """
 import argparse
@@ -56,7 +56,7 @@ def parse_args():
     p.add_argument("--risk-pct",     type=float, default=0.10,   help="Max account %% at risk per trade (default 0.10)")
     p.add_argument("--iv-premium",   type=float, default=1.20)
     p.add_argument("--dte",          type=int,   default=7,      help="7=weekly, 0=0DTE")
-    p.add_argument("--take-profit",  type=float, default=0.50,   help="TP fraction (default 0.50 = 50%%)")
+    p.add_argument("--take-profit",  type=float, default=0.75,   help="TP fraction (default 0.75 = 75%%)")
     p.add_argument("--period",       type=str,   default="2y")
     p.add_argument("--no-chart",     action="store_true")
     return p.parse_args()

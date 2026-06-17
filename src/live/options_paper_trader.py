@@ -716,7 +716,7 @@ def open_daily(engine: Optional[MultiStrategyEngine] = None,
 
 
 def daily_cycle(engine: Optional[MultiStrategyEngine] = None,
-                dte: int = 1, tp_pct: float = 0.50) -> dict:
+                dte: int = 1, tp_pct: float = 0.75) -> dict:
     """
     Full daily cycle: check TP → force-close any position from a prior day → open fresh spread.
     Designed to run at 9:45 AM ET Mon-Fri. PDT-safe: overnight hold = not a day trade.
@@ -757,7 +757,7 @@ def daily_cycle(engine: Optional[MultiStrategyEngine] = None,
 
 
 def check_tp(engine: Optional[MultiStrategyEngine] = None,
-             tp_pct: float = 0.50) -> Optional[dict]:
+             tp_pct: float = 0.75) -> Optional[dict]:
     """
     Check if the open spread has hit the take-profit threshold.
     Returns the closed trade dict if TP was triggered, else None.

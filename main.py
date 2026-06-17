@@ -35,7 +35,7 @@ _options_engine = MultiStrategyEngine(
     max_risk_pct=0.10,
     max_vix_entry=25.0,
     low_vol_threshold=18.0,
-    take_profit_pct=0.50,
+    take_profit_pct=0.75,
     max_dollar_risk=200,       # cap 1 contract risk at $200 for $2k account
     ratio_long_otm_pct=0.030,  # ratio spread long protection 3% OTM
     breakout_otm_pct=0.010,    # strangle legs 1% OTM when GEX flip near
@@ -181,7 +181,7 @@ def gex_force_close_job():
 def options_daily_cycle_job():
     """Mon-Fri 9:45 AM ET — close yesterday's spread (or TP), open new 3DTE spread."""
     try:
-        r = daily_cycle(engine=_options_engine, dte=1, tp_pct=0.50)
+        r = daily_cycle(engine=_options_engine, dte=1, tp_pct=0.75)
         if r["closed"]:
             logger.info("Daily cycle closed: P&L=%.2f", r["closed"].get("pnl", 0))
         if r["opened"]:

@@ -339,7 +339,7 @@ class RotatingEngine:
         day_trade_budget:    int   = 3,
         min_iv_rank_change:  float = 10.0,
         eval_interval_min:   int   = 30,
-        tp_threshold:        float = 0.50,   # close at 50% of max profit
+        tp_threshold:        float = 0.75,   # close at 75% of max profit
         sl_threshold:        float = 1.50,   # close at 150% of credit received
     ):
         self.symbol             = symbol

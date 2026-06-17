@@ -40,7 +40,7 @@ def parse_args():
     p.add_argument("--max-vix",     type=float, default=25.0)
     p.add_argument("--low-vol",     type=float, default=18.0)
     p.add_argument("--risk-pct",    type=float, default=0.10)
-    p.add_argument("--take-profit", type=float, default=0.50)
+    p.add_argument("--take-profit", type=float, default=0.75)
     p.add_argument("--dry-run", action="store_true",
                    help="Preview strategy/strikes without saving state or placing orders")
     p.add_argument("--dte",    type=int, default=1,

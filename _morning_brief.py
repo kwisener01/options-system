@@ -43,7 +43,7 @@ engine = MultiStrategyEngine(
     max_risk_pct=0.10,
     max_vix_entry=25.0,
     low_vol_threshold=20.0,
-    take_profit_pct=0.50,
+    take_profit_pct=0.75,
 )
 
 r   = preview_weekly(engine)

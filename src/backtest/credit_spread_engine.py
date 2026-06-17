@@ -10,8 +10,8 @@ DTE modes:
   dte=0  — open every trading day, expire same day     (0DTE)
 
 Take-profit:
-  take_profit_pct=0.50  — close the spread when its residual value has fallen
-                          to (1-0.50)*credit, i.e. we have locked in 50% of max
+  take_profit_pct=0.75  — close the spread when its residual value has fallen
+                          to (1-0.75)*credit, i.e. we have locked in 75% of max
                           profit.  Frees capital for faster redeployment.
   take_profit_pct=None  — hold all spreads to expiry.
 

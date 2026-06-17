@@ -35,7 +35,7 @@ logger     = logging.getLogger(__name__)
 ET         = pytz.timezone("America/New_York")
 STATE_PATH = os.path.join(DATA_DIR, "spy_gex_state.json")
 
-TP_PCT = 0.50   # close when unrealized gain >= 50% of max gain
+TP_PCT = 0.75   # close when unrealized gain >= 75% of max gain
 
 
 # ── state I/O ─────────────────────────────────────────────────────────────────

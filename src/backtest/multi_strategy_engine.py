@@ -105,7 +105,7 @@ class MultiStrategyEngine:
         breakout_otm_pct:     float = 0.010,  # strangle leg OTM% for GEX flip breakout play
         vol_window:         int   = 20,
         dte:                int   = 7,
-        take_profit_pct:    Optional[float] = 0.50,
+        take_profit_pct:    Optional[float] = 0.75,
     ):
         self.initial_capital     = initial_capital
         self.short_otm_pct       = short_otm_pct

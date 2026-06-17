@@ -376,7 +376,7 @@ def api_dry_run():
             max_risk_pct   = float(request.json.get("risk_pct",   0.10)) if request.json else 0.10,
             max_vix_entry  = float(request.json.get("max_vix",   25.0))  if request.json else 25.0,
             low_vol_threshold = float(request.json.get("low_vol", 18.0)) if request.json else 18.0,
-            take_profit_pct = float(request.json.get("tp",        0.50)) if request.json else 0.50,
+            take_profit_pct = float(request.json.get("tp",        0.75)) if request.json else 0.75,
         )
         r = preview_weekly(engine)
         pos = r.get("position")

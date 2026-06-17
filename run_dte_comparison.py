@@ -27,7 +27,7 @@ SPREAD_WIDTH_PCT = 0.01    # spread width ~1% of spot
 MAX_RISK_PCT     = 0.10    # risk 10% of account per trade
 IV_PREMIUM       = 1.20    # VIX × 1.2 for IV estimate
 MAX_VIX          = 25.0    # skip entry if VIX > 25
-TP_PCT           = 0.50    # take profit at 50% of max credit
+TP_PCT           = 0.75    # take profit at 75% of max credit
 START            = "2022-01-01"
 END              = "2025-12-31"
 
