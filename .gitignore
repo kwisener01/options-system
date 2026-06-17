@@ -20,6 +20,7 @@ data/rotating_paper_state.json
 data/pending_trades.json
 data/spy_trade_state.json
 data/futures_alert_state.json
+data/auto_trade_runtime.json
 
 # Reports (large images/csvs)
 reports/

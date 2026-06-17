@@ -2850,6 +2850,48 @@ def _cmd_eod(resp_url: str):
     _eod_report_job()
 
 
+def _cmd_autotrade(arg: str, resp_url: str):
+    """`/autotrade on|off|status` — toggle or inspect the one-shot auto-trade."""
+    arg = (arg or "").strip().lower()
+    if arg == "off":
+        _auto_runtime_set(False)
+        _slack_respond(resp_url,
+            ":no_entry: *Auto-trade DISABLED.* It will not place a trade. "
+            "Re-enable with `/autotrade on`.\n"
+            "_Note: this holds while the app stays awake; for a guaranteed overnight "
+            "cancel also set `AUTO_TRADE_KILL=1` in Render._")
+        return
+    if arg == "on":
+        _auto_runtime_set(True)
+        cfg = _auto_trade_config()
+        extra = "  :warning: _but env AUTO_TRADE_KILL is set — that overrides this._" \
+            if os.environ.get("AUTO_TRADE_KILL") else ""
+        _slack_respond(resp_url,
+            f":white_check_mark: *Auto-trade ENABLED.*{extra}\n"
+            f"  Armed {cfg.get('armed_date')}, max loss ${cfg.get('max_loss')}, "
+            f"10:00–12:30 ET, no 0DTE, exit 50%/1-DTE.")
+        return
+    # status (default)
+    cfg   = _auto_trade_config()
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    state = "ENABLED :green_circle:" if cfg.get("enabled") else "DISABLED :red_circle:"
+    armed = "TODAY" if cfg.get("armed_date") == today else f"not today ({cfg.get('armed_date')})"
+    lines = [
+        ":robot_face: *Auto-trade status*",
+        f"  State: *{state}*" + ("  _(env kill set)_" if os.environ.get("AUTO_TRADE_KILL") else ""),
+        f"  Armed for: {armed}",
+        f"  Max loss: ${cfg.get('max_loss')}  |  window 10:00–12:30 ET  |  no 0DTE",
+        f"  Exit: auto-close 50% / force-close 1 DTE 3:30 ET",
+        "  Toggle: `/autotrade on` · `/autotrade off`",
+    ]
+    try:
+        if _auto_already_fired(f"auto-{today.replace('-', '')}"):
+            lines.append("  :heavy_check_mark: *Already traded today.*")
+    except Exception:
+        pass
+    _slack_respond(resp_url, "\n".join(lines))
+
+
 HELP_TEXT = (
     ":robot_face: *Trader Bot Commands*\n\n"
     "`/positions`  — show all open positions + close suggestions\n"
@@ -2863,6 +2905,7 @@ HELP_TEXT = (
     "`/condor` — GEX-anchored iron condor (high-POP premium play)\n"
     "`/batman` — GEX-anchored Batman for XSP (positive-cowl double BWB)\n"
     "`/manage` — check open structures at the 50% profit target\n"
+    "`/autotrade on|off|status` — toggle / inspect the one-shot auto-trade\n"
     "`/eod`   — generate EOD P&L report now\n"
     "`/help`  — show this message"
 )
@@ -2892,6 +2935,7 @@ def slack_command():
         "condor":    ":hourglass: Scanning GEX-anchored condors...",
         "batman":    ":hourglass: Scanning XSP Batman setups...",
         "manage":    ":hourglass: Checking 50% profit targets...",
+        "autotrade": ":hourglass: Auto-trade...",
         "eod":       ":hourglass: Generating EOD report...",
         "help":      None,
     }
@@ -2913,6 +2957,7 @@ def slack_command():
         "condor":    lambda: _cmd_condor(resp_url),
         "batman":    lambda: _cmd_batman(resp_url),
         "manage":    lambda: _cmd_manage(resp_url),
+        "autotrade": lambda: _cmd_autotrade(text, resp_url),
         "eod":       lambda: _cmd_eod(resp_url),
     }
     threading.Thread(target=dispatch[command], daemon=True).start()
@@ -2926,6 +2971,29 @@ def slack_command():
 # in priority condor > bull put > fly, capped at max_loss. Re-priced + drift-guarded
 # at fill (same gate as the buttons). Idempotent via Alpaca client_order_id so a
 # Render restart can't double-fire. Kill switch: env AUTO_TRADE_KILL=1.
+
+_AUTO_RUNTIME = os.path.join(os.path.dirname(__file__), "data", "auto_trade_runtime.json")
+
+
+def _auto_runtime_get() -> dict | None:
+    """Slack-toggle override ({'enabled': bool}). Lives on the (ephemeral) disk —
+    reliably holds intraday while the app is warm; reverts to the committed
+    config after a restart. For an overnight-durable kill use env AUTO_TRADE_KILL."""
+    try:
+        with open(_AUTO_RUNTIME) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _auto_runtime_set(enabled: bool):
+    try:
+        os.makedirs(os.path.dirname(_AUTO_RUNTIME), exist_ok=True)
+        with open(_AUTO_RUNTIME, "w") as f:
+            json.dump({"enabled": bool(enabled), "ts": time.time()}, f)
+    except Exception as e:
+        logger.warning("auto runtime write failed: %s", e)
+
 
 def _auto_trade_config() -> dict:
     path = os.path.join(os.path.dirname(__file__), "config", "auto_trade.json")
@@ -2941,6 +3009,11 @@ def _auto_trade_config() -> dict:
             cfg["max_loss"] = float(os.environ["AUTO_TRADE_MAX_LOSS"])
         except ValueError:
             pass
+    # Slack toggle (/autotrade on|off) overrides the committed default…
+    rt = _auto_runtime_get()
+    if rt is not None and "enabled" in rt:
+        cfg["enabled"] = bool(rt["enabled"])
+    # …but the env kill switch is the hard master and always wins.
     if os.environ.get("AUTO_TRADE_KILL"):
         cfg["enabled"] = False
     return cfg

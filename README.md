@@ -252,6 +252,7 @@ Set all `.env` variables in Render's Environment dashboard. No redeploy needed f
 | `/condor` | GEX-anchored iron condor (high-POP premium play) |
 | `/batman` | GEX-anchored Batman for XSP (positive-cowl double BWB) |
 | `/manage` | Check open structures at the 50% profit target |
+| `/autotrade on\|off\|status` | Toggle or inspect the one-shot auto-trade (env `AUTO_TRADE_KILL` is the hard override) |
 | `/positions` | Current open positions |
 | `/place TICKER SHORT LONG EXPIRY [QTY]` | Place a bull put credit spread |
 | `/close_position TICKER` | Market-sell a stock/ETF position |
