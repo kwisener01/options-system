@@ -17,6 +17,7 @@ Gates (run in order):
   7. Liquidity: OI >= 100 and daily vol >= 10 on every leg
   8. Bid-ask width <= 30 pct of mid on every leg
   9. Earnings: no earnings within the trade window
+ 10. FOMC/Fed: no Fed rate decision or Powell speech in news
 
 Run:  python bull_put_screener.py
 """
@@ -815,6 +816,20 @@ def run_gates(ticker: str, price: float, trade: dict,
         gates.append({"gate": 8, "name": "No Earnings in Window", "pass": True,
                       "detail": "No earnings detected in trade window"})
 
+    # Gate 9: FOMC / Fed event — news-based
+    try:
+        from src.live.news import fomc_guard
+        fomc = fomc_guard()
+        if fomc["flagged"]:
+            gates.append({"gate": 9, "name": "No FOMC/Fed Event", "pass": False,
+                          "detail": f"{fomc['reason']} -- SKIP"})
+        else:
+            gates.append({"gate": 9, "name": "No FOMC/Fed Event", "pass": True,
+                          "detail": "No FOMC/Fed event detected"})
+    except Exception:
+        gates.append({"gate": 9, "name": "No FOMC/Fed Event", "pass": True,
+                      "detail": "FOMC guard unavailable (fail-open)"})
+
     return gates
 
 
@@ -1096,7 +1111,7 @@ def run_scan():
         "Breakeven / Range", "Breakeven % Below",
         "Gate 0 SPY", "Gate 1 EMA", "Gate 2 IV", "Gate 3 Structure",
         "Gate 4 Credit", "Gate 5 Sizing", "Gate 6 Cushion",
-        "Gate 7 Liquidity", "Gate 8 Earnings",
+        "Gate 7 Liquidity", "Gate 8 Earnings", "Gate 9 FOMC",
     ]
     run_id = datetime.now().strftime("%Y%m%d_%H%M")
     with open(path, "a", newline="", encoding="utf-8") as f:
@@ -1134,6 +1149,7 @@ def run_scan():
                 gates.get(0, ""), gates.get(1, ""), gates.get(2, ""),
                 gates.get(3, ""), gates.get(4, ""), gates.get(5, ""),
                 gates.get(6, ""), gates.get(7, ""), gates.get(8, ""),
+                gates.get(9, ""),
             ])
     log.info(f"Results appended to {path}  (run {run_id})")
     return results

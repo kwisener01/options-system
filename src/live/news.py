@@ -2,13 +2,15 @@
 News + event awareness for the trader.
 
 Pulls recent headlines from Alpaca's news API (Benzinga feed, included with the
-existing API keys — no new vendor or secret). Used two ways:
+existing API keys — no new vendor or secret). Used three ways:
 
-  1. analysis guard  — `earnings_guard()` flags an underlying that has an
+  1. earnings guard  — `earnings_guard()` flags an underlying that has an
      earnings/guidance catalyst in recent headlines, so the scanners can annotate
-     or suppress premium-selling setups (selling defined-risk premium into an
-     earnings print is the classic blow-up).
-  2. dashboard feed  — `news_for()` returns scored headlines for the web page.
+     or suppress premium-selling setups.
+  2. FOMC guard      — `fomc_guard()` detects upcoming Fed rate decisions,
+     minutes releases, and Powell speeches that inject gap risk into credit
+     spreads.
+  3. dashboard feed  — `news_for()` returns scored headlines for the web page.
 
 Everything is wrapped defensively: if the news endpoint is unavailable the
 trader keeps working, just without the news overlay.
@@ -29,6 +31,12 @@ _NEG = {"miss", "misses", "plunge", "plunges", "falls", "drop", "drops", "cuts",
 # Words that mark a scheduled/again-pending earnings or guidance catalyst.
 _EARNINGS = {"earnings", "q1", "q2", "q3", "q4", "quarterly", "guidance",
              "results", "eps", "revenue forecast", "to report", "reports earnings"}
+
+# Words that mark FOMC / Fed rate-decision / monetary-policy catalysts.
+_FOMC = {"fomc", "federal reserve", "fed meeting", "rate decision", "rate hike",
+         "rate cut", "interest rate", "fed minutes", "powell", "monetary policy",
+         "basis points", "fed holds", "fed pause", "quantitative tightening",
+         "dot plot", "fed statement", "policy rate", "funds rate"}
 
 
 def _client():
@@ -119,3 +127,35 @@ def earnings_guard(symbol: str, lookback_hours: int = 72) -> dict:
         }
     return {"flagged": False, "reason": "", "headlines": [n["headline"] for n in items[:3]],
             "net_sentiment": net}
+
+
+def fomc_guard(lookback_hours: int = 96) -> dict:
+    """Flag whether FOMC / Fed rate decision / Powell speech is imminent.
+    Scans broad-market symbols (SPY, QQQ, DIA) for Fed-related headlines.
+    Returns {flagged, reason, headlines}. Fail-open on outage."""
+    items = []
+    for sym in ("SPY", "QQQ", "DIA"):
+        items.extend(fetch_news(sym, limit=20, lookback_hours=lookback_hours))
+
+    if not items:
+        return {"flagged": False, "reason": "", "headlines": []}
+
+    # Deduplicate by headline text
+    seen = set()
+    unique = []
+    for n in items:
+        h = n["headline"]
+        if h not in seen:
+            seen.add(h)
+            unique.append(n)
+
+    hits = [n for n in unique
+            if any(k in f"{n['headline']} {n['summary']}".lower() for k in _FOMC)]
+
+    if hits:
+        return {
+            "flagged": True,
+            "reason": f"FOMC/Fed headline in last {lookback_hours}h ({len(hits)} article{'s' if len(hits)!=1 else ''})",
+            "headlines": [n["headline"] for n in hits[:5]],
+        }
+    return {"flagged": False, "reason": "", "headlines": []}

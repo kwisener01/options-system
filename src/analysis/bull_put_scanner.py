@@ -313,9 +313,20 @@ def scan(tickers: list[str] = None,
     """
     Scan for bull put credit spread setups.
     Returns list sorted: STRONG first, then WATCH, then NONE.
+    Each result includes fomc_warning (bool) if Fed news is detected.
     """
     tickers = tickers or UNIVERSE
     logger.info("Bull put scan: %d tickers  VIX %.2f", len(tickers), vix_now)
+
+    # FOMC check — once for the whole scan (affects all tickers equally)
+    fomc: dict = {"flagged": False, "reason": "", "headlines": []}
+    try:
+        from src.live.news import fomc_guard
+        fomc = fomc_guard()
+        if fomc["flagged"]:
+            logger.warning("FOMC guard flagged: %s", fomc["reason"])
+    except Exception as e:
+        logger.debug("FOMC guard unavailable: %s", e)
 
     with ThreadPoolExecutor(max_workers=2) as pre:
         spots_f    = pre.submit(_fetch_spots,   tickers)
@@ -348,13 +359,20 @@ def scan(tickers: list[str] = None,
                             "signal": "NONE", "note": "Price unavailable",
                             "price_ok": False})
 
+    # Stamp FOMC warning on every result
+    for r in results:
+        r["fomc_warning"] = fomc["flagged"]
+        r["fomc_reason"]  = fomc.get("reason", "")
+        r["fomc_headlines"] = fomc.get("headlines", [])
+
     _order = {"STRONG": 0, "WATCH": 1, "NONE": 2}
     results.sort(key=lambda r: (_order.get(r.get("signal", "NONE"), 9),
                                 -(r.get("candidate") or {}).get("credit_pct", 0)))
 
     n_strong = sum(1 for r in results if r.get("signal") == "STRONG")
     n_watch  = sum(1 for r in results if r.get("signal") == "WATCH")
-    logger.info("Bull put scan: %d STRONG, %d WATCH of %d", n_strong, n_watch, len(results))
+    logger.info("Bull put scan: %d STRONG, %d WATCH of %d  fomc=%s",
+                n_strong, n_watch, len(results), fomc["flagged"])
     return results
 
 
@@ -366,6 +384,20 @@ def fmt_slack(results: list[dict], spy_regime: str,
         "_Short strike AT GEX put wall · Credit > 50% of width_",
         "",
     ]
+
+    # FOMC banner — show once at top if flagged on any result
+    fomc_flagged = any(r.get("fomc_warning") for r in results)
+    if fomc_flagged:
+        fomc_r = next((r for r in results if r.get("fomc_warning")), {})
+        headlines = fomc_r.get("fomc_headlines", [])
+        top_hl = f"  _{headlines[0]}_" if headlines else ""
+        lines += [
+            ":rotating_light: *FOMC / Fed event detected — gap risk elevated*",
+            f"  {fomc_r.get('fomc_reason', '')}",
+            top_hl,
+            "",
+        ]
+
     candidates = [r for r in results if r.get("candidate") and r.get("signal") != "NONE"]
     if not candidates:
         lines.append("_No qualifying setups today — no spreads clear 50% credit._")

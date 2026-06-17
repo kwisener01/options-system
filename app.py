@@ -3263,12 +3263,19 @@ def _auto_pick_candidate(max_loss: float):
         except Exception as e:
             logger.warning("Auto-trade condor check failed: %s", e)
 
-    # 2) Bull put (STRONG before WATCH, higher score first, no earnings catalyst)
+    # 2) Bull put (STRONG before WATCH, higher score first, no earnings/FOMC catalyst)
     try:
         bp = bp_scan(vix_now=vix["now"], vix_prev=vix["prev"])
     except Exception as e:
         logger.warning("Auto-trade bull-put scan failed: %s", e)
         bp = []
+
+    # FOMC gate — skip all bull puts if Fed event detected
+    fomc_block = any(r.get("fomc_warning") for r in bp)
+    if fomc_block:
+        logger.info("Auto-trade skip ALL bull puts — FOMC/Fed event detected")
+        bp = []
+
     hits = [r for r in bp if r.get("signal") in ("STRONG", "WATCH") and r.get("candidate")]
     hits.sort(key=lambda r: (r["signal"] != "STRONG", -float(r["candidate"].get("score", 0))))
     for r in hits:
