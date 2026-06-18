@@ -859,14 +859,22 @@ def api_news():
 
 @app.route("/api/mode")
 def api_mode():
-    """LIVE vs PAPER, derived from ALPACA_BASE_URL. No account number exposed."""
+    """LIVE vs PAPER + whether the API keys actually authenticate against that
+    endpoint (catches paper-keys-on-live-endpoint, which rejects all orders)."""
+    from config.settings import IS_PAPER, ALPACA_BASE_URL
+    host = ALPACA_BASE_URL.split("//")[-1]
+    out = {"ok": True, "mode": "PAPER" if IS_PAPER else "LIVE", "paper": IS_PAPER, "host": host}
     try:
-        from config.settings import IS_PAPER, ALPACA_BASE_URL
-        host = ALPACA_BASE_URL.split("//")[-1]
-        return jsonify({"ok": True, "mode": "PAPER" if IS_PAPER else "LIVE",
-                        "paper": IS_PAPER, "host": host})
+        from src.live.alpaca_options import _trading
+        acct = _trading().get_account()
+        out["account_ok"]      = True
+        out["account_status"]  = str(getattr(acct, "status", ""))
+        out["trading_blocked"] = bool(getattr(acct, "trading_blocked", False))
+        out["options_level"]   = getattr(acct, "options_trading_level", None)
     except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+        out["account_ok"]    = False
+        out["account_error"] = str(e)[:200]
+    return jsonify(out)
 
 
 @app.route("/api/slack", methods=["POST"])
@@ -3758,6 +3766,7 @@ def _fa_manage_job():
 # Render restart can't double-fire. Kill switch: env AUTO_TRADE_KILL=1.
 
 _AUTO_RUNTIME = os.path.join(os.path.dirname(__file__), "data", "auto_trade_runtime.json")
+_AUTO_ERR: dict = {}   # de-dupe: last date we posted a submit-error to Slack
 
 
 def _auto_runtime_get() -> dict | None:
@@ -4005,6 +4014,15 @@ def _auto_trade_job():
         res = _auto_place(cand, f"auto-{cand['strategy']}-{date_tag}")
         if not res["ok"]:
             logger.info("Auto-trade: stood down this tick — %s", res["reason"])
+            # surface real broker rejections to Slack once/day (not transient drift/quotes)
+            if res["reason"].startswith("submit error") and _AUTO_ERR.get("date") != date_tag:
+                _AUTO_ERR["date"] = date_tag
+                send_message(
+                    f":rotating_light: *Auto-trade REJECTED by Alpaca* — {res['reason']}\n"
+                    f"  ({cand['strategy']} · {cand['label']})\n"
+                    f"  Common causes: API keys don't match the live endpoint (access-key error), "
+                    f"options approval level too low for spreads, or insufficient buying power. "
+                    f"Run `/risk` and check Alpaca → Account.")
             return   # drift may resolve; retry next tick (idempotency still holds)
 
         word = "credit" if res["is_credit"] else "debit"
