@@ -222,6 +222,21 @@ def test_attribution():
     print("ok  attribution (coid parse / cash flow / round-trip P&L)")
 
 
+def test_fa_trim_plan():
+    import app
+    p = app._fa_trim_plan(10)
+    assert p == {"mode": "trim_trail", "sell": 5, "keep": 5}
+    p3 = app._fa_trim_plan(3)
+    assert p3["sell"] == 1 and p3["keep"] == 2 and p3["mode"] == "trim_trail"
+    p1 = app._fa_trim_plan(1)
+    assert p1 == {"mode": "trail_only", "sell": 0, "keep": 1}
+    # sell + keep always equals qty (no shares lost/created)
+    for q in (2, 7, 20, 101):
+        pl = app._fa_trim_plan(q)
+        assert pl["sell"] + pl["keep"] == q
+    print("ok  fallen-angel trim plan (half + trail, 1-share trail-only)")
+
+
 if __name__ == "__main__":
     test_pending_store()
     test_blocks()
@@ -233,4 +248,5 @@ if __name__ == "__main__":
     test_fa_sizing()
     test_vix_derisk()
     test_attribution()
+    test_fa_trim_plan()
     print("\nALL PASS")

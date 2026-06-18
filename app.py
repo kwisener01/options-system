@@ -3553,6 +3553,139 @@ def _execute_stock_buy(rec: dict, resp_url: str):
         _slack_replace(resp_url, f":rotating_light: *Buy failed — {ticker}*: {e}")
 
 
+def _fa_trim_plan(qty) -> dict:
+    """Pure: how to split a fallen-angel winner. ≥2 shares → sell half + trail the
+    rest; 1 share → can't trim, just trail the whole thing."""
+    qty  = int(qty)
+    half = qty // 2
+    if qty < 2:
+        return {"mode": "trail_only", "sell": 0, "keep": qty}
+    return {"mode": "trim_trail", "sell": half, "keep": qty - half}
+
+
+def _fa_already_trimmed(ticker: str) -> bool:
+    """True once a trim/trail has been placed for this ticker (idempotent)."""
+    from src.live.alpaca_options import _trading
+    from alpaca.trading.requests import GetOrdersRequest
+    from alpaca.trading.enums import QueryOrderStatus
+    try:
+        orders = _trading().get_orders(filter=GetOrdersRequest(
+            status=QueryOrderStatus.ALL, limit=200,
+            after=datetime.now(ET) - timedelta(days=10)))
+        for o in orders:
+            c = getattr(o, "client_order_id", "") or ""
+            if c.startswith((f"fatrim-{ticker}", f"fatrail-{ticker}")):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _fa_cancel_stops(client, ticker: str):
+    """Cancel the fixed protective stop(s) for a ticker to free the shares."""
+    from alpaca.trading.requests import GetOrdersRequest
+    from alpaca.trading.enums import QueryOrderStatus
+    try:
+        for o in client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=200)):
+            if getattr(o, "symbol", "") != ticker:
+                continue
+            ot   = str(getattr(o, "order_type", "") or getattr(o, "type", "")).lower()
+            coid = getattr(o, "client_order_id", "") or ""
+            if "stop" in ot or coid.startswith("fastop"):
+                try:
+                    client.cancel_order_by_id(o.id)
+                except Exception as e:
+                    logger.warning("FA cancel stop %s failed: %s", ticker, e)
+    except Exception as e:
+        logger.warning("FA cancel-stops lookup %s failed: %s", ticker, e)
+
+
+def _fa_trim_and_trail(ticker: str, cfg: dict):
+    """At +trim_at_gain_pct: re-protect with a trailing stop, THEN sell half — so
+    the kept shares are never unprotected. Order matters for safety."""
+    from src.live.alpaca_options import _trading
+    from alpaca.trading.requests import MarketOrderRequest, TrailingStopOrderRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    from src.notifications.slack_notifier import send_message
+    client = _trading()
+    pos = next((p for p in client.get_all_positions() if p.symbol == ticker), None)
+    if pos is None:
+        return
+    qty   = int(float(pos.qty))
+    plan  = _fa_trim_plan(qty)
+    trailp = float(cfg["trail_pct"]) * 100
+    today  = datetime.now(ET).strftime("%Y%m%d")
+    unreal = float(getattr(pos, "unrealized_pl", 0) or 0)
+
+    # 1. release shares held by the fixed stop
+    _fa_cancel_stops(client, ticker)
+    try:
+        # 2. re-establish protection on the KEEP shares FIRST (trailing stop)
+        client.submit_order(TrailingStopOrderRequest(
+            symbol=ticker, qty=plan["keep"], side=OrderSide.SELL,
+            time_in_force=TimeInForce.GTC, trail_percent=round(trailp, 2),
+            client_order_id=f"fatrail-{ticker}-{today}"))
+    except Exception as e:
+        # recovery: protection failed — restore a trailing stop on the FULL position
+        logger.error("FA trail placement failed %s: %s", ticker, e)
+        try:
+            client.submit_order(TrailingStopOrderRequest(
+                symbol=ticker, qty=qty, side=OrderSide.SELL, time_in_force=TimeInForce.GTC,
+                trail_percent=round(trailp, 2), client_order_id=f"fatrail-{ticker}-{today}r"))
+            send_message(f":warning: *{ticker}* trim aborted — placed a {trailp:.0f}% trailing stop "
+                         f"on the full position instead. No shares sold.")
+        except Exception as e2:
+            send_message(f":rotating_light: *{ticker}* trim FAILED and could not re-protect ({e2}). "
+                         f"*Set a stop manually now.*")
+        return
+
+    if plan["mode"] == "trail_only":
+        send_message(f":chart_with_upwards_trend: *{ticker}* up ≥{cfg['trim_at_gain_pct']*100:.0f}% — "
+                     f"only {qty} share, can't trim; placed a {trailp:.0f}% trailing stop. "
+                     f"P&L ${unreal:+,.2f}")
+        return
+
+    # 3. sell half at market (kept shares already protected by the trail)
+    try:
+        client.submit_order(MarketOrderRequest(
+            symbol=ticker, qty=plan["sell"], side=OrderSide.SELL, time_in_force=TimeInForce.DAY,
+            client_order_id=f"fatrim-{ticker}-{today}"))
+        send_message(f":scissors: *{ticker} TRIMMED* — sold {plan['sell']}/{qty} at +"
+                     f"{cfg['trim_at_gain_pct']*100:.0f}%, {plan['keep']} left on a {trailp:.0f}% "
+                     f"trailing stop.  P&L ${unreal:+,.2f}")
+    except Exception as e:
+        send_message(f":warning: *{ticker}* trail placed on {plan['keep']} sh, but the trim-sell "
+                     f"failed ({e}). You still hold {qty} (half untrailed) — verify.")
+
+
+def _fa_manage_job():
+    """Every 15 min RTH. Fallen-angel exit: at +20% trim half + trail the rest
+    (15%). The −12%/52w-low stop set at entry covers the downside until then."""
+    try:
+        if not _market_is_open():
+            return
+        cfg = _fa_config()
+        if not cfg.get("enabled"):
+            return
+        from src.live.alpaca_options import _trading
+        positions = {p.symbol: p for p in _trading().get_all_positions()}
+        for ticker in _fa_open_tickers():
+            try:
+                pos = positions.get(ticker)
+                if not pos:
+                    continue
+                entry = float(getattr(pos, "avg_entry_price", 0) or 0)
+                cur   = float(getattr(pos, "current_price", 0) or 0) or (_stock_price(ticker) or 0)
+                if not entry or not cur:
+                    continue
+                if (cur - entry) / entry >= cfg["trim_at_gain_pct"] and not _fa_already_trimmed(ticker):
+                    _fa_trim_and_trail(ticker, cfg)
+            except Exception as e:
+                logger.warning("FA manage %s failed: %s", ticker, e)
+    except Exception as e:
+        logger.error("_fa_manage_job error: %s", e)
+
+
 # ── One-shot auto-trade ──────────────────────────────────────────────────────
 #
 # Fires AT MOST ONE defined-risk structure on the armed date (config/auto_trade.json),
@@ -3971,6 +4104,9 @@ def _start_scheduler():
                   id="auto_trade",         replace_existing=True)
     sched.add_job(_auto_manage_job,  "cron", day_of_week="mon-fri", hour="9-15", minute="*/5",
                   id="auto_manage",        replace_existing=True)
+    # Fallen-angel exit: trim half at +20%, trail the rest — every 15 min RTH
+    sched.add_job(_fa_manage_job,    "cron", day_of_week="mon-fri", hour="9-15", minute="*/15",
+                  id="fa_manage",          replace_existing=True)
     # Monthly NAV statement — 1st of the month, 8 AM ET
     sched.add_job(_monthly_nav_job,  "cron", day=1, hour=8, minute=0,
                   id="monthly_nav",        replace_existing=True)

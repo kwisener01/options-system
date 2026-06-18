@@ -67,7 +67,7 @@ Stocks down 30%+ from 52-week high, near their multi-year floor, with early inst
 - **risk-sizes** the position — shares = `1% of equity ÷ (entry − stop)`, capped at 15% of equity per name, `max_positions` (4) concurrent, and total category exposure ≤ 40% of equity (the stock sleeve);
 - buys, then places a **protective sell-stop** at the broker — stop = the higher (first-triggered) of **−12%** or **just below the 52-week low**, so a held name is never unprotected.
 
-Exit (trim half at +20%, then a 15% trailing stop on the remainder) is handled by the fallen-angel position manager.
+**Exit** (automatic, `_fa_manage_job` every 15 min RTH): at +20%, sell half and place a 15% trailing stop on the remainder — the trailing stop goes on *before* the half is sold, so the kept shares are never unprotected.
 
 ### Value Watchlist
 Pre-defined watchlist of quality companies monitored for entry signals.

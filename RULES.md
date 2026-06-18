@@ -45,9 +45,9 @@ risk rule`. Status: `/risk`.
   **max 4** concurrent; total category ≤ **40%** of equity.
 - **Stop (broker-side, set on entry):** higher of **−12%** or **just below the
   52-week low** — a held name is never unprotected.
-- **Exit:** trim half at **+20%**, then a **15% trailing stop** on the remainder.
-  *(Entry + stop enforced; the trim/trail manager is pending — until then the
-  +20% trim is offered as a button by the 3:30 sweep.)*
+- **Exit (automatic, every 15 min RTH):** at **+20%**, sell half and put a **15%
+  trailing stop** on the remainder. The trailing stop is placed *before* the
+  half is sold, so the kept shares are never unprotected.
 
 ## 4. Options approvals & end-of-day management
 
@@ -75,8 +75,7 @@ risk rule`. Status: `/risk`.
 
 ## Not yet enforced (honest gaps)
 
-1. Fallen-angel **trim/trail exit** automation (entry stop *is* set).
-2. **Allocation caps** in §5 (targets only).
-3. **No validated backtest** of the live combined system — existing backtests
-   cover related-but-different strategy variants and model option P&L from price
-   moves, not real historical chains.
+1. **Allocation caps** in §5 (targets only).
+2. **No validated backtest** of the live GEX strategies — backtests cover
+   related-but-different variants and model option P&L from price moves, not real
+   historical chains. Trust live `/performance` + `/attribution` as the scorecard.
