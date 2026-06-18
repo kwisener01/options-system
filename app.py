@@ -2731,6 +2731,54 @@ def _cmd_positions(resp_url: str):
     _slack_respond(resp_url, "\n".join(sections))
 
 
+def _close_option_structure(ticker: str, resp_url: str):
+    """Close all open option legs for an underlying as one multi-leg order
+    (mirrors close_bwb.py). A closing order frees buying power, so it works even
+    when new opens are rejected for insufficient BP."""
+    from src.live.alpaca_options import _trading, get_mid_price
+    from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    try:
+        client = _trading()
+        legs_pos = [p for p in client.get_all_positions()
+                    if (getattr(p, "asset_class", "") in ("us_option", "option") or len(p.symbol) > 8)
+                    and p.symbol.upper().startswith(ticker)]
+        if not legs_pos:
+            _slack_respond(resp_url, f":x: No open option legs for `{ticker}`.")
+            return
+        net_debit, leg_objs, unreal = 0.0, [], 0.0
+        for pos in legs_pos:
+            mid = get_mid_price(pos.symbol)
+            if mid is None:
+                continue
+            qn, ratio = float(pos.qty), int(abs(float(pos.qty)))
+            unreal += float(getattr(pos, "unrealized_pl", 0) or 0)
+            if qn > 0:
+                side, intent, limit = OrderSide.SELL, PositionIntent.SELL_TO_CLOSE, round(mid * 0.95, 2)
+                net_debit -= limit * ratio * 100
+            else:
+                side, intent, limit = OrderSide.BUY, PositionIntent.BUY_TO_CLOSE, round(mid * 1.05, 2)
+                net_debit += limit * ratio * 100
+            leg_objs.append(OptionLegRequest(symbol=pos.symbol, ratio_qty=ratio,
+                                             side=side, position_intent=intent))
+        if not leg_objs:
+            _slack_respond(resp_url, f":x: Could not price `{ticker}` legs (market closed?).")
+            return
+        is_debit  = net_debit > 0
+        net_share = round(abs(net_debit) / 100, 2)
+        order = client.submit_order(LimitOrderRequest(
+            symbol=ticker, qty=1, side=OrderSide.BUY if is_debit else OrderSide.SELL,
+            type=OrderType.LIMIT, time_in_force=TimeInForce.DAY, limit_price=net_share,
+            legs=leg_objs, client_order_id=f"close-{ticker}-{datetime.now(ET):%Y%m%d%H%M%S}"))
+        icon = ":green_circle:" if unreal >= 0 else ":red_circle:"
+        _slack_respond(resp_url,
+            f"{icon} *Closing `{ticker}` spread* ({len(leg_objs)} legs)\n"
+            f"  Net {'debit' if is_debit else 'credit'} ${net_share:.2f}  |  P&L ${unreal:+,.2f}\n"
+            f"  Order ID: `{order.id}`  ·  check fill in Alpaca")
+    except Exception as e:
+        _slack_respond(resp_url, f":rotating_light: Close failed for `{ticker}`: {e}")
+
+
 def _cmd_close(ticker: str, resp_url: str):
     from src.live.alpaca_options import _trading
     from alpaca.trading.requests import MarketOrderRequest
@@ -2740,7 +2788,12 @@ def _cmd_close(ticker: str, resp_url: str):
         positions = client.get_all_positions()
         pos       = next((p for p in positions if p.symbol == ticker.upper()), None)
         if pos is None:
-            _slack_respond(resp_url, f":x: No open position found for `{ticker.upper()}`.")
+            # no stock position by that name — maybe it's an option structure
+            if any(getattr(p, "asset_class", "") in ("us_option", "option") or len(p.symbol) > 8
+                   for p in positions if p.symbol.upper().startswith(ticker.upper())):
+                _close_option_structure(ticker.upper(), resp_url)
+            else:
+                _slack_respond(resp_url, f":x: No open position found for `{ticker.upper()}`.")
             return
         qty    = float(pos.qty)
         unreal = float(getattr(pos, "unrealized_pl",   0) or 0)
