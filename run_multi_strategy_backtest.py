@@ -53,7 +53,7 @@ def parse_args():
     p.add_argument("--width",        type=float, default=0.01,   help="Spread width %% of spot (default 0.01)")
     p.add_argument("--max-vix",      type=float, default=25.0,   help="Hard skip above this VIX (default 25)")
     p.add_argument("--low-vol",      type=float, default=18.0,   help="Below this VIX, prefer iron condor (default 18)")
-    p.add_argument("--risk-pct",     type=float, default=0.10,   help="Max account %% at risk per trade (default 0.10)")
+    p.add_argument("--risk-pct",     type=float, default=_live_risk_pct(), help="Max account %% at risk per trade (default = live config/risk.json)")
     p.add_argument("--iv-premium",   type=float, default=1.20)
     p.add_argument("--dte",          type=int,   default=7,      help="7=weekly, 0=0DTE")
     p.add_argument("--take-profit",  type=float, default=0.50,   help="TP fraction (default 0.50 = 50%%)")
@@ -65,10 +65,19 @@ def parse_args():
 def download_spy(period):
     logger = logging.getLogger(__name__)
     logger.info("Downloading SPY (%s)", period)
-    raw = yf.download("SPY", period=period, interval="1d",
-                      auto_adjust=True, progress=False)
-    raw.columns = [c.lower() if isinstance(c, str) else c[0].lower() for c in raw.columns]
-    return raw.dropna(subset=["close"])
+    from src.live.yahoo import fetch_daily_ohlcv          # SSL-resilient
+    return fetch_daily_ohlcv("SPY", period).dropna(subset=["close"])
+
+
+def _live_risk_pct() -> float:
+    """Default the backtest's per-trade risk to the live config so the simulated
+    sizing matches what actually trades."""
+    import json
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "config", "risk.json")) as f:
+            return float(json.load(f).get("risk_pct_per_trade", 0.05))
+    except Exception:
+        return 0.05
 
 
 def metrics(result, args):

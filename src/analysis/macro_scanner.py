@@ -45,30 +45,10 @@ def _vix_signal(vix: float) -> str:
 
 
 def _download_macro_prices(period: str = "2y") -> Dict[str, pd.DataFrame]:
-    """Download OHLCV for all macro symbols. Returns {ticker: df_with_lowercase_cols}."""
-    tickers = MACRO_SYMBOLS  # already has ^VIX
-    raw = yf.download(
-        " ".join(tickers),
-        period=period,
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-        group_by="ticker",
-    )
-    prices: Dict[str, pd.DataFrame] = {}
-    for sym in tickers:
-        try:
-            df = raw[sym].copy() if len(tickers) > 1 else raw.copy()
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            df.columns = [c.lower() for c in df.columns]
-            df = df.dropna(subset=["close"])
-            df.index = pd.to_datetime(df.index)
-            if not df.empty:
-                prices[sym] = df
-        except Exception:
-            pass
-    return prices
+    """Download OHLCV for all macro symbols. Returns {ticker: df_with_lowercase_cols}.
+    Uses the SSL-resilient Yahoo chart fetch (yf.download fails in some envs)."""
+    from src.live.yahoo import download_many
+    return download_many(MACRO_SYMBOLS, period)
 
 
 def build_macro_history(period: str = "2y") -> pd.DataFrame:
