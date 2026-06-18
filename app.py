@@ -2934,6 +2934,8 @@ HELP_TEXT = (
     "`/autotrade on|off|status` — toggle / inspect the one-shot auto-trade\n"
     "`/risk`  — fund risk status (equity, day P&L vs limit, drawdown, budget)\n"
     "`/performance` — fund metrics: CAGR, max DD, Sharpe, win rate, profit factor\n"
+    "`/journal` — recent trade log with hold time, return-on-risk\n"
+    "`/attribution` — per-strategy win rate, P&L, contribution %\n"
     "`/eod`   — generate EOD P&L report now\n"
     "`/help`  — show this message"
 )
@@ -2968,6 +2970,8 @@ def slack_command():
         "performance": ":hourglass: Computing performance...",
         "perf":      ":hourglass: Computing performance...",
         "eod":       ":hourglass: Generating EOD report...",
+        "journal":   ":hourglass: Loading trade journal...",
+        "attribution": ":hourglass: Computing strategy attribution...",
         "help":      None,
     }
 
@@ -2993,6 +2997,8 @@ def slack_command():
         "performance": lambda: _cmd_performance(resp_url),
         "perf":      lambda: _cmd_performance(resp_url),
         "eod":       lambda: _cmd_eod(resp_url),
+        "journal":   lambda: _cmd_journal(resp_url),
+        "attribution": lambda: _cmd_attribution(resp_url),
     }
     threading.Thread(target=dispatch[command], daemon=True).start()
     return jsonify({"text": ack_map[command], "response_type": "in_channel"}), 200
@@ -3156,12 +3162,31 @@ def _cmd_performance(resp_url: str):
         _slack_respond(resp_url, f":rotating_light: Performance report failed: {e}")
 
 
+def _cmd_journal(resp_url: str):
+    try:
+        from src.analysis.trade_journal import fmt_journal
+        _slack_respond(resp_url, fmt_journal())
+    except Exception as e:
+        _slack_respond(resp_url, f":rotating_light: Trade journal failed: {e}")
+
+
+def _cmd_attribution(resp_url: str):
+    try:
+        from src.analysis.trade_journal import fmt_attribution
+        _slack_respond(resp_url, fmt_attribution())
+    except Exception as e:
+        _slack_respond(resp_url, f":rotating_light: Attribution report failed: {e}")
+
+
 def _monthly_nav_job():
     """1st of the month, 8 AM ET — fund NAV statement to Slack."""
     try:
         from src.notifications.slack_notifier import send_message
+        from src.analysis.trade_journal import fmt_attribution
         m = _performance_metrics()
-        send_message(_fmt_performance(m, title=f"Monthly NAV — {datetime.now(ET):%B %Y}"))
+        nav_text = _fmt_performance(m, title=f"Monthly NAV — {datetime.now(ET):%B %Y}")
+        attr_text = fmt_attribution()
+        send_message(f"{nav_text}\n\n{attr_text}")
         logger.info("Monthly NAV report sent")
     except Exception as e:
         logger.error("_monthly_nav_job error: %s", e)
