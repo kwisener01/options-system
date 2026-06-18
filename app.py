@@ -906,6 +906,34 @@ def api_orders():
         return jsonify({"ok": False, "error": str(e)[:300]}), 500
 
 
+@app.route("/api/diag")
+def api_diag():
+    """Account flags that explain order rejections (PDT, BP, blocks, suspensions)."""
+    try:
+        from src.live.alpaca_options import _trading
+        a = _trading().get_account()
+        def g(f):
+            v = getattr(a, f, None)
+            return str(v) if v is not None else None
+        return jsonify({"ok": True,
+            "status": g("status"),
+            "pattern_day_trader": g("pattern_day_trader"),
+            "daytrade_count": g("daytrade_count"),
+            "account_blocked": g("account_blocked"),
+            "trading_blocked": g("trading_blocked"),
+            "trade_suspended_by_user": g("trade_suspended_by_user"),
+            "transfers_blocked": g("transfers_blocked"),
+            "options_trading_level": g("options_trading_level"),
+            "options_buying_power": g("options_buying_power"),
+            "buying_power": g("buying_power"),
+            "daytrading_buying_power": g("daytrading_buying_power"),
+            "regt_buying_power": g("regt_buying_power"),
+            "cash": g("cash"), "equity": g("equity"),
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:300]}), 500
+
+
 @app.route("/api/positions")
 def api_positions():
     """Open positions (symbol, qty, asset class) — diagnostic, no prices."""
