@@ -877,6 +877,35 @@ def api_mode():
     return jsonify(out)
 
 
+@app.route("/api/orders")
+def api_orders():
+    """Recent orders' status + reject reason (diagnostic). No sizes/prices."""
+    try:
+        from src.live.alpaca_options import _trading
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        orders = _trading().get_orders(filter=GetOrdersRequest(
+            status=QueryOrderStatus.ALL, limit=15,
+            after=datetime.now(ET) - timedelta(days=3)))
+        out = []
+        for o in orders:
+            reason = None
+            for f in ("rejected_reason", "reject_reason", "failure_reason"):
+                v = getattr(o, f, None)
+                if v:
+                    reason = str(v); break
+            out.append({
+                "coid":   getattr(o, "client_order_id", "") or "",
+                "symbol": getattr(o, "symbol", ""),
+                "status": str(getattr(o, "status", "")),
+                "reason": reason,
+                "submitted": str(getattr(o, "submitted_at", "")),
+            })
+        return jsonify({"ok": True, "orders": out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:300]}), 500
+
+
 @app.route("/api/slack", methods=["POST"])
 def api_slack():
     try:
