@@ -2454,11 +2454,14 @@ def _execute_entry(rec: dict, resp_url: str):
             for lg in priced
         ]
         client = _trading()
+        _strat = rec.get("strategy", "opt")
+        _coid  = f"{_strat}-{rec['underlying']}-{datetime.now(ET):%Y%m%d}-{tid[:4]}"
         order_obj = client.submit_order(LimitOrderRequest(
             symbol=rec["underlying"], qty=1,
             side=OrderSide.SELL if is_credit else OrderSide.BUY,
             type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
             limit_price=round(abs(live_net), 2), legs=leg_objs,
+            client_order_id=_coid,
         ))
         pending_store.update_status(tid, "taken", order_id=str(order_obj.id), live_net=live_net)
         word = "credit" if is_credit else "debit"
@@ -2915,6 +2918,14 @@ def _cmd_risk(resp_url: str):
         _slack_respond(resp_url, f":rotating_light: Risk status failed: {e}")
 
 
+def _cmd_attribution(resp_url: str):
+    """`/attribution` — realized P&L by strategy, from Alpaca order tags."""
+    try:
+        _slack_respond(resp_url, _fmt_attribution(_attribution_report()))
+    except Exception as e:
+        _slack_respond(resp_url, f":rotating_light: Attribution failed: {e}")
+
+
 def _cmd_autotrade(arg: str, resp_url: str):
     """`/autotrade on|off|status` — toggle or inspect the one-shot auto-trade."""
     arg = (arg or "").strip().lower()
@@ -2950,7 +2961,7 @@ def _cmd_autotrade(arg: str, resp_url: str):
         "  Toggle: `/autotrade on` · `/autotrade off`",
     ]
     try:
-        if _auto_already_fired(f"auto-{today.replace('-', '')}"):
+        if _auto_fired_today(today.replace('-', '')):
             lines.append("  :heavy_check_mark: *Already traded today.*")
     except Exception:
         pass
@@ -2973,6 +2984,7 @@ HELP_TEXT = (
     "`/autotrade on|off|status` — toggle / inspect the one-shot auto-trade\n"
     "`/risk`  — fund risk status (equity, day P&L vs limit, drawdown, budget)\n"
     "`/performance` — fund metrics: CAGR, max DD, Sharpe, win rate, profit factor\n"
+    "`/attribution` — realized P&L by strategy (which strategy makes money)\n"
     "`/eod`   — generate EOD P&L report now\n"
     "`/help`  — show this message"
 )
@@ -3006,6 +3018,8 @@ def slack_command():
         "risk":      ":hourglass: Checking risk status...",
         "performance": ":hourglass: Computing performance...",
         "perf":      ":hourglass: Computing performance...",
+        "attribution": ":hourglass: Computing attribution...",
+        "attr":      ":hourglass: Computing attribution...",
         "eod":       ":hourglass: Generating EOD report...",
         "help":      None,
     }
@@ -3031,6 +3045,8 @@ def slack_command():
         "risk":      lambda: _cmd_risk(resp_url),
         "performance": lambda: _cmd_performance(resp_url),
         "perf":      lambda: _cmd_performance(resp_url),
+        "attribution": lambda: _cmd_attribution(resp_url),
+        "attr":      lambda: _cmd_attribution(resp_url),
         "eod":       lambda: _cmd_eod(resp_url),
     }
     threading.Thread(target=dispatch[command], daemon=True).start()
@@ -3239,6 +3255,118 @@ def _monthly_nav_job():
         logger.info("Monthly NAV report sent")
     except Exception as e:
         logger.error("_monthly_nav_job error: %s", e)
+
+
+# ── Per-strategy attribution ─────────────────────────────────────────────────
+#
+# Which strategy actually makes money. Reconstructed from Alpaca filled orders
+# (durable) using the strategy encoded in each entry's client_order_id, netting
+# each (underlying, expiry) structure's cash flows. Realized = round-tripped
+# structures (legs no longer open); covers trades placed since strategy tagging.
+
+def _coid_strategy(coid: str):
+    """Strategy name from an ENTRY client_order_id, or None for closes/unknown."""
+    if not coid or coid.startswith(("autoclose", "fastop", "fatrim", "fatrail")):
+        return None
+    parts = coid.split("-")
+    if parts[0] == "auto" and len(parts) >= 3:
+        return parts[1]                       # auto-<strategy>-<date>
+    if parts[0] == "fa":
+        return "fallen_angel"                 # fa-<ticker>-<date>
+    if parts[0] in ("condor", "bull_put", "bwb", "fly"):
+        return parts[0]
+    return None
+
+
+def _order_cash_flow(o) -> float:
+    """Signed net dollars of a filled order: SELL +, BUY −. Options ×100. Sums
+    legs for multi-leg orders. Over a round-trip, the net = realized P&L."""
+    legs  = getattr(o, "legs", None)
+    items = list(legs) if legs else [o]
+    total = 0.0
+    for it in items:
+        price = float(getattr(it, "filled_avg_price", 0) or 0)
+        qty   = float(getattr(it, "filled_qty", 0) or 0)
+        if not price or not qty:
+            continue
+        sym  = getattr(it, "symbol", "") or ""
+        mult = 100 if len(sym) > 8 else 1     # OCC option symbols are long
+        sign = 1 if "sell" in str(getattr(it, "side", "")).lower() else -1
+        total += sign * price * qty * mult
+    return round(total, 2)
+
+
+def _order_key(o):
+    """(underlying, expiry) for an options order, or (symbol, 'stock') for equity."""
+    legs = getattr(o, "legs", None)
+    sym  = (getattr(legs[0], "symbol", None) if legs else None) or getattr(o, "symbol", "") or ""
+    if len(sym) > 8:
+        pr = _occ_parse(sym)
+        if pr:
+            return (pr[0], str(pr[1]))
+    return (sym, "stock")
+
+
+def _attribution(norm: list, open_keys: set) -> dict:
+    """Pure aggregator. norm: [{key,strategy,flow}]. Groups by structure key,
+    attributes by the entry's strategy, sums realized P&L for closed structures."""
+    groups: dict = {}
+    for o in norm:
+        g = groups.setdefault(o["key"], {"strategy": None, "flow": 0.0})
+        g["flow"] += o["flow"]
+        if o.get("strategy"):
+            g["strategy"] = o["strategy"]
+    out: dict = {}
+    for key, g in groups.items():
+        s = out.setdefault(g["strategy"] or "untagged",
+                           {"realized": 0.0, "trades": 0, "wins": 0, "open": 0})
+        if key in open_keys:
+            s["open"] += 1
+        else:
+            s["realized"] = round(s["realized"] + g["flow"], 2)
+            s["trades"]  += 1
+            if g["flow"] > 0:
+                s["wins"] += 1
+    return out
+
+
+def _attribution_report(days: int = 120) -> dict:
+    from src.live.alpaca_options import _trading
+    from alpaca.trading.requests import GetOrdersRequest
+    from alpaca.trading.enums import QueryOrderStatus
+    client = _trading()
+    orders = client.get_orders(filter=GetOrdersRequest(
+        status=QueryOrderStatus.ALL, limit=500,
+        after=datetime.now(ET) - timedelta(days=days)))
+    open_keys = set()
+    for p in client.get_all_positions():
+        sym = p.symbol
+        pr  = _occ_parse(sym) if len(sym) > 8 else None
+        open_keys.add((pr[0], str(pr[1])) if pr else (sym, "stock"))
+    norm = []
+    for o in orders:
+        if str(getattr(o, "status", "")).lower() != "filled":
+            continue
+        flow = _order_cash_flow(o)
+        if flow == 0:
+            continue
+        norm.append({"key": _order_key(o),
+                     "strategy": _coid_strategy(getattr(o, "client_order_id", "") or ""),
+                     "flow": flow})
+    return _attribution(norm, open_keys)
+
+
+def _fmt_attribution(rep: dict) -> str:
+    if not rep:
+        return ":bar_chart: *Strategy attribution* — no trades yet (tagging starts now)."
+    lines = [":bar_chart: *Strategy attribution*  _realized P&L by strategy (closed round-trips)_"]
+    for strat, s in sorted(rep.items(), key=lambda kv: -kv[1]["realized"]):
+        wr   = (s["wins"] / s["trades"] * 100) if s["trades"] else 0
+        icon = ":green_circle:" if s["realized"] >= 0 else ":red_circle:"
+        lines.append(f"  {icon} *{strat}*  ${s['realized']:+,.0f}  "
+                     f"({s['trades']} closed · {wr:.0f}% win · {s['open']} open)")
+    lines.append("  _realized = net of round-tripped structures; tagged trades only_")
+    return "\n".join(lines)
 
 
 # ── Fallen-angel stock rules ─────────────────────────────────────────────────
@@ -3480,14 +3608,24 @@ def _auto_trade_config() -> dict:
     return cfg
 
 
-def _auto_already_fired(coid: str) -> bool:
-    """True if an order with this client_order_id already exists at Alpaca — the
-    durable, restart-proof 'already traded today' check."""
+def _auto_fired_today(date_tag: str) -> bool:
+    """True if today's auto-trade already placed — scans Alpaca for an entry order
+    tagged `auto-<strategy>-<date_tag>`. Durable / restart-proof, and strategy-
+    agnostic (the strategy is encoded in the tag for attribution)."""
     from src.live.alpaca_options import _trading
+    from alpaca.trading.requests import GetOrdersRequest
+    from alpaca.trading.enums import QueryOrderStatus
     try:
-        return _trading().get_order_by_client_id(coid) is not None
+        orders = _trading().get_orders(filter=GetOrdersRequest(
+            status=QueryOrderStatus.ALL, limit=100,
+            after=datetime.now(ET) - timedelta(days=2)))
+        for o in orders:
+            c = getattr(o, "client_order_id", "") or ""
+            if c.startswith("auto-") and not c.startswith("autoclose") and c.endswith(date_tag):
+                return True
     except Exception:
-        return False   # not found (or transient) → treat as not yet fired
+        pass
+    return False
 
 
 def _auto_pick_candidate(max_loss: float):
@@ -3622,8 +3760,8 @@ def _auto_trade_job():
         if now < dt_time(10, 0) or now >= dt_time(12, 35):
             return
 
-        coid = f"auto-{today.replace('-', '')}"
-        if _auto_already_fired(coid):
+        date_tag = today.replace('-', '')
+        if _auto_fired_today(date_tag):
             return   # already placed today (survives restarts via Alpaca)
 
         from src.notifications.slack_notifier import send_message
@@ -3667,7 +3805,7 @@ def _auto_trade_job():
                              f"${max_loss:.0f} max-loss gate by 12:30 ET. No trade today.")
             return   # otherwise keep checking next tick
 
-        res = _auto_place(cand, coid)
+        res = _auto_place(cand, f"auto-{cand['strategy']}-{date_tag}")
         if not res["ok"]:
             logger.info("Auto-trade: stood down this tick — %s", res["reason"])
             return   # drift may resolve; retry next tick (idempotency still holds)

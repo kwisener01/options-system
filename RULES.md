@@ -66,8 +66,8 @@ risk rule`. Status: `/risk`.
 
 - **Outside capital = regulated.** These rules assume **own capital only**.
   Managing other people's money requires registration (RIA/CPO) + legal counsel.
-- **Reporting:** `/risk`, `/performance` (`/perf`), monthly NAV statement (1st,
-  8 AM ET), EOD recap.
+- **Reporting:** `/risk`, `/performance` (`/perf`), `/attribution` (realized P&L
+  by strategy), monthly NAV statement (1st, 8 AM ET), EOD recap.
 - **Uptime:** UptimeRobot + a second pinger keep the scheduler alive during market
   hours — required for the auto-exits to fire.
 

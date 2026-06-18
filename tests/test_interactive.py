@@ -191,6 +191,37 @@ def test_vix_derisk():
     print("ok  vix de-risk (size factor + crisis stand-down)")
 
 
+def test_attribution():
+    import app
+    from types import SimpleNamespace as NS
+    # strategy parsed from entry coid; closes/blank → None
+    assert app._coid_strategy("auto-condor-20260618") == "condor"
+    assert app._coid_strategy("fa-INTC-20260618") == "fallen_angel"
+    assert app._coid_strategy("bull_put-KO-20260618-ab12") == "bull_put"
+    assert app._coid_strategy("autoclose-SPY-2026-06-20") is None
+    assert app._coid_strategy("") is None
+
+    # signed cash flow of a put credit spread entry: sell 2.00 / buy 1.00 → +$100
+    entry = NS(legs=[NS(symbol="SPY260620P00500000", side="sell", filled_avg_price=2.0, filled_qty=1),
+                     NS(symbol="SPY260620P00490000", side="buy",  filled_avg_price=1.0, filled_qty=1)])
+    assert app._order_cash_flow(entry) == 100.0
+    assert app._order_key(entry) == ("SPY", "2026-06-20")
+    # close for 0.30 net debit → −$30
+    close = NS(legs=[NS(symbol="SPY260620P00500000", side="buy",  filled_avg_price=0.40, filled_qty=1),
+                     NS(symbol="SPY260620P00490000", side="sell", filled_avg_price=0.10, filled_qty=1)])
+    assert app._order_cash_flow(close) == -30.0
+
+    # round-trip nets +$70 realized, attributed to condor
+    norm = [{"key": ("SPY", "2026-06-20"), "strategy": "condor", "flow": 100.0},
+            {"key": ("SPY", "2026-06-20"), "strategy": None,     "flow": -30.0}]
+    rep = app._attribution(norm, open_keys=set())
+    assert rep["condor"]["realized"] == 70.0 and rep["condor"]["trades"] == 1 and rep["condor"]["wins"] == 1
+    # still open → counts as open, not realized
+    rep2 = app._attribution(norm, open_keys={("SPY", "2026-06-20")})
+    assert rep2["condor"]["open"] == 1 and rep2["condor"]["trades"] == 0
+    print("ok  attribution (coid parse / cash flow / round-trip P&L)")
+
+
 if __name__ == "__main__":
     test_pending_store()
     test_blocks()
@@ -201,4 +232,5 @@ if __name__ == "__main__":
     test_performance_metrics()
     test_fa_sizing()
     test_vix_derisk()
+    test_attribution()
     print("\nALL PASS")

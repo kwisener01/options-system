@@ -282,6 +282,7 @@ Set all `.env` variables in Render's Environment dashboard. No redeploy needed f
 | `/autotrade on\|off\|status` | Toggle or inspect the one-shot auto-trade (env `AUTO_TRADE_KILL` is the hard override) |
 | `/risk` | Fund risk status: equity, day P&L vs limit, drawdown vs high-water mark, per-trade budget |
 | `/performance` (`/perf`) | Fund metrics: total/30d/CAGR returns, max drawdown, Sharpe, Sortino, win rate, profit factor |
+| `/attribution` (`/attr`) | Realized P&L by strategy — reconciled from Alpaca order tags (which strategy makes money) |
 | `/positions` | Current open positions |
 | `/place TICKER SHORT LONG EXPIRY [QTY]` | Place a bull put credit spread |
 | `/close_position TICKER` | Market-sell a stock/ETF position |
