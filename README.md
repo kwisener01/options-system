@@ -140,6 +140,7 @@ Fund-style capital protection that gates **every** new entry — the auto-trade 
 - **Daily-loss circuit breaker** — blocks new entries once today's P&L is down `daily_loss_limit_pct` (default 5%) vs. yesterday's close.
 - **Drawdown guard** — blocks new entries while equity is `max_drawdown_pct` (default 15%) below its high-water mark.
 - **VIX de-risk** — half size at VIX ≥ `vix_half_size` (18), full stand-down ≥ `vix_stand_down` (25). Backtested (10y) to cut max drawdown −38% → −14% while raising Sharpe.
+- **Allocation caps** — **cash floor** (≥ `cash_floor_pct`, 30%) blocks all new entries when dry powder runs low; **stock-sleeve cap** (≤ `stock_cap_pct`, 40%) caps fallen-angel exposure. Their sum leaves ~25% for options. `/allocation` shows the live split.
 
 A blocked button entry replies `🛑 Blocked by risk rule — …`; the auto-trade posts a halt and stands down. `/risk` shows live status (equity, day P&L vs limit, drawdown, per-trade budget). Defaults are starting values for a small account — tune in `config/risk.json`.
 
@@ -283,6 +284,7 @@ Set all `.env` variables in Render's Environment dashboard. No redeploy needed f
 | `/risk` | Fund risk status: equity, day P&L vs limit, drawdown vs high-water mark, per-trade budget |
 | `/performance` (`/perf`) | Fund metrics: total/30d/CAGR returns, max drawdown, Sharpe, Sortino, win rate, profit factor |
 | `/attribution` (`/attr`) | Realized P&L by strategy — reconciled from Alpaca order tags (which strategy makes money) |
+| `/allocation` (`/alloc`) | Stock / option / cash split vs. the cash floor + stock cap |
 | `/positions` | Current open positions |
 | `/place TICKER SHORT LONG EXPIRY [QTY]` | Place a bull put credit spread |
 | `/close_position TICKER` | Market-sell a stock/ETF position |

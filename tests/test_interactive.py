@@ -129,7 +129,11 @@ def test_risk_gate():
     assert app._risk_gate(ok_snap, cfg, 101)[0] is False
     # disabled → always allowed
     assert app._risk_gate({**ok_snap, "day_pl_pct": -0.5}, {**cfg, "enabled": False}, None)[0] is True
-    print("ok  risk gate (daily-loss / drawdown / per-trade budget)")
+    # cash floor: below the minimum blocks new entries
+    cfc = {**cfg, "cash_floor_pct": 0.30}
+    assert app._risk_gate({**ok_snap, "cash_pct": 0.20}, cfc, None)[0] is False
+    assert app._risk_gate({**ok_snap, "cash_pct": 0.45}, cfc, None)[0] is True
+    print("ok  risk gate (daily-loss / drawdown / cash-floor / per-trade budget)")
 
 
 def test_performance_metrics():

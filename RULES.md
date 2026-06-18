@@ -57,10 +57,19 @@ risk rule`. Status: `/risk`.
   / stop at −8%** and **options ≤ 3 DTE** review — each with a button.
 - **4:05 PM:** post-close P&L recap only (no actions — market closed).
 
-## 5. Allocation targets — *guidance, not yet auto-enforced*
+## 5. Allocation caps (`config/risk.json`)
 
-- **~40% stocks / ~25% options-at-risk / ~35% cash.** Never exceed ~50% buying-
-  power usage. Cash is ammunition for adjustments, assignment, and dips.
+Target mix **~40% stocks / ~25% options-at-risk / ~35% cash**. Enforced by two
+exactly-computable caps (their sum *leaves* ≤30% for options, so the mix falls
+out — no flaky "options-at-risk" gauge needed):
+
+| Cap | Default | Effect |
+|-----|---------|--------|
+| **Cash floor** | ≥ 30% of equity | Blocks **all** new entries when cash is too low — the master "keep dry powder" rule |
+| **Stock-sleeve cap** | ≤ 40% of equity | Blocks fallen-angel buys that would push total stock past it |
+
+Cash is ammunition for adjustments, assignment, and dips. `/allocation` shows the
+live split vs. the caps.
 
 ## 6. Operating discipline
 
@@ -75,7 +84,9 @@ risk rule`. Status: `/risk`.
 
 ## Not yet enforced (honest gaps)
 
-1. **Allocation caps** in §5 (targets only).
-2. **No validated backtest** of the live GEX strategies — backtests cover
+1. **No validated backtest** of the live GEX strategies — backtests cover
    related-but-different variants and model option P&L from price moves, not real
    historical chains. Trust live `/performance` + `/attribution` as the scorecard.
+2. **Options-at-risk** is bounded *indirectly* (cash floor + stock cap leave the
+   room) rather than measured per-structure — a precise gauge needs max-loss
+   reconstruction from chains.

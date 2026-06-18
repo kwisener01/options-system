@@ -2926,6 +2926,14 @@ def _cmd_attribution(resp_url: str):
         _slack_respond(resp_url, f":rotating_light: Attribution failed: {e}")
 
 
+def _cmd_allocation(resp_url: str):
+    """`/allocation` — stock / option / cash split vs the caps."""
+    try:
+        _slack_respond(resp_url, _fmt_allocation(_allocation_snapshot(), _risk_config()))
+    except Exception as e:
+        _slack_respond(resp_url, f":rotating_light: Allocation failed: {e}")
+
+
 def _cmd_autotrade(arg: str, resp_url: str):
     """`/autotrade on|off|status` — toggle or inspect the one-shot auto-trade."""
     arg = (arg or "").strip().lower()
@@ -2985,6 +2993,7 @@ HELP_TEXT = (
     "`/risk`  — fund risk status (equity, day P&L vs limit, drawdown, budget)\n"
     "`/performance` — fund metrics: CAGR, max DD, Sharpe, win rate, profit factor\n"
     "`/attribution` — realized P&L by strategy (which strategy makes money)\n"
+    "`/allocation` — stock / option / cash split vs caps\n"
     "`/eod`   — generate EOD P&L report now\n"
     "`/help`  — show this message"
 )
@@ -3020,6 +3029,8 @@ def slack_command():
         "perf":      ":hourglass: Computing performance...",
         "attribution": ":hourglass: Computing attribution...",
         "attr":      ":hourglass: Computing attribution...",
+        "allocation": ":hourglass: Computing allocation...",
+        "alloc":     ":hourglass: Computing allocation...",
         "eod":       ":hourglass: Generating EOD report...",
         "help":      None,
     }
@@ -3047,6 +3058,8 @@ def slack_command():
         "perf":      lambda: _cmd_performance(resp_url),
         "attribution": lambda: _cmd_attribution(resp_url),
         "attr":      lambda: _cmd_attribution(resp_url),
+        "allocation": lambda: _cmd_allocation(resp_url),
+        "alloc":     lambda: _cmd_allocation(resp_url),
         "eod":       lambda: _cmd_eod(resp_url),
     }
     threading.Thread(target=dispatch[command], daemon=True).start()
@@ -3108,11 +3121,13 @@ def _risk_snapshot() -> dict:
         vix = (get_data().get("vix") or {}).get("now")
     except Exception:
         vix = None
+    cash = float(getattr(acct, "cash", 0) or 0)
     return {
         "equity": equity, "last_equity": last, "day_pl": day_pl,
         "day_pl_pct": (day_pl / last) if last else 0.0,
         "hwm": hwm, "drawdown_pct": ((hwm - equity) / hwm) if hwm else 0.0,
         "vix": vix,
+        "cash": cash, "cash_pct": (cash / equity) if equity else 1.0,
     }
 
 
@@ -3143,6 +3158,10 @@ def _risk_gate(snap: dict, cfg: dict, max_loss: float | None = None) -> tuple[bo
     vix, sd = snap.get("vix"), cfg.get("vix_stand_down")
     if vix is not None and sd and vix >= sd:
         return False, f"VIX {vix:.1f} ≥ {sd:.0f} — crisis-vol stand-down (no new premium)"
+    cf = cfg.get("cash_floor_pct")
+    if cf and snap.get("cash_pct") is not None and snap["cash_pct"] < cf:
+        return False, (f"cash floor — {snap['cash_pct']*100:.0f}% cash < {cf*100:.0f}% min "
+                       f"(keep dry powder)")
     if max_loss is not None:
         budget = cfg["risk_pct_per_trade"] * snap["equity"]
         if max_loss > budget + 1e-9:
@@ -3159,6 +3178,40 @@ def _risk_check_entry(max_loss: float | None = None) -> tuple[bool, str]:
     except Exception as e:
         logger.warning("risk check failed (allowing): %s", e)
         return True, "risk check unavailable"
+
+
+def _allocation_snapshot() -> dict:
+    """Stock / option / cash split of the book, from Alpaca positions + account."""
+    from src.live.alpaca_options import _trading
+    client = _trading()
+    acct   = client.get_account()
+    equity = float(acct.equity)
+    cash   = float(getattr(acct, "cash", 0) or 0)
+    stock_val = opt_val = 0.0
+    for p in client.get_all_positions():
+        mv = abs(float(getattr(p, "market_value", 0) or 0))
+        if "option" in str(getattr(p, "asset_class", "") or "") or len(p.symbol) > 8:
+            opt_val += mv
+        else:
+            stock_val += mv
+    e = equity or 1.0
+    return {"equity": equity, "cash": cash, "stock_value": stock_val, "option_value": opt_val,
+            "cash_pct": cash / e, "stock_pct": stock_val / e, "option_pct": opt_val / e,
+            "deployed_pct": (equity - cash) / e}
+
+
+def _fmt_allocation(snap: dict, cfg: dict) -> str:
+    cf, sc = cfg.get("cash_floor_pct", 0.30), cfg.get("stock_cap_pct", 0.40)
+    cash_ok  = ":green_circle:" if snap["cash_pct"]  >= cf else ":red_circle:"
+    stock_ok = ":green_circle:" if snap["stock_pct"] <= sc else ":red_circle:"
+    return "\n".join([
+        ":balance_scale: *Allocation*",
+        f"  Equity ${snap['equity']:,.2f}",
+        f"  {cash_ok} Cash:    {snap['cash_pct']*100:4.0f}%  _(floor {cf*100:.0f}%)_  ${snap['cash']:,.0f}",
+        f"  {stock_ok} Stocks:  {snap['stock_pct']*100:4.0f}%  _(cap {sc*100:.0f}%)_  ${snap['stock_value']:,.0f}",
+        f"  :large_blue_circle: Options (mkt): {snap['option_pct']*100:4.0f}%  ${snap['option_value']:,.0f}",
+        f"  Deployed {snap['deployed_pct']*100:.0f}%  ·  target ~40 stock / ~25 opt-at-risk / ~35 cash",
+    ])
 
 
 # ── Performance reporting (fund metrics) ─────────────────────────────────────
@@ -3516,6 +3569,13 @@ def _execute_stock_buy(rec: dict, resp_url: str):
         room = max(cfg["max_category_pct"] * equity - fa_val, 0)
         if shares * entry > room:
             shares = int(room // entry); sz["capped_by"] = "category_pct"
+        # total stock-sleeve cap (allocation rule, all equity positions)
+        stock_cap = _risk_config().get("stock_cap_pct", 0.40)
+        total_stock = sum(abs(float(getattr(p, "market_value", 0) or 0))
+                          for s, p in positions.items() if len(s) <= 8)
+        room_stk = max(stock_cap * equity - total_stock, 0)
+        if shares * entry > room_stk:
+            shares = int(room_stk // entry); sz["capped_by"] = "stock_sleeve"
         # cash cap
         if shares * entry > cash:
             shares = int(cash // entry); sz["capped_by"] = "cash"
