@@ -3,5 +3,7 @@
   "risk_pct_per_trade": 0.05,
   "daily_loss_limit_pct": 0.05,
   "max_drawdown_pct": 0.15,
+  "vix_half_size": 18,
+  "vix_stand_down": 25,
   "note": "Fund risk rules. risk_pct_per_trade: per-trade max-loss budget as a fraction of equity (scales as the account grows; the auto-trade also keeps its own hard $ cap, effective = min of the two). daily_loss_limit_pct: halt NEW entries once today's P&L is down this fraction of yesterday's close. max_drawdown_pct: halt NEW entries while equity is this far below its high-water mark (from Alpaca portfolio history). These are STARTING values for a small account — review and tune. Equity/P&L/HWM come from Alpaca (durable, restart-proof)."
 }

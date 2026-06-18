@@ -106,6 +106,7 @@ class MultiStrategyEngine:
         vol_window:         int   = 20,
         dte:                int   = 7,
         take_profit_pct:    Optional[float] = 0.50,
+        vix_half_size:      float = 999.0,    # at/above this VIX, halve position size (de-risk)
     ):
         self.initial_capital     = initial_capital
         self.short_otm_pct       = short_otm_pct
@@ -127,6 +128,7 @@ class MultiStrategyEngine:
         self.vol_window          = vol_window
         self.dte                 = dte
         self.take_profit_pct     = take_profit_pct
+        self.vix_half_size       = vix_half_size
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -584,7 +586,10 @@ class MultiStrategyEngine:
                     prev_vix = vix
                     continue
 
-                contracts = max(int(account * self.max_risk_pct // (max_risk * _SHARES)), 1)
+                # VIX de-risk: halve size in the elevated-vol band (full stand-down
+                # above max_vix_entry is already handled by _select → CASH).
+                size_factor = 0.5 if vix >= self.vix_half_size else 1.0
+                contracts = max(int(account * self.max_risk_pct * size_factor // (max_risk * _SHARES)), 1)
 
                 # Find expiry
                 if self.dte == 0:

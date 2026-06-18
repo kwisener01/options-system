@@ -51,7 +51,8 @@ def parse_args():
     p.add_argument("--capital",      type=float, default=10_000.0)
     p.add_argument("--otm",          type=float, default=0.02,   help="Short OTM%% for credit spreads (default 0.02)")
     p.add_argument("--width",        type=float, default=0.01,   help="Spread width %% of spot (default 0.01)")
-    p.add_argument("--max-vix",      type=float, default=25.0,   help="Hard skip above this VIX (default 25)")
+    p.add_argument("--max-vix",      type=float, default=25.0,   help="Stand down (cash) above this VIX (default 25)")
+    p.add_argument("--vix-half",     type=float, default=999.0,  help="Halve position size at/above this VIX (default off; 18 = live de-risk)")
     p.add_argument("--low-vol",      type=float, default=18.0,   help="Below this VIX, prefer iron condor (default 18)")
     p.add_argument("--risk-pct",     type=float, default=_live_risk_pct(), help="Max account %% at risk per trade (default = live config/risk.json)")
     p.add_argument("--iv-premium",   type=float, default=1.20)
@@ -215,6 +216,7 @@ def main():
         low_vol_threshold=args.low_vol,
         dte=args.dte,
         take_profit_pct=args.take_profit,
+        vix_half_size=args.vix_half,
     )
 
     result = engine.run(spy, macro)

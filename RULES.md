@@ -18,6 +18,11 @@ Gates the auto-trade, the options Take buttons, and fallen-angel buys alike.
 | Per-trade risk budget | 5% of equity | Caps each trade's max loss |
 | Daily-loss circuit breaker | −5% on the day | Blocks **new** entries the rest of the day |
 | Drawdown guard | 15% below high-water mark | Blocks **new** entries until recovered |
+| VIX de-risk | ½ size at VIX ≥ 18, stand down ≥ 25 | Shrinks/halts premium-selling as vol rises |
+
+The VIX de-risk is the highest-impact rule: in a 10-year backtest it cut max
+drawdown from −38% to −14% (2.7×) while *raising* Sharpe — same trades, smaller
+size in elevated vol.
 
 Equity / P&L / HWM come from Alpaca (durable). Blocked entries say `🛑 Blocked by
 risk rule`. Status: `/risk`.

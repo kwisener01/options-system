@@ -173,6 +173,24 @@ def test_fa_sizing():
     print("ok  fallen-angel sizing (stop / risk-based shares / caps)")
 
 
+def test_vix_derisk():
+    import app
+    cfg = {"vix_half_size": 18, "vix_stand_down": 25}
+    assert app._vix_size_factor(12, cfg) == 1.0      # calm → full
+    assert app._vix_size_factor(18, cfg) == 0.5      # band → half
+    assert app._vix_size_factor(22, cfg) == 0.5
+    assert app._vix_size_factor(25, cfg) == 0.0      # crisis → stand down
+    assert app._vix_size_factor(30, cfg) == 0.0
+    assert app._vix_size_factor(None, cfg) == 1.0    # no data → full
+    # risk gate stands down on crisis VIX
+    rc = {"enabled": True, "risk_pct_per_trade": 0.05, "daily_loss_limit_pct": 0.05,
+          "max_drawdown_pct": 0.15, "vix_stand_down": 25}
+    base = {"equity": 2000, "day_pl_pct": -0.01, "drawdown_pct": 0.02}
+    assert app._risk_gate({**base, "vix": 30}, rc, None)[0] is False
+    assert app._risk_gate({**base, "vix": 15}, rc, None)[0] is True
+    print("ok  vix de-risk (size factor + crisis stand-down)")
+
+
 if __name__ == "__main__":
     test_pending_store()
     test_blocks()
@@ -182,4 +200,5 @@ if __name__ == "__main__":
     test_risk_gate()
     test_performance_metrics()
     test_fa_sizing()
+    test_vix_derisk()
     print("\nALL PASS")
