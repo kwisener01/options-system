@@ -27,7 +27,7 @@ app.py              Flask web server + APScheduler (single process)
 ├── every 5 min    → _spy_trade_monitor_job()   SPY trade + rotation (alert on CHANGE only)
 ├── 3:30 PM ET     → _manage_5050_job()          Actionable sweep: 50% targets + stock trim/stop + expiry (buttons)
 ├── 4:05 PM ET     → _eod_report_job()           Post-close P&L recap (no actions — market's closed)
-├── 10:00-12:30    → _auto_trade_job()           One-shot auto-trade on the armed date (best passing, ≤ max_loss)
+├── 10:00-12:30    → _auto_trade_job()           Recurring auto-trade (one defined-risk trade/market day, ≤ max_loss)
 └── every 5 min    → _auto_manage_job()          Auto-exit the auto-trade: 50% profit / 1-DTE force-close
 
 src/
@@ -108,7 +108,7 @@ Computed as `Gamma × OI × 100 × Spot²`, **calls positive / puts negative** (
 | every 5 min | SPY trade monitor | High-prob SPY trade + stock rotation |
 | 3:30 PM | Position check | 50% profit targets + stock trim/stop-loss + near-expiry options, each with a Close/Trim button (market still open) |
 | 4:05 PM | EOD report | Post-close P&L + position recap only — actions already fired at 3:30 |
-| 10:00 AM–12:30 PM | Auto-trade | One-shot defined-risk entry on the armed date; stands down at 12:30 if nothing qualifies |
+| 10:00 AM–12:30 PM | Auto-trade | Recurring: one defined-risk entry per market day; stands down at 12:30 if nothing qualifies |
 | every 5 min | Auto-manage | Auto-exits the auto-trade at 50% profit or force-closes at 1 DTE / 3:30 PM |
 
 ### 3:30 PM Position Check (was Manage-at-50%)
@@ -144,11 +144,11 @@ Fund-style capital protection that gates **every** new entry — the auto-trade 
 
 A blocked button entry replies `🛑 Blocked by risk rule — …`; the auto-trade posts a halt and stands down. `/risk` shows live status (equity, day P&L vs limit, drawdown, per-trade budget). Defaults are starting values for a small account — tune in `config/risk.json`.
 
-### One-Shot Auto-Trade (config/auto_trade.json)
+### Recurring Auto-Trade (config/auto_trade.json)
 
-Places **at most one** defined-risk structure automatically on a single armed date — no button tap. Guardrails:
+Places **one** defined-risk structure automatically per day — no button tap. Guardrails:
 
-- **Armed per date.** Fires only when `armed_date` (or env `AUTO_TRADE_DATE`) equals today. After that day it never fires again until re-armed. Committed config survives Render restarts.
+- **Cadence.** `recurring: true` → every market day (one trade/day, idempotent). `recurring: false` → one-shot on `armed_date` (or env `AUTO_TRADE_DATE`) only. Committed config survives Render restarts.
 - **Window:** re-checks every 5 min from **10:00 AM** and places the first qualifying setup; **stands down at 12:30** if nothing clears the gate.
 - **Best passing candidate**, priority **condor → bull put → fly**, capped at `max_loss` (default **$100**), **no 0DTE**, bull puts skipped on an earnings catalyst (news guard).
 - **Re-priced + drift-guarded at fill** (same 20% gate as the buttons) and **idempotent** via Alpaca `client_order_id` (`auto-YYYYMMDD`) — a restart can't double-fire.
@@ -280,7 +280,7 @@ Set all `.env` variables in Render's Environment dashboard. No redeploy needed f
 | `/condor` | GEX-anchored iron condor (high-POP premium play) |
 | `/batman` | GEX-anchored Batman for XSP (positive-cowl double BWB) |
 | `/manage` | Check open structures at the 50% profit target |
-| `/autotrade on\|off\|status` | Toggle or inspect the one-shot auto-trade (env `AUTO_TRADE_KILL` is the hard override) |
+| `/autotrade on\|off\|status` | Toggle or inspect the recurring auto-trade (env `AUTO_TRADE_KILL` is the hard override) |
 | `/risk` | Fund risk status: equity, day P&L vs limit, drawdown vs high-water mark, per-trade budget |
 | `/performance` (`/perf`) | Fund metrics: total/30d/CAGR returns, max drawdown, Sharpe, Sortino, win rate, profit factor |
 | `/attribution` (`/attr`) | Realized P&L by strategy — reconciled from Alpaca order tags (which strategy makes money) |

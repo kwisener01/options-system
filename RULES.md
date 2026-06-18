@@ -27,10 +27,11 @@ size in elevated vol.
 Equity / P&L / HWM come from Alpaca (durable). Blocked entries say `🛑 Blocked by
 risk rule`. Status: `/risk`.
 
-## 2. One-shot auto-trade (`config/auto_trade.json`)
+## 2. Recurring auto-trade (`config/auto_trade.json`)
 
-- Fires **at most one** defined-risk structure on `armed_date`, scanning
-  **10:00 AM–12:30 PM ET**; stands down at 12:30 if nothing qualifies.
+- `recurring: true` → fires **one** defined-risk structure **every market day**
+  (idempotent per day), scanning **10:00 AM–12:30 PM ET**; stands down at 12:30
+  if nothing qualifies. (`recurring: false` → one-shot on `armed_date` only.)
 - Candidate priority **condor → bull put → fly**; max loss = min($100 cap, 5% of equity).
 - **No 0DTE**; bull puts skipped on an earnings catalyst.
 - Re-priced live at fill; **rejected if drift > 20%**.

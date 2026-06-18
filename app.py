@@ -2950,20 +2950,23 @@ def _cmd_autotrade(arg: str, resp_url: str):
         cfg = _auto_trade_config()
         extra = "  :warning: _but env AUTO_TRADE_KILL is set — that overrides this._" \
             if os.environ.get("AUTO_TRADE_KILL") else ""
+        cad = "every market day" if cfg.get("recurring") else f"one-shot {cfg.get('armed_date')}"
         _slack_respond(resp_url,
             f":white_check_mark: *Auto-trade ENABLED.*{extra}\n"
-            f"  Armed {cfg.get('armed_date')}, max loss ${cfg.get('max_loss')}, "
+            f"  {cad}, max loss ${cfg.get('max_loss')}, "
             f"10:00–12:30 ET, no 0DTE, exit 50%/1-DTE.")
         return
     # status (default)
     cfg   = _auto_trade_config()
     today = datetime.now(ET).strftime("%Y-%m-%d")
     state = "ENABLED :green_circle:" if cfg.get("enabled") else "DISABLED :red_circle:"
-    armed = "TODAY" if cfg.get("armed_date") == today else f"not today ({cfg.get('armed_date')})"
+    cadence = ("recurring — every market day" if cfg.get("recurring")
+               else ("TODAY" if cfg.get("armed_date") == today
+                     else f"one-shot {cfg.get('armed_date')} (not today)"))
     lines = [
         ":robot_face: *Auto-trade status*",
         f"  State: *{state}*" + ("  _(env kill set)_" if os.environ.get("AUTO_TRADE_KILL") else ""),
-        f"  Armed for: {armed}",
+        f"  Cadence: {cadence}",
         f"  Max loss: ${cfg.get('max_loss')}  |  window 10:00–12:30 ET  |  no 0DTE",
         f"  Exit: auto-close 50% / force-close 1 DTE 3:30 ET",
         "  Toggle: `/autotrade on` · `/autotrade off`",
@@ -3945,7 +3948,8 @@ def _auto_trade_job():
         if not cfg.get("enabled"):
             return
         today = datetime.now(ET).strftime("%Y-%m-%d")
-        if cfg.get("armed_date") != today:
+        # recurring → fires every market day; otherwise only on the armed date
+        if not cfg.get("recurring") and cfg.get("armed_date") != today:
             return
         if not _market_is_open():
             return
