@@ -906,6 +906,21 @@ def api_orders():
         return jsonify({"ok": False, "error": str(e)[:300]}), 500
 
 
+@app.route("/api/positions")
+def api_positions():
+    """Open positions (symbol, qty, asset class) — diagnostic, no prices."""
+    try:
+        from src.live.alpaca_options import _trading
+        out = []
+        for p in _trading().get_all_positions():
+            out.append({"symbol": p.symbol, "qty": str(p.qty),
+                        "asset": str(getattr(p, "asset_class", "")),
+                        "is_option": len(p.symbol) > 8})
+        return jsonify({"ok": True, "positions": out, "count": len(out)})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:300]}), 500
+
+
 @app.route("/api/slack", methods=["POST"])
 def api_slack():
     try:
