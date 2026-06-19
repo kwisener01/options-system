@@ -1,0 +1,11 @@
+{
+  "enabled": false,
+  "underlying": "SPY",
+  "width": 1,
+  "fire_start": "10:00",
+  "fire_end": "11:30",
+  "profit_target": 0.50,
+  "force_close": "15:45",
+  "min_credit_frac": 0.12,
+  "note": "0DTE SPY put credit spread at the downside expected move (tastylive-style). OFF by default — flip enabled:true to run. Each market day in [fire_start, fire_end]: sell a width-wide put spread with the short strike ~1 expected-move below the forward (from expected_move.py). Gated by the risk engine (5%/VIX/cash-floor/drawdown) AND the IV>RV premium gate. Manage at profit_target (50%); DON'T close losers early; FORCE-CLOSE by force_close ET — SPY is American & physically settled, so a 0DTE short put left ITM at expiry gets assigned 100 shares (~$74k), which a small account can't hold. Underlying is SPY because Alpaca has no SPX/XSP index options. UNTESTED against live order mechanics — watch the first enabled run."
+}

@@ -90,6 +90,9 @@ Double broken-wing butterfly = a put BWB (left ear) + a call BWB (right ear) sha
 
 **Strategy barbell:** butterfly = low-win / high-reward (pin bet); condor = high-win / modest-reward (premium). High win % ≠ high expectancy — the edge is selling when IV > realized, wall-anchored strikes, and managing winners early.
 
+### 0DTE Put Spread at the Expected Move (`config/zerodte.json`, opt-in)
+tastylive-style and **off by default**. Each market day (10:00–11:30 ET) sells one **SPY 0DTE put credit spread** with the short strike ~1 expected-move below the forward, **$1-wide**, gated by the risk engine + IV>RV. Manages at **50% profit**, never closes losers early, and **force-closes by 3:45 PM** (SPY is physically settled — assignment guard). Short gamma; respect the tail. Set `enabled: true` to run.
+
 ### Expected Move (`expected_move.py`)
 The market's implied ±range by a chosen expiry, from the **ATM straddle** (the most accurate method — it bakes in the real IV/skew at that expiry): `EM ≈ 0.85 × (ATM call + ATM put)`. The ATM strike is found where |call − put| is smallest (parity), so 0DTE works naturally (the straddle reflects remaining time value). Shown in the **pre-market Slack brief** (SPY 0DTE + weekly) and on the **dashboard** with a DTE selector (`/api/expected-move?symbol=SPY&dte=N`). Note: the 1-SD expected move ≈ the 16Δ strike — so "sell outside the expected move" and "sell at 16Δ" are the same trade.
 

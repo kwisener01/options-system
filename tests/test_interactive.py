@@ -269,6 +269,18 @@ def test_expected_move():
     print("ok  expected move (ATM straddle -> range)")
 
 
+def test_zerodte_strikes():
+    import app
+    # forward 747, EM ±4.5, $1 wide → short ~742 (1 SD below), long 741
+    s, l = app._zerodte_strikes(747.0, 4.5, 1)
+    assert s == 742.0 and l == 741.0
+    # wider EM pushes the short strike further OTM
+    s2, l2 = app._zerodte_strikes(747.0, 9.5, 2)
+    assert s2 == 738.0 and l2 == 736.0
+    assert s - l == 1 and s2 - l2 == 2          # width preserved
+    print("ok  0DTE strikes (short at expected move, width below)")
+
+
 if __name__ == "__main__":
     test_pending_store()
     test_blocks()
@@ -283,4 +295,5 @@ if __name__ == "__main__":
     test_fa_trim_plan()
     test_realized_vol()
     test_expected_move()
+    test_zerodte_strikes()
     print("\nALL PASS")

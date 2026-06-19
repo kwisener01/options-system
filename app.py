@@ -3895,6 +3895,207 @@ def _fa_manage_job():
         logger.error("_fa_manage_job error: %s", e)
 
 
+# ── 0DTE put-credit-spread at the expected move (opt-in) ─────────────────────
+#
+# tastylive-style: sell a SPY 0DTE put spread with the short strike ~1 expected-
+# move below the forward, width-wide, manage at 50% / DON'T close losers early /
+# force-close before the bell (SPY is physically settled — never let a 0DTE short
+# put expire ITM on a small account). OFF by default (config/zerodte.json).
+
+def _zerodte_config() -> dict:
+    path = os.path.join(os.path.dirname(__file__), "config", "zerodte.json")
+    cfg = {"enabled": False, "underlying": "SPY", "width": 1, "fire_start": "10:00",
+           "fire_end": "11:30", "profit_target": 0.50, "force_close": "15:45",
+           "min_credit_frac": 0.12}
+    try:
+        with open(path) as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    return cfg
+
+
+def _parse_hhmm(s: str):
+    h, m = str(s).split(":")
+    return dt_time(int(h), int(m))
+
+
+def _zerodte_strikes(forward: float, em_dollars: float, width: float):
+    """Pure: short put ~1 expected-move below the forward (nearest $1 strike),
+    long put `width` below it."""
+    short_put = float(round(forward - em_dollars))
+    return short_put, short_put - width
+
+
+def _zerodte_place(short_k, long_k, coid, budget, cfg) -> dict:
+    """Submit the SPY 0DTE put spread; respects the per-trade budget + min credit."""
+    from src.live.alpaca_options import _trading, get_mid_price, occ_symbol
+    from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    try:
+        today = date.today()
+        ssym = occ_symbol("SPY", today, "PUT", short_k)
+        lsym = occ_symbol("SPY", today, "PUT", long_k)
+        sm, lm = get_mid_price(ssym), get_mid_price(lsym)
+        if not sm or not lm:
+            return {"ok": False, "reason": "no quotes"}
+        credit = round(sm * 0.97 - lm * 1.03, 2)
+        width  = short_k - long_k
+        if credit < cfg.get("min_credit_frac", 0.12) * width:
+            return {"ok": False, "reason": f"thin credit ${credit:.2f} on ${width:.0f} wide"}
+        max_loss = round((width - credit) * 100, 2)
+        if max_loss > budget:
+            return {"ok": False, "reason": f"max loss ${max_loss:.0f} > budget ${budget:.0f}"}
+        legs = [
+            OptionLegRequest(symbol=ssym, ratio_qty=1, side=OrderSide.SELL,
+                             position_intent=PositionIntent.SELL_TO_OPEN),
+            OptionLegRequest(symbol=lsym, ratio_qty=1, side=OrderSide.BUY,
+                             position_intent=PositionIntent.BUY_TO_OPEN),
+        ]
+        o = _trading().submit_order(LimitOrderRequest(
+            symbol="SPY", qty=1, side=OrderSide.SELL, type=OrderType.LIMIT,
+            time_in_force=TimeInForce.DAY, limit_price=credit, legs=legs, client_order_id=coid))
+        return {"ok": True, "order_id": str(o.id), "credit": credit, "max_loss": max_loss}
+    except Exception as e:
+        return {"ok": False, "reason": f"submit error: {e}"}
+
+
+def _zerodte_job():
+    """Every 5 min in the entry window. Places one SPY 0DTE put spread/day at the
+    expected move, gated by the risk engine + IV>RV. OFF unless config enabled."""
+    try:
+        cfg = _zerodte_config()
+        if not cfg.get("enabled") or not _market_is_open():
+            return
+        now = datetime.now(ET).time()
+        if now < _parse_hhmm(cfg["fire_start"]) or now > _parse_hhmm(cfg["fire_end"]):
+            return
+        from src.live.alpaca_options import _trading
+        date_tag = datetime.now(ET).strftime("%Y%m%d")
+        coid = f"0dte-SPY-{date_tag}"
+        try:
+            if _trading().get_order_by_client_id(coid):
+                return   # already placed today
+        except Exception:
+            pass
+
+        from src.notifications.slack_notifier import send_message
+        from config.settings import IS_PAPER
+        if IS_PAPER:
+            return   # never auto-trade 0DTE on paper-as-live by accident
+        snap, rcfg = _risk_snapshot(), _risk_config()
+        ok, reason = _risk_gate(snap, rcfg, None)
+        if not ok:
+            return
+        pok, preason, _ = _premium_ok()
+        if not pok:
+            logger.info("0DTE stand-down: %s", preason)
+            return
+
+        from src.analysis.expected_move import compute
+        em = compute("SPY", 0)
+        if not em or em.get("dte") != 0:
+            logger.info("0DTE: no live 0DTE expiry/quotes")
+            return
+        short_k, long_k = _zerodte_strikes(em["forward"], em["em_dollars"], float(cfg["width"]))
+        budget = rcfg["risk_pct_per_trade"] * snap["equity"] * _vix_size_factor(snap.get("vix"), rcfg)
+        res = _zerodte_place(short_k, long_k, coid, budget, cfg)
+        if not res["ok"]:
+            logger.info("0DTE stood down: %s", res["reason"])
+            return
+        send_message(
+            f":zap: *0DTE SPY put spread placed* — at the expected move\n"
+            f"  SELL {short_k:.0f}P / BUY {long_k:.0f}P  {em['expiry']} (0DTE)\n"
+            f"  credit +${res['credit']:.2f}  max loss ${res['max_loss']:.0f}  "
+            f"_short ~1σ below ({em['lower']:.0f})_\n"
+            f"  manage 50% · force-close {cfg['force_close']} ET\n"
+            f"  Order: `{res['order_id']}`")
+        logger.info("0DTE placed: SPY %.0f/%.0f credit %.2f", short_k, long_k, res["credit"])
+    except Exception as e:
+        logger.error("_zerodte_job error: %s", e)
+
+
+def _zerodte_manage_job():
+    """Every 5 min RTH. Manages the open 0DTE SPY put spread: close at 50% profit,
+    DON'T close losers early, force-close before the bell (assignment guard)."""
+    try:
+        if not _market_is_open():
+            return
+        cfg = _zerodte_config()
+        if not cfg.get("enabled"):
+            return
+        from src.live.alpaca_options import _trading
+        client, today = _trading(), date.today()
+        legs = []
+        for p in client.get_all_positions():
+            if len(p.symbol) <= 8 or not p.symbol.startswith("SPY"):
+                continue
+            pr = _occ_parse(p.symbol)
+            if pr and pr[1] == today and pr[3] == "P":
+                legs.append(p)
+        if not legs:
+            return
+        net_credit = sum(-float(p.qty) * float(getattr(p, "avg_entry_price", 0) or 0) * 100 for p in legs)
+        unreal     = sum(float(getattr(p, "unrealized_pl", 0) or 0) for p in legs)
+        now = datetime.now(ET).time()
+        reason = None
+        if net_credit > 0 and unreal >= cfg.get("profit_target", 0.5) * net_credit:
+            reason = f"50% profit (+${unreal:.0f} of ${net_credit:.0f} credit)"
+        elif now >= _parse_hhmm(cfg["force_close"]):
+            reason = f"force-close {cfg['force_close']} ET — 0DTE assignment guard"
+        if not reason:
+            return
+        # don't double-submit while a close is already working
+        from alpaca.trading.requests import GetOrdersRequest
+        from alpaca.trading.enums import QueryOrderStatus
+        try:
+            for o in client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=50)):
+                if (getattr(o, "client_order_id", "") or "").startswith("0dteclose"):
+                    return
+        except Exception:
+            pass
+        res = _submit_close(client, legs, f"0dteclose-{datetime.now(ET):%Y%m%d%H%M}")
+        if res:
+            from src.notifications.slack_notifier import send_message
+            icon = ":green_circle:" if res["unreal"] >= 0 else ":red_circle:"
+            send_message(f"{icon} *0DTE close* — {reason}\n  P&L ${res['unreal']:+,.2f}  "
+                         f"Order: `{res['order_id']}`")
+            logger.info("0DTE close (%s) order=%s", reason, res["order_id"])
+    except Exception as e:
+        logger.error("_zerodte_manage_job error: %s", e)
+
+
+def _submit_close(client, legs, coid):
+    """Close a specific set of option-leg positions as one multi-leg order."""
+    from src.live.alpaca_options import get_mid_price
+    from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    net_debit, leg_objs, unreal, underlying = 0.0, [], 0.0, None
+    for pos in legs:
+        mid = get_mid_price(pos.symbol)
+        if mid is None:
+            continue
+        qn, ratio = float(pos.qty), int(abs(float(pos.qty)))
+        unreal += float(getattr(pos, "unrealized_pl", 0) or 0)
+        underlying = _occ_parse(pos.symbol)[0]
+        if qn > 0:
+            side, intent, limit = OrderSide.SELL, PositionIntent.SELL_TO_CLOSE, round(mid * 0.90, 2)
+            net_debit -= limit * ratio * 100
+        else:
+            side, intent, limit = OrderSide.BUY, PositionIntent.BUY_TO_CLOSE, round(mid * 1.10, 2)
+            net_debit += limit * ratio * 100
+        leg_objs.append(OptionLegRequest(symbol=pos.symbol, ratio_qty=ratio, side=side, position_intent=intent))
+    if not leg_objs:
+        return None
+    is_debit  = net_debit > 0
+    net_share = round(abs(net_debit) / 100, 2)
+    o = client.submit_order(LimitOrderRequest(
+        symbol=underlying, qty=1, side=OrderSide.BUY if is_debit else OrderSide.SELL,
+        type=OrderType.LIMIT, time_in_force=TimeInForce.DAY, limit_price=net_share,
+        legs=leg_objs, client_order_id=coid))
+    return {"order_id": str(o.id), "unreal": round(unreal, 2)}
+
+
 # ── One-shot auto-trade ──────────────────────────────────────────────────────
 #
 # Fires AT MOST ONE defined-risk structure on the armed date (config/auto_trade.json),
@@ -4333,6 +4534,11 @@ def _start_scheduler():
     # Fallen-angel exit: trim half at +20%, trail the rest — every 15 min RTH
     sched.add_job(_fa_manage_job,    "cron", day_of_week="mon-fri", hour="9-15", minute="*/15",
                   id="fa_manage",          replace_existing=True)
+    # 0DTE put spread at the expected move (opt-in; gated to its window + manager)
+    sched.add_job(_zerodte_job,        "cron", day_of_week="mon-fri", hour="10-11", minute="*/5",
+                  id="zerodte",            replace_existing=True)
+    sched.add_job(_zerodte_manage_job, "cron", day_of_week="mon-fri", hour="9-15", minute="*/5",
+                  id="zerodte_manage",     replace_existing=True)
     # Monthly NAV statement — 1st of the month, 8 AM ET
     sched.add_job(_monthly_nav_job,  "cron", day=1, hour=8, minute=0,
                   id="monthly_nav",        replace_existing=True)

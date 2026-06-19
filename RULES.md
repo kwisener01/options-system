@@ -40,6 +40,19 @@ risk rule`. Status: `/risk`.
 - **LIVE only** (`require_live`); idempotent via `client_order_id`.
 - Controls: `/autotrade on|off|status`; hard kill `AUTO_TRADE_KILL=1` (Render env).
 
+## 2b. 0DTE put spread at the expected move (`config/zerodte.json`, OFF by default)
+
+Opt-in tastylive-style strategy — **`enabled: false`** until you flip it on.
+- Each market day in **10:00–11:30 ET**, sells one **SPY 0DTE put credit spread**,
+  short strike ~**1 expected-move below the forward** (from `expected_move.py`),
+  **$1-wide** (≈$100 risk).
+- Gated by the **risk engine** (5%/VIX/cash-floor/drawdown) **and the IV>RV gate**.
+- **Manage at 50% profit; do NOT close losers early; FORCE-CLOSE by 15:45 ET** —
+  SPY is American/physically settled, so a 0DTE short put left ITM at expiry gets
+  assigned 100 shares (~$74k), which a small account can't hold.
+- SPY (not SPX/XSP) because Alpaca has no index options. Short gamma → respect the
+  fat tail. Untested against live order mechanics — watch the first enabled run.
+
 ## 3. Fallen-angel stocks (`config/fallen_angel.json`)
 
 - Act on **STRONG** signals only (score ≥ 8/13), via the 🪂 **Buy** button.
