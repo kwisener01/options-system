@@ -859,116 +859,11 @@ def api_news():
 
 @app.route("/api/mode")
 def api_mode():
-    """LIVE vs PAPER + whether the API keys actually authenticate against that
-    endpoint (catches paper-keys-on-live-endpoint, which rejects all orders)."""
+    """LIVE vs PAPER, derived from ALPACA_BASE_URL only. No account data exposed."""
     from config.settings import IS_PAPER, ALPACA_BASE_URL
     host = ALPACA_BASE_URL.split("//")[-1]
-    out = {"ok": True, "mode": "PAPER" if IS_PAPER else "LIVE", "paper": IS_PAPER, "host": host}
-    try:
-        from src.live.alpaca_options import _trading
-        acct = _trading().get_account()
-        out["account_ok"]      = True
-        out["account_status"]  = str(getattr(acct, "status", ""))
-        out["trading_blocked"] = bool(getattr(acct, "trading_blocked", False))
-        out["options_level"]   = getattr(acct, "options_trading_level", None)
-    except Exception as e:
-        out["account_ok"]    = False
-        out["account_error"] = str(e)[:200]
-    return jsonify(out)
-
-
-@app.route("/api/orders")
-def api_orders():
-    """Recent orders' status + reject reason (diagnostic). No sizes/prices."""
-    try:
-        from src.live.alpaca_options import _trading
-        from alpaca.trading.requests import GetOrdersRequest
-        from alpaca.trading.enums import QueryOrderStatus
-        orders = _trading().get_orders(filter=GetOrdersRequest(
-            status=QueryOrderStatus.ALL, limit=15,
-            after=datetime.now(ET) - timedelta(days=3)))
-        out = []
-        for o in orders:
-            reason = None
-            for f in ("rejected_reason", "reject_reason", "failure_reason"):
-                v = getattr(o, f, None)
-                if v:
-                    reason = str(v); break
-            out.append({
-                "coid":   getattr(o, "client_order_id", "") or "",
-                "symbol": getattr(o, "symbol", ""),
-                "status": str(getattr(o, "status", "")),
-                "reason": reason,
-                "submitted": str(getattr(o, "submitted_at", "")),
-            })
-        return jsonify({"ok": True, "orders": out})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)[:300]}), 500
-
-
-@app.route("/api/close-prompt/<ticker>", methods=["GET", "POST"])
-def api_close_prompt(ticker):
-    """Post a Close/Hold button for a ticker's option structure to Slack, so it
-    can be closed with a tap (no slash command, no typing). The actual close
-    still requires the signature-verified button tap — this only posts the prompt."""
-    try:
-        ticker = ticker.upper()
-        from src.live.alpaca_options import _trading
-        legs = [p for p in _trading().get_all_positions()
-                if (getattr(p, "asset_class", "") in ("us_option", "option") or len(p.symbol) > 8)
-                and p.symbol.upper().startswith(ticker)]
-        if not legs:
-            return jsonify({"ok": False, "error": f"no open option legs for {ticker}"}), 404
-        label = f"{ticker} spread ({len(legs)} legs)"
-        text  = f"*Close {label}?*  _tap to submit a closing order_"
-        tid   = register_exit("structure", ticker, label, text)
-        _post_exit_approvals([{"tid": tid, "text": text, "label": label}])
-        return jsonify({"ok": True, "posted": label, "legs": [p.symbol for p in legs]})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)[:300]}), 500
-
-
-@app.route("/api/diag")
-def api_diag():
-    """Account flags that explain order rejections (PDT, BP, blocks, suspensions)."""
-    try:
-        from src.live.alpaca_options import _trading
-        a = _trading().get_account()
-        def g(f):
-            v = getattr(a, f, None)
-            return str(v) if v is not None else None
-        return jsonify({"ok": True,
-            "status": g("status"),
-            "pattern_day_trader": g("pattern_day_trader"),
-            "daytrade_count": g("daytrade_count"),
-            "account_blocked": g("account_blocked"),
-            "trading_blocked": g("trading_blocked"),
-            "trade_suspended_by_user": g("trade_suspended_by_user"),
-            "transfers_blocked": g("transfers_blocked"),
-            "options_trading_level": g("options_trading_level"),
-            "options_buying_power": g("options_buying_power"),
-            "buying_power": g("buying_power"),
-            "daytrading_buying_power": g("daytrading_buying_power"),
-            "regt_buying_power": g("regt_buying_power"),
-            "cash": g("cash"), "equity": g("equity"),
-        })
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)[:300]}), 500
-
-
-@app.route("/api/positions")
-def api_positions():
-    """Open positions (symbol, qty, asset class) — diagnostic, no prices."""
-    try:
-        from src.live.alpaca_options import _trading
-        out = []
-        for p in _trading().get_all_positions():
-            out.append({"symbol": p.symbol, "qty": str(p.qty),
-                        "asset": str(getattr(p, "asset_class", "")),
-                        "is_option": len(p.symbol) > 8})
-        return jsonify({"ok": True, "positions": out, "count": len(out)})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)[:300]}), 500
+    return jsonify({"ok": True, "mode": "PAPER" if IS_PAPER else "LIVE",
+                    "paper": IS_PAPER, "host": host})
 
 
 @app.route("/api/slack", methods=["POST"])
