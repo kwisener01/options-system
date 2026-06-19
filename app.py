@@ -906,6 +906,28 @@ def api_orders():
         return jsonify({"ok": False, "error": str(e)[:300]}), 500
 
 
+@app.route("/api/close-prompt/<ticker>", methods=["GET", "POST"])
+def api_close_prompt(ticker):
+    """Post a Close/Hold button for a ticker's option structure to Slack, so it
+    can be closed with a tap (no slash command, no typing). The actual close
+    still requires the signature-verified button tap — this only posts the prompt."""
+    try:
+        ticker = ticker.upper()
+        from src.live.alpaca_options import _trading
+        legs = [p for p in _trading().get_all_positions()
+                if (getattr(p, "asset_class", "") in ("us_option", "option") or len(p.symbol) > 8)
+                and p.symbol.upper().startswith(ticker)]
+        if not legs:
+            return jsonify({"ok": False, "error": f"no open option legs for {ticker}"}), 404
+        label = f"{ticker} spread ({len(legs)} legs)"
+        text  = f"*Close {label}?*  _tap to submit a closing order_"
+        tid   = register_exit("structure", ticker, label, text)
+        _post_exit_approvals([{"tid": tid, "text": text, "label": label}])
+        return jsonify({"ok": True, "posted": label, "legs": [p.symbol for p in legs]})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:300]}), 500
+
+
 @app.route("/api/diag")
 def api_diag():
     """Account flags that explain order rejections (PDT, BP, blocks, suspensions)."""
