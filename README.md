@@ -141,6 +141,7 @@ Fund-style capital protection that gates **every** new entry — the auto-trade 
 - **Drawdown guard** — blocks new entries while equity is `max_drawdown_pct` (default 15%) below its high-water mark.
 - **VIX de-risk** — half size at VIX ≥ `vix_half_size` (18), full stand-down ≥ `vix_stand_down` (25). Backtested (10y) to cut max drawdown −38% → −14% while raising Sharpe.
 - **Allocation caps** — **cash floor** (≥ `cash_floor_pct`, 30%) blocks all new entries when dry powder runs low; **stock-sleeve cap** (≤ `stock_cap_pct`, 40%) caps fallen-angel exposure. Their sum leaves ~25% for options. `/allocation` shows the live split.
+- **IV-vs-RV gate** — the auto-trade sells premium (condor / bull put) only when **VIX > SPY 20-day realized vol** by ≥ `vrp_min_points` (0), i.e. only when implied richness pays for the risk; the long pin fly is exempt (it benefits from cheap premium). The variance risk premium is the actual edge behind premium selling. `/risk` shows the live spread.
 
 A blocked button entry replies `🛑 Blocked by risk rule — …`; the auto-trade posts a halt and stands down. `/risk` shows live status (equity, day P&L vs limit, drawdown, per-trade budget). Defaults are starting values for a small account — tune in `config/risk.json`.
 

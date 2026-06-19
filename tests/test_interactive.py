@@ -241,6 +241,20 @@ def test_fa_trim_plan():
     print("ok  fallen-angel trim plan (half + trail, 1-share trail-only)")
 
 
+def test_realized_vol():
+    import app
+    # alternating +1% / -1% daily moves → ~1%/day stdev → ~15.9% annualized RV
+    closes, p = [], 100.0
+    for i in range(26):
+        p *= 1.01 if i % 2 == 0 else (1 / 1.01)
+        closes.append(p)
+    rv = app._rv_from_closes(closes, 20)
+    assert rv is not None and 12 < rv < 22, rv
+    # too little history → None
+    assert app._rv_from_closes([100, 101, 102], 20) is None
+    print("ok  realized vol (annualized from closes)")
+
+
 if __name__ == "__main__":
     test_pending_store()
     test_blocks()
@@ -253,4 +267,5 @@ if __name__ == "__main__":
     test_vix_derisk()
     test_attribution()
     test_fa_trim_plan()
+    test_realized_vol()
     print("\nALL PASS")

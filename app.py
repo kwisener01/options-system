@@ -2962,6 +2962,9 @@ def _cmd_risk(resp_url: str):
             f"  VIX: {snap.get('vix') if snap.get('vix') is not None else '?'}  → size ×"
             f"{_vix_size_factor(snap.get('vix'), cfg):g}  "
             f"_(½ ≥{cfg.get('vix_half_size','?')}, cash ≥{cfg.get('vix_stand_down','?')})_",
+            (lambda v: f"  IV vs RV: VIX {v['vix']:.0f} vs RV {v['rv']:.0f} → spread {v['spread']:+.0f}  "
+                       f"_{'rich · sell OK' if v['spread'] >= cfg.get('vrp_min_points',0) else 'cheap · no premium-sells'}_"
+                       if v.get('spread') is not None else "  IV vs RV: _n/a_")(_vrp_snapshot()),
             f"  Per-trade budget: ${budget:,.0f}  ({cfg['risk_pct_per_trade']*100:.0f}% of equity)",
         ]))
     except Exception as e:
@@ -3182,6 +3185,67 @@ def _risk_snapshot() -> dict:
         "vix": vix,
         "cash": cash, "cash_pct": (cash / equity) if equity else 1.0,
     }
+
+
+_vrp_cache: dict = {"ts": 0.0, "data": None}
+
+
+def _rv_from_closes(closes: list, lookback: int = 20):
+    """Pure: annualized realized vol (%) from daily closes over `lookback` days."""
+    import math
+    closes = [float(c) for c in closes if c]
+    if len(closes) < lookback + 1:
+        return None
+    seg  = closes[-(lookback + 1):]
+    rets = [math.log(seg[i] / seg[i - 1]) for i in range(1, len(seg)) if seg[i - 1]]
+    if len(rets) < 2:
+        return None
+    mean = sum(rets) / len(rets)
+    var  = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+    return round(math.sqrt(var) * math.sqrt(252) * 100, 1)
+
+
+def _realized_vol(symbol: str = "SPY", lookback: int = 20):
+    try:
+        from src.live.yahoo import fetch_daily_ohlcv
+        df = fetch_daily_ohlcv(symbol, "3mo")
+        return _rv_from_closes(list(df["close"]) if not df.empty else [], lookback)
+    except Exception as e:
+        logger.warning("realized vol failed: %s", e)
+        return None
+
+
+def _vrp_snapshot() -> dict:
+    """Variance risk premium: VIX (implied) vs SPY realized vol. spread>0 = premium
+    is rich (sell-favourable). Cached 5 min."""
+    now = time.time()
+    if _vrp_cache["data"] and now - _vrp_cache["ts"] < 300:
+        return _vrp_cache["data"]
+    vix = None
+    try:
+        vix = (get_data().get("vix") or {}).get("now")
+    except Exception:
+        pass
+    rv = _realized_vol("SPY", 20)
+    spread = round(vix - rv, 1) if (vix is not None and rv is not None) else None
+    out = {"vix": vix, "rv": rv, "spread": spread}
+    _vrp_cache.update(ts=now, data=out)
+    return out
+
+
+def _premium_ok():
+    """(ok, reason, snapshot) — is implied > realized enough to sell premium?
+    Fail-open if vol data is unavailable (don't block on a fetch error)."""
+    snap = _vrp_snapshot()
+    vmin = _risk_config().get("vrp_min_points", 0)
+    if snap["spread"] is None:
+        return True, "vrp n/a", snap
+    if snap["spread"] < vmin:
+        return (False,
+                f"IV≤RV — VIX {snap['vix']:.0f} vs RV {snap['rv']:.0f} "
+                f"(spread {snap['spread']:+.0f} < {vmin}); premium too cheap to sell",
+                snap)
+    return True, "ok", snap
 
 
 def _vix_size_factor(vix, cfg: dict) -> float:
@@ -3890,8 +3954,14 @@ def _auto_pick_candidate(max_loss: float):
     except Exception:
         gx = None
 
+    # Sell premium (condor / bull put) only when IV > RV; the long fly is exempt
+    # (it actually benefits from cheap premium).
+    prem_ok, _prem_reason, _ = _premium_ok()
+    if not prem_ok:
+        logger.info("Auto-trade: skipping premium-sellers — %s", _prem_reason)
+
     # 1) Iron condor (no 0DTE — dte_min=1)
-    if gx:
+    if gx and prem_ok:
         try:
             con = condor_scan(gx.spot, gx, dte_min=1, dte_max=7).get("candidate")
             if con and float(con.get("max_loss_usd", 1e9)) <= max_loss and int(con.get("dte", 0)) >= 1:
@@ -3912,7 +3982,7 @@ def _auto_pick_candidate(max_loss: float):
     except Exception as e:
         logger.warning("Auto-trade bull-put scan failed: %s", e)
         bp = []
-    hits = [r for r in bp if r.get("signal") in ("STRONG", "WATCH") and r.get("candidate")]
+    hits = [r for r in bp if r.get("signal") in ("STRONG", "WATCH") and r.get("candidate")] if prem_ok else []
     hits.sort(key=lambda r: (r["signal"] != "STRONG", -float(r["candidate"].get("score", 0))))
     for r in hits:
         c = r["candidate"]

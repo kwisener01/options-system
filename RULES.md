@@ -19,6 +19,7 @@ Gates the auto-trade, the options Take buttons, and fallen-angel buys alike.
 | Daily-loss circuit breaker | −5% on the day | Blocks **new** entries the rest of the day |
 | Drawdown guard | 15% below high-water mark | Blocks **new** entries until recovered |
 | VIX de-risk | ½ size at VIX ≥ 18, stand down ≥ 25 | Shrinks/halts premium-selling as vol rises |
+| IV-vs-RV gate | sell premium only when VIX − SPY-realized-vol ≥ `vrp_min_points` (0) | No condor/bull-put when premium is cheap vs actual movement; the long fly is exempt |
 
 The VIX de-risk is the highest-impact rule: in a 10-year backtest it cut max
 drawdown from −38% to −14% (2.7×) while *raising* Sharpe — same trades, smaller
