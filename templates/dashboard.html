@@ -75,6 +75,28 @@
     <!-- VIX bar -->
     <div id="vix-bar" class="mb-4 bg-gray-900 rounded-lg border border-gray-800 px-4 py-2 flex items-center gap-6 text-sm"></div>
 
+    <!-- Expected Move -->
+    <div class="mb-4 bg-gray-900 rounded-lg border border-emerald-900/60 overflow-hidden">
+      <div class="px-3 py-2.5 bg-gray-800/50 flex items-center gap-2 flex-wrap">
+        <span class="text-emerald-400 font-bold text-sm shrink-0">🎯 Expected Move</span>
+        <span class="text-gray-600 text-xs hidden sm:inline">ATM straddle × 0.85 · 1σ range</span>
+        <div class="flex items-center gap-1.5 ml-auto">
+          <input id="em-symbol" value="SPY" maxlength="5"
+            class="w-16 px-2 py-1 text-xs bg-gray-800 rounded border border-gray-700 uppercase">
+          <label class="text-gray-500 text-xs">DTE</label>
+          <input id="em-dte" type="number" value="0" min="0" max="60"
+            class="w-16 px-2 py-1 text-xs bg-gray-800 rounded border border-gray-700">
+          <button onclick="loadExpectedMove()"
+            class="px-2.5 py-1 text-xs bg-emerald-700 hover:bg-emerald-600 rounded border border-emerald-500 transition-colors font-semibold">
+            Calc
+          </button>
+        </div>
+      </div>
+      <div id="em-body" class="px-4 py-3 text-sm text-gray-400">
+        Enter a DTE (0 = today / 0DTE) and click <strong class="text-emerald-400">Calc</strong>.
+      </div>
+    </div>
+
     <!-- SPY + QQQ grid -->
     <div class="grid grid-cols-1 xl:grid-cols-2 gap-4 mb-4">
       <div id="spy-panel"></div>
@@ -1576,6 +1598,31 @@ function newsEsc(t) {
   const d = document.createElement('div');
   d.textContent = t == null ? '' : t;
   return d.innerHTML;
+}
+
+async function loadExpectedMove() {
+  const sym = ($('em-symbol').value || 'SPY').toUpperCase();
+  const dte = parseInt($('em-dte').value || '0', 10);
+  const body = $('em-body');
+  body.innerHTML = '<span class="text-gray-500"><span class="pulse inline-block mr-1">⟳</span>Calculating…</span>';
+  try {
+    const resp = await fetch(`/api/expected-move?symbol=${encodeURIComponent(sym)}&dte=${dte}`);
+    const j = await resp.json();
+    if (!j.ok) { body.innerHTML = `<span class="text-rose-400">${(j.error||'no data')}</span>`; return; }
+    const dteNote = (j.dte !== j.requested_dte) ? ` <span class="text-amber-400">(nearest to ${j.requested_dte})</span>` : '';
+    body.innerHTML = `
+      <div class="flex flex-wrap items-baseline gap-x-6 gap-y-1">
+        <div class="text-2xl font-bold text-emerald-400">±$${j.em_dollars.toFixed(2)}
+          <span class="text-base text-gray-400">(${j.em_pct.toFixed(1)}%)</span></div>
+        <div class="text-sm text-gray-300">Range <span class="font-semibold">${j.lower.toFixed(2)} – ${j.upper.toFixed(2)}</span></div>
+      </div>
+      <div class="text-xs text-gray-500 mt-1">
+        ${j.underlying} ${j.expiry} · ${j.dte}DTE${dteNote} · ATM ${j.atm_strike} · IV ${j.atm_iv}% ·
+        straddle $${j.straddle.toFixed(2)} · fwd ${j.forward.toFixed(2)}
+      </div>`;
+  } catch(err) {
+    body.innerHTML = `<span class="text-rose-400">Error: ${err.message}</span>`;
+  }
 }
 
 async function loadNews(force = false) {

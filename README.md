@@ -15,6 +15,7 @@ app.py              Flask web server + APScheduler (single process)
 ├── /                Dashboard HTML (GEX levels, positions, market status, news)
 ├── /api/gex         Live GEX JSON (5-min cache)
 ├── /api/news        Recent scored headlines for holdings + SPY (5-min cache)
+├── /api/expected-move  Straddle-based expected move for a chosen DTE (0DTE supported)
 ├── /slack/command   Slack slash commands (/scan, /positions, /gex, etc.)
 ├── /slack/interactive  Trade approval button taps (Take/Skip, Close/Hold)
 ├── /health          Render health check (pinged by UptimeRobot every 5 min)
@@ -88,6 +89,9 @@ The high-win-percentage premium play and the mirror of the butterfly. Sells an O
 Double broken-wing butterfly = a put BWB (left ear) + a call BWB (right ear) sharing one expiry, ears anchored to the GEX put/call walls. **Key constraint: positive cowl.** When both ears are OTM, P&L at spot = the net credit, so a *positive cowl* (profit even if price sits at spot) means the whole structure is a *net credit* — which broken wings make possible but symmetric butterflies never do. The scanner searches inner/outer wing widths to find a positive-cowl structure with defined tail risk (≤ $1,500), only in `POSITIVE_GAMMA`. Priced off the SPY chain (SPY ≈ XSP numerically) and **presented for XSP execution** at a European/cash-settled broker (no assignment, no pin risk — XSP isn't on Alpaca). `/batman` runs it on demand.
 
 **Strategy barbell:** butterfly = low-win / high-reward (pin bet); condor = high-win / modest-reward (premium). High win % ≠ high expectancy — the edge is selling when IV > realized, wall-anchored strikes, and managing winners early.
+
+### Expected Move (`expected_move.py`)
+The market's implied ±range by a chosen expiry, from the **ATM straddle** (the most accurate method — it bakes in the real IV/skew at that expiry): `EM ≈ 0.85 × (ATM call + ATM put)`. The ATM strike is found where |call − put| is smallest (parity), so 0DTE works naturally (the straddle reflects remaining time value). Shown in the **pre-market Slack brief** (SPY 0DTE + weekly) and on the **dashboard** with a DTE selector (`/api/expected-move?symbol=SPY&dte=N`). Note: the 1-SD expected move ≈ the 16Δ strike — so "sell outside the expected move" and "sell at 16Δ" are the same trade.
 
 ### GEX (Gamma Exposure)
 Computed as `Gamma × OI × 100 × Spot²`, **calls positive / puts negative** (SqueezeMetrics convention). `net_gex > 0` → POSITIVE_GAMMA (pinning); `< 0` → NEGATIVE_GAMMA (trending). Uses Yahoo Finance OI (high confidence) cached daily; Alpaca greeks/chain as fallback.

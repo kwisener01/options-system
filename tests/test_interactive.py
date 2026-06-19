@@ -255,6 +255,20 @@ def test_realized_vol():
     print("ok  realized vol (annualized from closes)")
 
 
+def test_expected_move():
+    from src.analysis.expected_move import _em_calc
+    # ATM 740, call=put=8 → straddle 16, forward 740, EM = 0.85*16 = 13.6
+    em = _em_calc(740, 8.0, 8.0)
+    assert em["straddle"] == 16.0
+    assert em["forward"] == 740.0
+    assert em["em_dollars"] == 13.6
+    assert em["lower"] == 726.4 and em["upper"] == 753.6
+    # call != put shifts the forward via parity (C-P)
+    em2 = _em_calc(740, 9.0, 7.0)
+    assert em2["forward"] == 742.0          # 740 + (9-7)
+    print("ok  expected move (ATM straddle -> range)")
+
+
 if __name__ == "__main__":
     test_pending_store()
     test_blocks()
@@ -268,4 +282,5 @@ if __name__ == "__main__":
     test_attribution()
     test_fa_trim_plan()
     test_realized_vol()
+    test_expected_move()
     print("\nALL PASS")

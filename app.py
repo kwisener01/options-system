@@ -857,6 +857,22 @@ def api_news():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+@app.route("/api/expected-move")
+def api_expected_move():
+    """Straddle-based expected move for a chosen DTE (0 = today / 0DTE)."""
+    try:
+        dte = int(request.args.get("dte", 0))
+        sym = request.args.get("symbol", "SPY").upper()
+        from src.analysis.expected_move import compute
+        em = compute(sym, dte)
+        if not em:
+            return jsonify({"ok": False, "error": "no chain data (market closed or no quotes)"}), 200
+        return jsonify({"ok": True, **em})
+    except Exception as e:
+        logger.exception("expected-move failed")
+        return jsonify({"ok": False, "error": str(e)[:200]}), 500
+
+
 @app.route("/api/mode")
 def api_mode():
     """LIVE vs PAPER, derived from ALPACA_BASE_URL only. No account data exposed."""
@@ -1472,6 +1488,19 @@ def _premarket_prep_job():
                 f"  {vix_icon} *VIX* {vix_now:.1f} ({vix_chg:+.1f})  _{vix_label}_"
             )
 
+        # -- Expected move (straddle-based) -----------------------------------
+        em_lines = []
+        try:
+            from src.analysis.expected_move import compute as _em
+            for lbl, want in (("0DTE", 0), ("Weekly", 7)):
+                em = _em("SPY", want)
+                if em:
+                    em_lines.append(
+                        f"  *{lbl}* ({em['expiry']}, {em['dte']}DTE): ±${em['em_dollars']:.2f} "
+                        f"({em['em_pct']:.1f}%)  → {em['lower']:.0f}–{em['upper']:.0f}")
+        except Exception as e:
+            logger.warning("premarket expected-move failed: %s", e)
+
         # -- Open positions snapshot ------------------------------------------
         _, pos_block = _build_position_summary()
 
@@ -1480,6 +1509,9 @@ def _premarket_prep_job():
 
         if index_lines:
             sections += ["", "*--- MARKET ---*"] + index_lines
+
+        if em_lines:
+            sections += ["", "*--- EXPECTED MOVE (SPY, ATM straddle) ---*"] + em_lines
 
         if gex_block:
             sections += ["", "*--- GEX WALLS (prior close, HIGH confidence) ---*", gex_block]
