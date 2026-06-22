@@ -1707,10 +1707,18 @@ def _spy_trade_monitor_job():
         d   = get_data()
         t   = d.get("trade_idea") or {}
         sig = _spy_trade_signature(t)
+        # stability: how many consecutive ticks this exact idea has held (×5 min).
+        # A persistent idea is decision-worthy; one that flickers every tick is noise.
+        if sig and sig == state.get("stable_sig"):
+            state["stable_n"] = int(state.get("stable_n", 0)) + 1
+        else:
+            state["stable_sig"], state["stable_n"] = sig, 1
+        stable_min = state["stable_n"] * 5
         if sig:
             tier, reasons = _spy_trade_quality(t)
             if tier == "HIGH" and state.get("sig") != sig:
                 changed = state.get("sig") is not None
+                reasons = list(reasons) + [f"stable {stable_min}m"]
                 send_message(_fmt_spy_signal(t, tier, reasons, changed))
                 logger.info("SPY monitor: trade alert %s (prev=%s)", sig, state.get("sig"))
                 state["sig"] = sig
@@ -2492,6 +2500,17 @@ def _execute_entry(rec: dict, resp_url: str):
             limit_price=round(abs(live_net), 2), legs=leg_objs,
             client_order_id=_coid,
         ))
+        # Alpaca ACCEPTS then can reject async — read the order back to catch it
+        # and surface the real reason (which is null on the API order object, so
+        # dump every candidate field to find where it actually lives).
+        rej = _order_rejection(client, order_obj.id)
+        if rej is not None:
+            pending_store.update_status(tid, "rejected", order_id=str(order_obj.id), note=rej)
+            _slack_replace(resp_url,
+                f":rotating_light: *Rejected by Alpaca — {rec['label']}*\n"
+                f"  reason: {rej or '(none reported)'}\n"
+                f"  Order ID: `{order_obj.id}` · check Alpaca dashboard for detail")
+            return
         pending_store.update_status(tid, "taken", order_id=str(order_obj.id), live_net=live_net)
         word = "credit" if is_credit else "debit"
         _slack_replace(resp_url,
@@ -2501,6 +2520,34 @@ def _execute_entry(rec: dict, resp_url: str):
     except Exception as e:
         pending_store.update_status(tid, "failed", note=str(e))
         _slack_replace(resp_url, f":rotating_light: *Place failed — {rec['label']}*: {e}")
+
+
+def _order_rejection(client, order_id, waits=(1.0, 2.0, 2.0)):
+    """Poll an order briefly; if it ends REJECTED/CANCELED, return the reason
+    string (searching every field that might hold it). Returns None if it's live/
+    filled (i.e. NOT rejected). Empty string = rejected but no reason exposed."""
+    import time as _t
+    for w in waits:
+        _t.sleep(w)
+        try:
+            o = client.get_order_by_id(order_id)
+        except Exception:
+            return None
+        st = str(getattr(o, "status", "")).lower()
+        if "reject" in st or "cancel" in st:
+            for f in ("rejected_reason", "reject_reason", "failure_reason",
+                      "rejected_at_reason", "extended_hours", "notional"):
+                v = getattr(o, f, None)
+                if v and "reason" in f:
+                    return str(v)
+            # nothing in a named field — return the legs' statuses as a hint
+            legs = getattr(o, "legs", None) or []
+            hints = [f"{getattr(l,'symbol','?')}:{getattr(l,'status','?')}" for l in legs]
+            return ("; ".join(hints)) if hints else ""
+        if st in ("filled", "partially_filled", "accepted", "new", "pending_new",
+                  "held", "done_for_day"):
+            return None   # not rejected
+    return None           # still pending after the window — treat as not-rejected
 
 
 def _execute_exit(rec: dict, resp_url: str):
@@ -2973,6 +3020,25 @@ def _cmd_eod(resp_url: str):
     _eod_report_job()
 
 
+def _spy_idea_line() -> str:
+    """One-line confidence + stability read of the current SPY trade idea."""
+    try:
+        t = get_data().get("trade_idea") or {}
+        rec = _spy_recommended(t)
+        if not rec:
+            return "  SPY idea: _none right now_"
+        tier, _ = _spy_trade_quality(t)
+        st = _load_spy_state()
+        sig = _spy_trade_signature(t)
+        stable = f"{int(st.get('stable_n',0))*5}m" if st.get("stable_sig") == sig else "new"
+        icon = {"HIGH": ":green_circle:", "MODERATE": ":large_yellow_circle:"}.get(tier, ":red_circle:")
+        return (f"  SPY idea: {icon} *{tier}* — {rec.get('type','?')} "
+                f"({t.get('dte','?')}DTE) · stable {stable}"
+                + ("  ← *decision-worthy*" if tier == "HIGH" and stable != "new" else ""))
+    except Exception:
+        return "  SPY idea: _n/a_"
+
+
 def _cmd_risk(resp_url: str):
     """`/risk` — fund risk status: equity, today's P&L vs limit, drawdown, budget."""
     try:
@@ -2998,6 +3064,7 @@ def _cmd_risk(resp_url: str):
                        f"_{'rich · sell OK' if v['spread'] >= cfg.get('vrp_min_points',0) else 'cheap · no premium-sells'}_"
                        if v.get('spread') is not None else "  IV vs RV: _n/a_")(_vrp_snapshot()),
             f"  Per-trade budget: ${budget:,.0f}  ({cfg['risk_pct_per_trade']*100:.0f}% of equity)",
+            _spy_idea_line(),
         ]))
     except Exception as e:
         _slack_respond(resp_url, f":rotating_light: Risk status failed: {e}")
@@ -4105,7 +4172,8 @@ def _submit_close(client, legs, coid):
 # Render restart can't double-fire. Kill switch: env AUTO_TRADE_KILL=1.
 
 _AUTO_RUNTIME = os.path.join(os.path.dirname(__file__), "data", "auto_trade_runtime.json")
-_AUTO_ERR: dict = {}   # de-dupe: last date we posted a submit-error to Slack
+_AUTO_ERR: dict = {}        # de-dupe: last date we posted a submit-error to Slack
+_AUTO_PROPOSED: dict = {}   # de-dupe: last date we posted an auto-trade proposal
 
 
 def _auto_runtime_get() -> dict | None:
@@ -4165,7 +4233,7 @@ def _auto_fired_today(date_tag: str) -> bool:
             after=datetime.now(ET) - timedelta(days=2)))
         for o in orders:
             c = getattr(o, "client_order_id", "") or ""
-            if c.startswith("auto-") and not c.startswith("autoclose") and c.endswith(date_tag):
+            if c.startswith("auto-") and not c.startswith("autoclose") and date_tag in c:
                 return True
     except Exception:
         pass
@@ -4349,6 +4417,11 @@ def _auto_trade_job():
             send_message(f":robot_face: *Auto-trade armed* ({_m}) — scanning for the best defined-risk "
                          f"setup ≤ ${max_loss:.0f} max loss until 12:30 ET. One shot.")
 
+        # Already proposed today? (in-memory; one button/day, restart re-proposes
+        # at most one harmless extra button — the user approves each tap.)
+        if _AUTO_PROPOSED.get("date") == date_tag:
+            return
+
         cand = _auto_pick_candidate(max_loss)
         if not cand:
             if now >= dt_time(12, 30):
@@ -4356,29 +4429,29 @@ def _auto_trade_job():
                              f"${max_loss:.0f} max-loss gate by 12:30 ET. No trade today.")
             return   # otherwise keep checking next tick
 
-        res = _auto_place(cand, f"auto-{cand['strategy']}-{date_tag}")
-        if not res["ok"]:
-            logger.info("Auto-trade: stood down this tick — %s", res["reason"])
-            # surface real broker rejections to Slack once/day (not transient drift/quotes)
-            if res["reason"].startswith("submit error") and _AUTO_ERR.get("date") != date_tag:
-                _AUTO_ERR["date"] = date_tag
-                send_message(
-                    f":rotating_light: *Auto-trade REJECTED by Alpaca* — {res['reason']}\n"
-                    f"  ({cand['strategy']} · {cand['label']})\n"
-                    f"  Common causes: API keys don't match the live endpoint (access-key error), "
-                    f"options approval level too low for spreads, or insufficient buying power. "
-                    f"Run `/risk` and check Alpaca → Account.")
-            return   # drift may resolve; retry next tick (idempotency still holds)
-
-        word = "credit" if res["is_credit"] else "debit"
-        send_message(
-            f":robot_face: *AUTO-TRADE PLACED* — {cand['strategy']}\n"
-            f"  *{cand['label']}*\n"
-            f"  {cand['detail']}\n"
-            f"  filled net {word} ${abs(res['live_net']):.2f}  (max loss ≤ ${max_loss:.0f})\n"
-            f"  Order ID: `{res['order_id']}`  ·  one-shot — disarmed for today")
-        logger.info("Auto-trade FILLED: %s | %s | order=%s",
-                    cand["strategy"], cand["label"], res["order_id"])
+        # AUTO-PROPOSE (not auto-place): post a Take button. Tapping runs the proven
+        # _execute_entry path (re-price + drift guard + submit), so you approve each
+        # one and we route through the order path that has actually filled before.
+        tier_note = ""
+        try:
+            t = get_data().get("trade_idea") or {}
+            tier, _ = _spy_trade_quality(t)
+            tier_note = f"  ·  SPY idea tier {tier}"
+        except Exception:
+            pass
+        legs_simple = [{"action": lg["action"], "strike": lg["strike"],
+                        "opt": lg.get("opt", "P"), "qty": lg.get("qty", 1)} for lg in cand["legs"]]
+        tid = register_entry(f"auto-{cand['strategy']}", cand["underlying"], cand["expiry"],
+                             legs_simple, qty=1, ref_net=cand["ref_net"], label=cand["label"],
+                             text=f"*{cand['label']}*  {cand['detail']}{tier_note}")
+        _post_entry_approvals([{"tid": tid,
+                                "text": f"*{cand['label']}*\n  {cand['detail']}{tier_note}",
+                                "label": cand["label"]}])
+        _AUTO_PROPOSED["date"] = date_tag
+        send_message(f":robot_face: *Auto-trade idea ready* ({cand['strategy']}) — "
+                     f"tap *Take* above to place (re-priced live, 20% drift guard). "
+                     f"One proposal/day.")
+        logger.info("Auto-trade PROPOSED: %s | %s", cand["strategy"], cand["label"])
     except Exception as e:
         logger.error("_auto_trade_job error: %s", e)
         try:

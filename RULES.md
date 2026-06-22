@@ -30,9 +30,16 @@ risk rule`. Status: `/risk`.
 
 ## 2. Recurring auto-trade (`config/auto_trade.json`)
 
-- `recurring: true` → fires **one** defined-risk structure **every market day**
-  (idempotent per day), scanning **10:00 AM–12:30 PM ET**; stands down at 12:30
-  if nothing qualifies. (`recurring: false` → one-shot on `armed_date` only.)
+- `recurring: true` → **proposes one** defined-risk structure **every market day**
+  (idempotent per day) as a Slack **Take button** — you approve each one; the tap
+  runs the proven re-price + drift-guard + submit path. Scans **10:00 AM–12:30 PM
+  ET**; stands down at 12:30 if nothing qualifies. (`recurring: false` → one-shot.)
+- **Confidence + stability:** the SPY idea is tiered **HIGH/MODERATE/LOW** (0–4
+  quality points) and tracked for how many consecutive 5-min ticks it has held.
+  A HIGH idea that's been **stable** is decision-worthy; a flickering one is noise.
+  `/risk` shows the live tier + stability.
+- **Rejection visibility:** an accepted-then-async-rejected order is detected on
+  read-back and the reason posted to Slack (instead of a false "Placed").
 - Candidate priority **condor → bull put → fly**; max loss = min($100 cap, 5% of equity).
 - **No 0DTE**; bull puts skipped on an earnings catalyst.
 - Re-priced live at fill; **rejected if drift > 20%**.
