@@ -2395,23 +2395,35 @@ def _legs_to_occ(underlying: str, expiry, legs: list) -> list:
     return out
 
 
-def _reprice_net(legs: list):
-    """Re-fetch live mids and return (net_per_lot, priced_legs) using the same
-    slip convention as /place and close_bwb (SELL ×0.97, BUY ×1.03). net > 0 is
-    a credit. Returns (None, []) if any leg can't be priced."""
-    from src.live.alpaca_options import get_mid_price
+ENTRY_FILL_FRAC = 0.60   # how far from mid toward the natural (fillable) price;
+                         # 0 = mid (often won't fill), 1 = natural/cross (fills now)
+
+
+def _reprice_net(legs: list, fill_frac: float = ENTRY_FILL_FRAC):
+    """Re-fetch live quotes and price each leg `fill_frac` of the way from mid
+    toward its NATURAL fill side (SELL→bid, BUY→ask), so the combo limit is
+    actually marketable. Returns (net_per_lot, priced_legs); net>0 = credit.
+    Falls back to mid if only a mid is available; (None,[]) if unpriceable."""
+    from src.live.alpaca_options import get_quote, get_mid_price
     net = 0.0
     priced = []
     for lg in legs:
-        mid = get_mid_price(lg["symbol"])
-        if mid is None:
-            return None, []
-        if lg["side"] == "SELL":
-            limit = round(mid * 0.97, 2)
-            net  += limit * lg["ratio"]
+        bid, ask = get_quote(lg["symbol"])
+        if bid is not None and ask is not None and ask >= bid:
+            mid = (bid + ask) / 2
+            # toward the side that gets us filled: sell lower (toward bid), buy higher (toward ask)
+            limit = (mid - (mid - bid) * fill_frac) if lg["side"] == "SELL" \
+                    else (mid + (ask - mid) * fill_frac)
+            limit = round(limit, 2)
         else:
-            limit = round(mid * 1.03, 2)
-            net  -= limit * lg["ratio"]
+            mid = get_mid_price(lg["symbol"])
+            if mid is None:
+                return None, []
+            limit = round(mid * (0.97 if lg["side"] == "SELL" else 1.03), 2)
+        if lg["side"] == "SELL":
+            net += limit * lg["ratio"]
+        else:
+            net -= limit * lg["ratio"]
         priced.append({**lg, "mid": mid, "limit": limit})
     return round(net, 2), priced
 
@@ -2500,54 +2512,64 @@ def _execute_entry(rec: dict, resp_url: str):
             limit_price=round(abs(live_net), 2), legs=leg_objs,
             client_order_id=_coid,
         ))
-        # Alpaca ACCEPTS then can reject async — read the order back to catch it
-        # and surface the real reason (which is null on the API order object, so
-        # dump every candidate field to find where it actually lives).
-        rej = _order_rejection(client, order_obj.id)
-        if rej is not None:
-            pending_store.update_status(tid, "rejected", order_id=str(order_obj.id), note=rej)
-            _slack_replace(resp_url,
-                f":rotating_light: *Rejected by Alpaca — {rec['label']}*\n"
-                f"  reason: {rej or '(none reported)'}\n"
-                f"  Order ID: `{order_obj.id}` · check Alpaca dashboard for detail")
-            return
-        pending_store.update_status(tid, "taken", order_id=str(order_obj.id), live_net=live_net)
+        # Accepted ≠ filled. Poll the order and report the TRUTH (a resting limit
+        # that never fills and cancels at the close looks "placed" but isn't).
         word = "credit" if is_credit else "debit"
-        _slack_replace(resp_url,
-            f":white_check_mark: *Placed — {rec['label']}*  (qty {qty})\n"
-            f"  Net {word} ${abs(live_net):.2f}  _(alert ${abs(ref_net):.2f})_\n"
-            f"  Order ID: `{order_obj.id}`")
+        status, filled, note = _confirm_fill(client, order_obj.id)
+        if status == "filled":
+            pending_store.update_status(tid, "taken", order_id=str(order_obj.id), live_net=live_net)
+            _slack_replace(resp_url,
+                f":white_check_mark: *FILLED — {rec['label']}*  (qty {qty})\n"
+                f"  Net {word} ${abs(live_net):.2f}  _(alert ${abs(ref_net):.2f})_\n"
+                f"  Order ID: `{order_obj.id}`")
+        elif status in ("rejected", "canceled"):
+            pending_store.update_status(tid, "rejected", order_id=str(order_obj.id), note=note)
+            _slack_replace(resp_url,
+                f":rotating_light: *Not filled — {rec['label']}* ({status})\n"
+                f"  {note or 'order did not fill'}\n"
+                f"  Order ID: `{order_obj.id}`")
+        else:   # still working / unfilled limit
+            pending_store.update_status(tid, "working", order_id=str(order_obj.id), live_net=live_net)
+            _slack_replace(resp_url,
+                f":hourglass_flowing_sand: *Working (not yet filled) — {rec['label']}*\n"
+                f"  Limit net {word} ${abs(live_net):.2f}; resting at the broker. "
+                f"Fills if the market reaches it, else expires at the close.\n"
+                f"  Order ID: `{order_obj.id}`")
     except Exception as e:
         pending_store.update_status(tid, "failed", note=str(e))
         _slack_replace(resp_url, f":rotating_light: *Place failed — {rec['label']}*: {e}")
 
 
-def _order_rejection(client, order_id, waits=(1.0, 2.0, 2.0)):
-    """Poll an order briefly; if it ends REJECTED/CANCELED, return the reason
-    string (searching every field that might hold it). Returns None if it's live/
-    filled (i.e. NOT rejected). Empty string = rejected but no reason exposed."""
+def _confirm_fill(client, order_id, waits=(2.0, 3.0, 3.0, 4.0, 4.0)):
+    """Poll an order to its real outcome. Returns (status, filled_qty, note) where
+    status ∈ {filled, rejected, canceled, working}. Accepted-but-unfilled limits
+    return 'working' so we never report a false fill."""
     import time as _t
+    last = None
     for w in waits:
         _t.sleep(w)
         try:
             o = client.get_order_by_id(order_id)
         except Exception:
-            return None
-        st = str(getattr(o, "status", "")).lower()
+            return ("working", 0.0, "")
+        st     = str(getattr(o, "status", "")).lower()
+        filled = float(getattr(o, "filled_qty", 0) or 0)
+        last   = o
+        if "filled" in st and filled > 0 and "partial" not in st:
+            return ("filled", filled, "")
         if "reject" in st or "cancel" in st:
-            for f in ("rejected_reason", "reject_reason", "failure_reason",
-                      "rejected_at_reason", "extended_hours", "notional"):
+            reason = ""
+            for f in ("rejected_reason", "reject_reason", "failure_reason"):
                 v = getattr(o, f, None)
-                if v and "reason" in f:
-                    return str(v)
-            # nothing in a named field — return the legs' statuses as a hint
-            legs = getattr(o, "legs", None) or []
-            hints = [f"{getattr(l,'symbol','?')}:{getattr(l,'status','?')}" for l in legs]
-            return ("; ".join(hints)) if hints else ""
-        if st in ("filled", "partially_filled", "accepted", "new", "pending_new",
-                  "held", "done_for_day"):
-            return None   # not rejected
-    return None           # still pending after the window — treat as not-rejected
+                if v:
+                    reason = str(v); break
+            if not reason:
+                reason = ("no fill at the limit; canceled" if "cancel" in st
+                          else "rejected by broker (see Alpaca)")
+            return ("canceled" if "cancel" in st else "rejected", filled, reason)
+    # window elapsed, still live → working limit (will fill later or expire at close)
+    fq = float(getattr(last, "filled_qty", 0) or 0) if last else 0.0
+    return ("filled" if fq > 0 else "working", fq, "")
 
 
 def _execute_exit(rec: dict, resp_url: str):

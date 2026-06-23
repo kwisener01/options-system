@@ -126,8 +126,8 @@ def find_contract(underlying: str, expiry: date, option_type: str,
 
 # ── live quote ────────────────────────────────────────────────────────────────
 
-def get_mid_price(symbol: str) -> Optional[float]:
-    """Return the mid-price of a live option quote, or None on failure."""
+def get_quote(symbol: str):
+    """Return (bid, ask) for a live option quote, or (None, None) on failure."""
     try:
         try:
             from alpaca.data.requests import OptionLatestQuoteRequest
@@ -138,9 +138,17 @@ def get_mid_price(symbol: str) -> Optional[float]:
         quotes = _data().get_option_latest_quote(req)
         q = quotes.get(symbol)
         if q and q.bid_price is not None and q.ask_price is not None:
-            return (float(q.bid_price) + float(q.ask_price)) / 2
+            return float(q.bid_price), float(q.ask_price)
     except Exception as e:
         logger.warning("Quote fetch failed for %s: %s", symbol, e)
+    return None, None
+
+
+def get_mid_price(symbol: str) -> Optional[float]:
+    """Return the mid-price of a live option quote, or None on failure."""
+    bid, ask = get_quote(symbol)
+    if bid is not None and ask is not None:
+        return (bid + ask) / 2
     return None
 
 
