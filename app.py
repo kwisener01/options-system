@@ -2851,18 +2851,27 @@ def _close_option_structure(ticker: str, resp_url: str):
         if not legs_pos:
             _slack_respond(resp_url, f":x: No open option legs for `{ticker}`.")
             return
+        from src.live.alpaca_options import get_quote
         net_debit, leg_objs, unreal = 0.0, [], 0.0
+        CLOSE_FRAC = 0.85   # price aggressively toward the natural side so the exit fills
         for pos in legs_pos:
-            mid = get_mid_price(pos.symbol)
-            if mid is None:
-                continue
+            bid, ask = get_quote(pos.symbol)
+            if bid is not None and ask is not None and ask >= bid:
+                mid = (bid + ask) / 2
+            else:
+                mid = get_mid_price(pos.symbol)
+                if mid is None:
+                    continue
+                bid, ask = mid * 0.9, mid * 1.1
             qn, ratio = float(pos.qty), int(abs(float(pos.qty)))
             unreal += float(getattr(pos, "unrealized_pl", 0) or 0)
-            if qn > 0:
-                side, intent, limit = OrderSide.SELL, PositionIntent.SELL_TO_CLOSE, round(mid * 0.95, 2)
+            if qn > 0:   # long leg → SELL to close, price toward the bid (fills)
+                limit = round(mid - (mid - bid) * CLOSE_FRAC, 2)
+                side, intent = OrderSide.SELL, PositionIntent.SELL_TO_CLOSE
                 net_debit -= limit * ratio * 100
-            else:
-                side, intent, limit = OrderSide.BUY, PositionIntent.BUY_TO_CLOSE, round(mid * 1.05, 2)
+            else:        # short leg → BUY to close, price toward the ask (fills)
+                limit = round(mid + (ask - mid) * CLOSE_FRAC, 2)
+                side, intent = OrderSide.BUY, PositionIntent.BUY_TO_CLOSE
                 net_debit += limit * ratio * 100
             leg_objs.append(OptionLegRequest(symbol=pos.symbol, ratio_qty=ratio,
                                              side=side, position_intent=intent))
