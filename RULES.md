@@ -105,6 +105,48 @@ live split vs. the caps.
 
 ---
 
+## 7. Operating Manual — how to run it
+
+> Adopted 2026-06-23 after deciding to **stop building and start running**. The
+> machine is done; a great fund is built by running a disciplined process over
+> time and measuring honestly — not by adding features. **The trader is the risk.**
+
+### Cadence
+- **Daily (5 min):** let the auto-trade place its one trade; read the fill line
+  (FILLED vs working/not-filled). Check `/risk` once. Tap approval buttons **only
+  for HIGH-tier, stable setups** — most days you do nothing, and that's correct.
+- **Weekly:** `/attribution` (what's making/losing money), `/allocation` (within
+  caps?), close persistent losers.
+- **Monthly:** `/performance`. One question — *is expectancy positive across enough
+  closed trades?* Yes → continue. No → the strategy, not execution, needs rethink.
+
+### Discipline (the rules that actually make or break it)
+1. **Don't touch the dials after a streak.** Up big → do NOT size up. Down a week
+   → do NOT widen gates or "make it back." Settings are set; leave them.
+2. **Don't override the risk gates.** "Blocked — cash floor" / "stood down —
+   negative edge" is the fund *working*. Respect it.
+3. **Stay small.** Each trade at the 5% cap (~$115 now). Survive to compound.
+   Boredom is the strategy.
+4. **One trade ≠ signal.** Conclude nothing from a single day — premium selling
+   wins most days even when it loses money long-term.
+5. **No new toys live.** 0DTE stays off; unbuilt strategies stay unbuilt — until
+   the *core* shows measured edge.
+
+### How you'll know it's working (timeline)
+- Need **~30–50 closed trades** before `/attribution` means anything ≈ **6–10
+  weeks** at one auto-trade/day.
+- **Judge at 3 months, decide at 6.** Shorter is noise.
+- **Success = positive expectancy + drawdown within limits**, not a big return
+  number. 12%/yr at 8% max DD beats a lucky 60% that gives it back.
+
+### Kill criteria (predefined — decide now, don't rationalize later)
+- Drawdown **−15% from peak** → engine auto-halts new entries; stop and review.
+- **3 months of negative expectancy** → pause live, back to shadow/paper.
+- Any single loss **> 2× the max-loss budget** → something broke; stop and
+  investigate before the next trade.
+
+---
+
 ## Not yet enforced (honest gaps)
 
 1. **No validated backtest** of the live GEX strategies — backtests cover
