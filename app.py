@@ -888,8 +888,12 @@ def api_close_prompt(ticker):
             return jsonify({"ok": False, "error": "no open option legs"}), 404
         label = f"{ticker} spread ({len(legs)} legs)"
         text  = f"*Close {label}?*  _tap to submit a closing order_"
-        tid   = register_exit("structure", ticker, label, text)
-        _post_exit_approvals([{"tid": tid, "text": text, "label": label}])
+        # restart-proof: button value carries the ticker, not a stored record id
+        from src.notifications.slack_blocks import exit_blocks
+        from src.notifications.slack_notifier import send_blocks
+        blocks, fb = exit_blocks(":outbox_tray: *Close position*",
+                                 [{"tid": f"close_ticker:{ticker}", "text": text, "label": label}])
+        send_blocks(blocks, fb)
         return jsonify({"ok": True, "posted": label})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:200]}), 500
@@ -2734,6 +2738,13 @@ def slack_interactive():
     aid      = action.get("action_id", "")
     tid      = action.get("value", "")
     resp_url = payload.get("response_url", "")
+
+    # Restart-proof close: value "close_ticker:SYM" carries the ticker directly,
+    # so it works even after the ephemeral pending-store is wiped on a redeploy.
+    if aid == ACTION_CLOSE and isinstance(tid, str) and tid.startswith("close_ticker:"):
+        sym = tid.split(":", 1)[1].upper()
+        threading.Thread(target=lambda: _close_option_structure(sym, resp_url), daemon=True).start()
+        return "", 200
 
     pending_store.purge_expired()
     rec = pending_store.get(tid)
