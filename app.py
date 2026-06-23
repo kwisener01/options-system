@@ -873,6 +873,28 @@ def api_expected_move():
         return jsonify({"ok": False, "error": str(e)[:200]}), 500
 
 
+@app.route("/api/close-prompt/<ticker>", methods=["GET", "POST"])
+def api_close_prompt(ticker):
+    """Post a Close/Hold button for a ticker's option structure to Slack so it can
+    be closed with a tap (no slash command needed). Exposes NO account data; the
+    close itself still requires the signature-verified Slack button tap."""
+    try:
+        ticker = ticker.upper()
+        from src.live.alpaca_options import _trading
+        legs = [p for p in _trading().get_all_positions()
+                if (getattr(p, "asset_class", "") in ("us_option", "option") or len(p.symbol) > 8)
+                and p.symbol.upper().startswith(ticker)]
+        if not legs:
+            return jsonify({"ok": False, "error": "no open option legs"}), 404
+        label = f"{ticker} spread ({len(legs)} legs)"
+        text  = f"*Close {label}?*  _tap to submit a closing order_"
+        tid   = register_exit("structure", ticker, label, text)
+        _post_exit_approvals([{"tid": tid, "text": text, "label": label}])
+        return jsonify({"ok": True, "posted": label})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)[:200]}), 500
+
+
 @app.route("/api/mode")
 def api_mode():
     """LIVE vs PAPER, derived from ALPACA_BASE_URL only. No account data exposed."""
@@ -1733,10 +1755,18 @@ def _spy_trade_monitor_job():
             from src.analysis.condor_scanner import scan as condor_scan, fmt_slack as condor_fmt
             gx = gex_scan()
 
+            # Bucket strikes so tiny (1–2pt) wiggles don't re-fire the same idea.
+            # Re-alert only on a meaningful strike move (bucket grid) / expiry change.
+            def _b(x, n):
+                try:
+                    return int(round(float(x) / n) * n)
+                except Exception:
+                    return x
+
             fly = fly_scan(gx.spot, gx, dte_min=0, dte_max=10) if gx else {}
             cands = fly.get("candidates") or []
             top = cands[0] if cands else None
-            fly_sig = (f"{top['ticker']}|{top['short_body']}|{top['wing']}|{top['expiry']}"
+            fly_sig = (f"{top['ticker']}|{_b(top['short_body'],2)}|{top['wing']}|{top['expiry']}"
                        if top else None)
             if fly_sig and state.get("fly_sig") != fly_sig:
                 send_message(f":alarm_clock: _{now}_\n" + fly_fmt(fly))
@@ -1747,7 +1777,7 @@ def _spy_trade_monitor_job():
 
             con = condor_scan(gx.spot, gx, dte_min=0, dte_max=7) if gx else {}
             cc = con.get("candidate")
-            con_sig = (f"{cc['ticker']}|{cc['short_put']}|{cc['short_call']}|{cc['expiry']}"
+            con_sig = (f"{cc['ticker']}|{_b(cc['short_put'],5)}|{_b(cc['short_call'],5)}|{cc['expiry']}"
                        if cc else None)
             if con_sig and state.get("con_sig") != con_sig:
                 send_message(f":alarm_clock: _{now}_\n" + condor_fmt(con))
@@ -1759,7 +1789,7 @@ def _spy_trade_monitor_job():
             from src.analysis.batman_scanner import scan as batman_scan, fmt_slack as batman_fmt
             bat = batman_scan(gx.spot, gx, dte_min=5, dte_max=21) if gx else {}
             bc = bat.get("candidate")
-            bat_sig = (f"{bc['put_short']}|{bc['call_short']}|{bc['outer_wing']}|{bc['expiry']}"
+            bat_sig = (f"{_b(bc['put_short'],5)}|{_b(bc['call_short'],5)}|{bc['outer_wing']}|{bc['expiry']}"
                        if bc else None)
             if bat_sig and state.get("bat_sig") != bat_sig:
                 send_message(f":alarm_clock: _{now}_\n" + batman_fmt(bat))
