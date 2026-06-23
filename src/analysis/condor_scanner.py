@@ -35,6 +35,9 @@ DEFAULT_DELTA = 0.16    # short-strike target (~84% POP/side); pass 0.10 for ~90
 DEFAULT_WING  = 5       # spread width (points) on each side
 MIN_CREDIT    = 0.20    # skip condors thinner than this (per share, total)
 VIX_FLOOR     = 11.0    # below this, premium is too thin to bother
+EDGE_MARGIN   = 5       # POP must beat the breakeven win-rate by ≥ this many points
+                        # (breakeven POP = 1 − credit/width). Below it the condor has
+                        # negative expectancy no matter how high the raw win rate.
 
 
 def _abs_put_delta(S, K, T, sigma):
@@ -154,6 +157,14 @@ def scan(spot: float, gex, ticker: str = "SPY",
     sc_d = _call_delta(spot, short_call, T, _iv(crows, short_call))
     pop_between = round((1 - sp_d - sc_d) * 100)   # P(finish between shorts)
 
+    # Expectancy gate: breakeven win-rate = 1 − credit/width. If POP doesn't beat
+    # it by EDGE_MARGIN, the condor is a negative-EV bet regardless of raw win %.
+    breakeven_pop = round((1 - credit / max_w) * 100)
+    if pop_between < breakeven_pop + EDGE_MARGIN:
+        out["note"] = (f"Negative edge: POP {pop_between}% < breakeven "
+                       f"{breakeven_pop}%+{EDGE_MARGIN} (credit ${credit:.2f} / {max_w:.0f} wide).")
+        return out
+
     max_loss = round((max_w - credit) * 100)
     out["candidate"] = {
         "ticker": ticker, "expiry": exp, "dte": dte,
@@ -166,7 +177,9 @@ def scan(spot: float, gex, ticker: str = "SPY",
         "lower_be": round(short_put - credit, 2),
         "upper_be": round(short_call + credit, 2),
         "short_put_delta": round(sp_d, 2), "short_call_delta": round(sc_d, 2),
-        "pop_pct": pop_between, "vol_band": out["vol_band"], "vix": round(vix, 1),
+        "pop_pct": pop_between, "breakeven_pop": breakeven_pop,
+        "edge_pts": pop_between - breakeven_pop,
+        "vol_band": out["vol_band"], "vix": round(vix, 1),
         "legs": [
             {"action": "BUY",  "strike": long_put,   "opt": "P", "qty": 1, "mid": put_mids[long_put]},
             {"action": "SELL", "strike": short_put,  "opt": "P", "qty": 1, "mid": put_mids[short_put]},
@@ -199,6 +212,7 @@ def fmt_slack(result: dict) -> str:
         f"(short {c['short_call_delta']:.2f}Δ)",
         f"  Credit +${c['credit']:.2f} (${c['max_profit_usd']})  |  "
         f"Max loss -${c['max_loss_usd']}  |  R/R {c['rr']:.2f}",
-        f"  POP ~{c['pop_pct']}% between shorts  |  profit ${c['lower_be']:.0f}–${c['upper_be']:.0f}",
+        f"  POP ~{c['pop_pct']}% vs breakeven {c.get('breakeven_pop','?')}%  "
+        f"(*+{c.get('edge_pts','?')}pt edge*)  |  profit ${c['lower_be']:.0f}–${c['upper_be']:.0f}",
         f"  _manage at 50% — close to cut the gamma tail_",
     ])

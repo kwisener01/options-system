@@ -281,6 +281,20 @@ def test_zerodte_strikes():
     print("ok  0DTE strikes (short at expected move, width below)")
 
 
+def test_condor_edge_gate():
+    # breakeven POP = 1 - credit/width; gate needs POP >= breakeven + EDGE_MARGIN
+    from src.analysis import condor_scanner as cs
+    # today's bad condor: $0.40 credit / $5 wide -> breakeven 92%, POP 82% -> REJECT
+    be = round((1 - 0.40 / 5) * 100)
+    assert be == 92
+    assert 82 < be + cs.EDGE_MARGIN          # 82 < 97 -> rejected
+    # a good one: $1.20 credit / $5 wide -> breakeven 76%, POP 84% -> PASS
+    be2 = round((1 - 1.20 / 5) * 100)
+    assert be2 == 76
+    assert 84 >= be2 + cs.EDGE_MARGIN        # 84 >= 81 -> passes
+    print("ok  condor edge gate (POP vs breakeven win-rate)")
+
+
 if __name__ == "__main__":
     test_pending_store()
     test_blocks()
@@ -296,4 +310,5 @@ if __name__ == "__main__":
     test_realized_vol()
     test_expected_move()
     test_zerodte_strikes()
+    test_condor_edge_gate()
     print("\nALL PASS")
