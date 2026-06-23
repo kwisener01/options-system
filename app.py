@@ -4195,7 +4195,6 @@ def _submit_close(client, legs, coid):
 
 _AUTO_RUNTIME = os.path.join(os.path.dirname(__file__), "data", "auto_trade_runtime.json")
 _AUTO_ERR: dict = {}        # de-dupe: last date we posted a submit-error to Slack
-_AUTO_PROPOSED: dict = {}   # de-dupe: last date we posted an auto-trade proposal
 
 
 def _auto_runtime_get() -> dict | None:
@@ -4373,13 +4372,17 @@ def _auto_place(cand: dict, client_order_id: str) -> dict:
                                  else PositionIntent.BUY_TO_OPEN))
             for lg in priced
         ]
-        order = _trading().submit_order(LimitOrderRequest(
+        client = _trading()
+        order = client.submit_order(LimitOrderRequest(
             symbol=cand["underlying"], qty=1,
             side=OrderSide.SELL if is_credit else OrderSide.BUY,
             type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
             limit_price=round(abs(live_net), 2), legs=leg_objs,
             client_order_id=client_order_id))
-        return {"ok": True, "order_id": str(order.id), "live_net": live_net, "is_credit": is_credit}
+        # confirm it actually fills — never report a fill on mere acceptance
+        status, filled, note = _confirm_fill(client, order.id)
+        return {"ok": True, "order_id": str(order.id), "live_net": live_net,
+                "is_credit": is_credit, "status": status, "filled": filled, "note": note}
     except Exception as e:
         return {"ok": False, "reason": f"submit error: {e}"}
 
@@ -4439,11 +4442,6 @@ def _auto_trade_job():
             send_message(f":robot_face: *Auto-trade armed* ({_m}) — scanning for the best defined-risk "
                          f"setup ≤ ${max_loss:.0f} max loss until 12:30 ET. One shot.")
 
-        # Already proposed today? (in-memory; one button/day, restart re-proposes
-        # at most one harmless extra button — the user approves each tap.)
-        if _AUTO_PROPOSED.get("date") == date_tag:
-            return
-
         cand = _auto_pick_candidate(max_loss)
         if not cand:
             if now >= dt_time(12, 30):
@@ -4451,29 +4449,39 @@ def _auto_trade_job():
                              f"${max_loss:.0f} max-loss gate by 12:30 ET. No trade today.")
             return   # otherwise keep checking next tick
 
-        # AUTO-PROPOSE (not auto-place): post a Take button. Tapping runs the proven
-        # _execute_entry path (re-price + drift guard + submit), so you approve each
-        # one and we route through the order path that has actually filled before.
-        tier_note = ""
-        try:
-            t = get_data().get("trade_idea") or {}
-            tier, _ = _spy_trade_quality(t)
-            tier_note = f"  ·  SPY idea tier {tier}"
-        except Exception:
-            pass
-        legs_simple = [{"action": lg["action"], "strike": lg["strike"],
-                        "opt": lg.get("opt", "P"), "qty": lg.get("qty", 1)} for lg in cand["legs"]]
-        tid = register_entry(f"auto-{cand['strategy']}", cand["underlying"], cand["expiry"],
-                             legs_simple, qty=1, ref_net=cand["ref_net"], label=cand["label"],
-                             text=f"*{cand['label']}*  {cand['detail']}{tier_note}")
-        _post_entry_approvals([{"tid": tid,
-                                "text": f"*{cand['label']}*\n  {cand['detail']}{tier_note}",
-                                "label": cand["label"]}])
-        _AUTO_PROPOSED["date"] = date_tag
-        send_message(f":robot_face: *Auto-trade idea ready* ({cand['strategy']}) — "
-                     f"tap *Take* above to place (re-priced live, 20% drift guard). "
-                     f"One proposal/day.")
-        logger.info("Auto-trade PROPOSED: %s | %s", cand["strategy"], cand["label"])
+        # AUTO-PLACE the one daily trade (fully automatic; the rest of the system
+        # is button-approval). Marketable limit + fill confirmation built in.
+        res = _auto_place(cand, f"auto-{cand['strategy']}-{date_tag}")
+        if not res["ok"]:
+            logger.info("Auto-trade: stood down this tick — %s", res["reason"])
+            if res["reason"].startswith("submit error") and _AUTO_ERR.get("date") != date_tag:
+                _AUTO_ERR["date"] = date_tag
+                send_message(f":rotating_light: *Auto-trade submit error* — {res['reason']}\n"
+                             f"  ({cand['strategy']} · {cand['label']})")
+            return   # drift/quotes may resolve; retry next tick (idempotent)
+
+        word   = "credit" if res["is_credit"] else "debit"
+        status = res.get("status", "working")
+        if status == "filled":
+            send_message(
+                f":robot_face: *AUTO-TRADE FILLED* — {cand['strategy']}\n"
+                f"  *{cand['label']}*\n  {cand['detail']}\n"
+                f"  net {word} ${abs(res['live_net']):.2f}  (max loss ≤ ${max_loss:.0f})\n"
+                f"  Order ID: `{res['order_id']}`  ·  managed at 50% / 1-DTE")
+            logger.info("Auto-trade FILLED: %s | %s | order=%s",
+                        cand["strategy"], cand["label"], res["order_id"])
+        elif status in ("rejected", "canceled"):
+            send_message(
+                f":rotating_light: *Auto-trade not filled* ({status}) — {cand['strategy']} {cand['label']}\n"
+                f"  {res.get('note') or 'did not fill at the limit'}\n"
+                f"  Order ID: `{res['order_id']}` · daily attempt spent")
+            logger.info("Auto-trade %s: %s (%s)", status, cand["label"], res.get("note"))
+        else:   # working — resting limit; report once, idempotency stops re-fire
+            send_message(
+                f":robot_face: *Auto-trade working* — {cand['strategy']} {cand['label']}\n"
+                f"  limit net {word} ${abs(res['live_net']):.2f} resting; fills if the market "
+                f"reaches it.  Order ID: `{res['order_id']}`")
+            logger.info("Auto-trade WORKING: %s | %s", cand["strategy"], cand["label"])
     except Exception as e:
         logger.error("_auto_trade_job error: %s", e)
         try:
