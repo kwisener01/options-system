@@ -2827,6 +2827,24 @@ def _close_option_structure(ticker: str, resp_url: str):
     from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
     try:
         client = _trading()
+        # Cancel any working orders on this underlying first — a stale resting
+        # close from a prior attempt causes wash-trade/duplicate rejections.
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            for o in client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=200)):
+                osym = (getattr(o, "symbol", "") or "").upper()
+                legs = getattr(o, "legs", None) or []
+                touches = osym == ticker or any((getattr(l, "symbol", "") or "").upper().startswith(ticker)
+                                                for l in legs)
+                if touches:
+                    try:
+                        client.cancel_order_by_id(o.id)
+                    except Exception:
+                        pass
+        except Exception as e:
+            logger.warning("close: cancel-existing %s failed: %s", ticker, e)
+
         legs_pos = [p for p in client.get_all_positions()
                     if (getattr(p, "asset_class", "") in ("us_option", "option") or len(p.symbol) > 8)
                     and p.symbol.upper().startswith(ticker)]
@@ -2857,11 +2875,22 @@ def _close_option_structure(ticker: str, resp_url: str):
             symbol=ticker, qty=1, side=OrderSide.BUY if is_debit else OrderSide.SELL,
             type=OrderType.LIMIT, time_in_force=TimeInForce.DAY, limit_price=net_share,
             legs=leg_objs, client_order_id=f"close-{ticker}-{datetime.now(ET):%Y%m%d%H%M%S}"))
+        status, filled, note = _confirm_fill(client, order.id)
         icon = ":green_circle:" if unreal >= 0 else ":red_circle:"
-        _slack_respond(resp_url,
-            f"{icon} *Closing `{ticker}` spread* ({len(leg_objs)} legs)\n"
-            f"  Net {'debit' if is_debit else 'credit'} ${net_share:.2f}  |  P&L ${unreal:+,.2f}\n"
-            f"  Order ID: `{order.id}`  ·  check fill in Alpaca")
+        if status == "filled":
+            _slack_respond(resp_url,
+                f"{icon} *Closed `{ticker}` spread* ({len(leg_objs)} legs)\n"
+                f"  Net {'debit' if is_debit else 'credit'} ${net_share:.2f}  |  P&L ${unreal:+,.2f}\n"
+                f"  Order ID: `{order.id}`")
+        elif status in ("rejected", "canceled"):
+            _slack_respond(resp_url,
+                f":rotating_light: *Close {status} — `{ticker}`*\n  {note or 'broker refused'}\n"
+                f"  Order ID: `{order.id}`")
+        else:
+            _slack_respond(resp_url,
+                f":hourglass_flowing_sand: *Close working — `{ticker}`* ({len(leg_objs)} legs)\n"
+                f"  Limit net {'debit' if is_debit else 'credit'} ${net_share:.2f} resting; "
+                f"fills if the market reaches it.\n  Order ID: `{order.id}`")
     except Exception as e:
         _slack_respond(resp_url, f":rotating_light: Close failed for `{ticker}`: {e}")
 
