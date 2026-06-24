@@ -113,7 +113,7 @@ def run():
 
     # -- Submit multi-leg order -----------------------------------------------
     from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent, OrderClass
 
     legs = [
         OptionLegRequest(
@@ -132,12 +132,12 @@ def run():
 
     try:
         req = LimitOrderRequest(
-            symbol=args.ticker.upper(),
             qty=1,
+            order_class=OrderClass.MLEG,
             side=OrderSide.SELL,        # credit spread = net sell
             type=OrderType.LIMIT,
             time_in_force=TimeInForce.DAY,
-            limit_price=net_credit,     # net credit per share
+            limit_price=round(-net_credit, 2),   # signed net: credit < 0
             legs=legs,
         )
         order = _trading().submit_order(req)

@@ -32,7 +32,7 @@ def run():
     dry    = args.dry_run
 
     from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent, OrderClass
 
     print(f"\n=== CLOSE OPTION SPREAD: {ticker} ===")
     print(f"Mode: {'DRY RUN' if dry else '*** LIVE ***'}\n")
@@ -122,12 +122,12 @@ def run():
 
     try:
         req = LimitOrderRequest(
-            symbol=ticker,
             qty=1,
+            order_class=OrderClass.MLEG,
             side=OrderSide.BUY if is_debit else OrderSide.SELL,
             type=OrderType.LIMIT,
             time_in_force=TimeInForce.DAY,
-            limit_price=net_per_share,
+            limit_price=(net_per_share if is_debit else -net_per_share),  # signed net
             legs=leg_objects,
         )
         order = client.submit_order(req)

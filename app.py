@@ -2499,7 +2499,7 @@ def _execute_entry(rec: dict, resp_url: str):
     from src.notifications import pending_store
     from src.live.alpaca_options import _trading
     from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent, OrderClass
     tid = rec["id"]
     try:
         allowed, reason = _risk_check_entry(None)
@@ -2540,10 +2540,10 @@ def _execute_entry(rec: dict, resp_url: str):
         _strat = rec.get("strategy", "opt")
         _coid  = f"{_strat}-{rec['underlying']}-{datetime.now(ET):%Y%m%d}-{tid[:4]}"
         order_obj = client.submit_order(LimitOrderRequest(
-            symbol=rec["underlying"], qty=1,
+            qty=1, order_class=OrderClass.MLEG,
             side=OrderSide.SELL if is_credit else OrderSide.BUY,
             type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
-            limit_price=round(abs(live_net), 2), legs=leg_objs,
+            limit_price=round(-live_net, 2), legs=leg_objs,   # signed: credit<0, debit>0
             client_order_id=_coid,
         ))
         # Accepted ≠ filled. Poll the order and report the TRUTH (a resting limit
@@ -2611,7 +2611,7 @@ def _execute_exit(rec: dict, resp_url: str):
     from src.notifications import pending_store
     from src.live.alpaca_options import _trading, get_mid_price
     from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, OptionLegRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent, OrderClass
     tid = rec["id"]
     try:
         client = _trading()
@@ -2676,10 +2676,10 @@ def _execute_exit(rec: dict, resp_url: str):
         is_debit = net_debit > 0
         net_share = round(abs(net_debit) / 100, 2)
         order_obj = client.submit_order(LimitOrderRequest(
-            symbol=underlying, qty=1,
+            qty=1, order_class=OrderClass.MLEG,
             side=OrderSide.BUY if is_debit else OrderSide.SELL,
             type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
-            limit_price=net_share, legs=leg_objs))
+            limit_price=(net_share if is_debit else -net_share), legs=leg_objs))
         pending_store.update_status(tid, "taken", order_id=str(order_obj.id))
         icon = ":green_circle:" if total_unreal >= 0 else ":red_circle:"
         _slack_replace(resp_url,
@@ -2824,7 +2824,7 @@ def _close_option_structure(ticker: str, resp_url: str):
     when new opens are rejected for insufficient BP."""
     from src.live.alpaca_options import _trading, get_mid_price
     from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent, OrderClass
     try:
         client = _trading()
         # Cancel any working orders on this underlying first — a stale resting
@@ -2881,8 +2881,10 @@ def _close_option_structure(ticker: str, resp_url: str):
         is_debit  = net_debit > 0
         net_share = round(abs(net_debit) / 100, 2)
         order = client.submit_order(LimitOrderRequest(
-            symbol=ticker, qty=1, side=OrderSide.BUY if is_debit else OrderSide.SELL,
-            type=OrderType.LIMIT, time_in_force=TimeInForce.DAY, limit_price=net_share,
+            qty=1, order_class=OrderClass.MLEG,
+            side=OrderSide.BUY if is_debit else OrderSide.SELL,
+            type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
+            limit_price=(net_share if is_debit else -net_share),
             legs=leg_objs, client_order_id=f"close-{ticker}-{datetime.now(ET):%Y%m%d%H%M%S}"))
         status, filled, note = _confirm_fill(client, order.id)
         icon = ":green_circle:" if unreal >= 0 else ":red_circle:"
@@ -2943,7 +2945,7 @@ def _cmd_place(args: str, resp_url: str):
     """args: TICKER SHORT LONG EXPIRY [QTY]"""
     from src.live.alpaca_options import _trading, get_mid_price, occ_symbol
     from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent, OrderClass
     from datetime import date
     try:
         parts = args.split()
@@ -2994,9 +2996,9 @@ def _cmd_place(args: str, resp_url: str):
                              side=OrderSide.BUY,  position_intent=PositionIntent.BUY_TO_OPEN),
         ]
         order = _trading().submit_order(LimitOrderRequest(
-            symbol=ticker, qty=1, side=OrderSide.SELL,
+            qty=1, order_class=OrderClass.MLEG, side=OrderSide.SELL,
             type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
-            limit_price=net_credit, legs=legs,
+            limit_price=round(-net_credit, 2), legs=legs,   # signed: credit<0
         ))
         _slack_respond(resp_url,
             f":white_check_mark: *Placed — Bull Put Spread*\n"
@@ -4099,7 +4101,7 @@ def _zerodte_place(short_k, long_k, coid, budget, cfg) -> dict:
     """Submit the SPY 0DTE put spread; respects the per-trade budget + min credit."""
     from src.live.alpaca_options import _trading, get_mid_price, occ_symbol
     from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent, OrderClass
     try:
         today = date.today()
         ssym = occ_symbol("SPY", today, "PUT", short_k)
@@ -4121,8 +4123,8 @@ def _zerodte_place(short_k, long_k, coid, budget, cfg) -> dict:
                              position_intent=PositionIntent.BUY_TO_OPEN),
         ]
         o = _trading().submit_order(LimitOrderRequest(
-            symbol="SPY", qty=1, side=OrderSide.SELL, type=OrderType.LIMIT,
-            time_in_force=TimeInForce.DAY, limit_price=credit, legs=legs, client_order_id=coid))
+            qty=1, order_class=OrderClass.MLEG, side=OrderSide.SELL, type=OrderType.LIMIT,
+            time_in_force=TimeInForce.DAY, limit_price=round(-credit, 2), legs=legs, client_order_id=coid))  # signed: credit<0
         return {"ok": True, "order_id": str(o.id), "credit": credit, "max_loss": max_loss}
     except Exception as e:
         return {"ok": False, "reason": f"submit error: {e}"}
@@ -4237,7 +4239,7 @@ def _submit_close(client, legs, coid):
     """Close a specific set of option-leg positions as one multi-leg order."""
     from src.live.alpaca_options import get_mid_price
     from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent, OrderClass
     net_debit, leg_objs, unreal, underlying = 0.0, [], 0.0, None
     for pos in legs:
         mid = get_mid_price(pos.symbol)
@@ -4258,8 +4260,10 @@ def _submit_close(client, legs, coid):
     is_debit  = net_debit > 0
     net_share = round(abs(net_debit) / 100, 2)
     o = client.submit_order(LimitOrderRequest(
-        symbol=underlying, qty=1, side=OrderSide.BUY if is_debit else OrderSide.SELL,
-        type=OrderType.LIMIT, time_in_force=TimeInForce.DAY, limit_price=net_share,
+        qty=1, order_class=OrderClass.MLEG,
+        side=OrderSide.BUY if is_debit else OrderSide.SELL,
+        type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
+        limit_price=(net_share if is_debit else -net_share),
         legs=leg_objs, client_order_id=coid))
     return {"order_id": str(o.id), "unreal": round(unreal, 2)}
 
@@ -4432,7 +4436,7 @@ def _auto_place(cand: dict, client_order_id: str) -> dict:
     client_order_id for idempotency. Returns {ok, reason|order_id, live_net, is_credit}."""
     from src.live.alpaca_options import _trading
     from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent, OrderClass
     try:
         legs = _legs_to_occ(cand["underlying"], cand["expiry"], cand["legs"])
         live_net, priced = _reprice_net(legs)
@@ -4453,10 +4457,10 @@ def _auto_place(cand: dict, client_order_id: str) -> dict:
         ]
         client = _trading()
         order = client.submit_order(LimitOrderRequest(
-            symbol=cand["underlying"], qty=1,
+            qty=1, order_class=OrderClass.MLEG,
             side=OrderSide.SELL if is_credit else OrderSide.BUY,
             type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
-            limit_price=round(abs(live_net), 2), legs=leg_objs,
+            limit_price=round(-live_net, 2), legs=leg_objs,   # signed: credit<0, debit>0
             client_order_id=client_order_id))
         # confirm it actually fills — never report a fill on mere acceptance
         status, filled, note = _confirm_fill(client, order.id)
@@ -4609,7 +4613,7 @@ def _auto_close_structure(st: dict, reason: str):
     underlying) as one multi-leg order, idempotent via client_order_id."""
     from src.live.alpaca_options import _trading, get_mid_price
     from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
-    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent, OrderClass
     from src.notifications.slack_notifier import send_message
     client = _trading()
     coid = f"autoclose-{st['underlying']}-{st['expiry']}"
@@ -4642,10 +4646,10 @@ def _auto_close_structure(st: dict, reason: str):
     is_debit  = net_debit > 0
     net_share = round(abs(net_debit) / 100, 2)
     order = client.submit_order(LimitOrderRequest(
-        symbol=st["underlying"], qty=1,
+        qty=1, order_class=OrderClass.MLEG,
         side=OrderSide.BUY if is_debit else OrderSide.SELL,
         type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
-        limit_price=net_share, legs=leg_objs, client_order_id=coid))
+        limit_price=(net_share if is_debit else -net_share), legs=leg_objs, client_order_id=coid))
     icon = ":green_circle:" if unreal >= 0 else ":red_circle:"
     send_message(
         f"{icon} *AUTO-CLOSE `{st['underlying']}`* — {reason}\n"
