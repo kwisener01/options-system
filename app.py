@@ -1290,6 +1290,36 @@ def health():
     return jsonify({"status": "ok"})
 
 
+@app.route("/cron/manage", methods=["GET", "POST"])
+def cron_manage():
+    """External-cron heartbeat for the AUTO-EXITS. Hit this every ~5 min during
+    market hours (cron-job.org / UptimeRobot) so the 50%/1-DTE and trim/trail
+    exits fire even if the in-process scheduler is asleep or was restarted.
+
+    Runs only the RTH-guarded, idempotent management jobs (each no-ops when the
+    market is closed and never double-closes via client_order_id), so it is safe
+    to run alongside the scheduler and to call repeatedly. Token-protected
+    because it can place closing orders.
+    """
+    token = request.args.get("token") or request.headers.get("X-Cron-Token", "")
+    expected = os.getenv("CRON_TOKEN", "")
+    if not expected:
+        return jsonify({"ok": False, "error": "CRON_TOKEN not configured"}), 503
+    if token != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    ran, errs = [], {}
+    for name, fn in (("auto_manage", _auto_manage_job),
+                     ("fa_manage", _fa_manage_job),
+                     ("zerodte_manage", _zerodte_manage_job)):
+        try:
+            fn()
+            ran.append(name)
+        except Exception as e:
+            errs[name] = str(e)
+            logger.error("cron_manage %s failed: %s", name, e)
+    return jsonify({"ok": not errs, "ran": ran, "errors": errs})
+
+
 # ── slack formatter ─────────────────────────────────────────────────────────────
 
 def _fmt_slack(d: dict) -> str:
