@@ -72,16 +72,19 @@ def exit_blocks(header: str, candidates: list[dict]) -> tuple[list, str]:
 
 
 def buy_blocks(header: str, candidates: list[dict]) -> tuple[list, str]:
-    """Fallen-angel Buy/Skip approval. candidates: [{tid, text, label}]."""
+    """Fallen-angel Buy/Skip approval. candidates: [{tid, text, label, ticker, low_52w}].
+    The Buy button value is self-contained (fa_buy:SYM:LOW52W) so it survives a
+    redeploy that wipes the ephemeral pending-store."""
     blocks: list = [_section(header)]
     for i, c in enumerate(candidates, 1):
         blocks.append({"type": "divider"})
         blocks.append(_section(f"*{i}.* {c['text']}"))
+        buy_val = f"fa_buy:{str(c.get('ticker','')).upper()}:{c.get('low_52w') or ''}"
         blocks.append({
             "type": "actions",
             "block_id": f"buy_{c['tid']}",
             "elements": [
-                _button(f"🪂 Buy #{i}", ACTION_BUY, c["tid"], "primary"),
+                _button(f"🪂 Buy #{i}", ACTION_BUY, buy_val, "primary"),
                 _button("✖ Skip", ACTION_SKIP, c["tid"], "danger"),
             ],
         })

@@ -2148,7 +2148,8 @@ def _unified_scan_job():
                     text  = (f"*{label}*  score {a['score']}/13  RSI {a.get('rsi','?')}  "
                              f"P/C {a.get('put_call_ratio','?')}")
                     tid = register_fa_buy(a["ticker"], a["spot"], a.get("low_52w"), label, text)
-                    fa_cands.append({"tid": tid, "text": text, "label": label})
+                    fa_cands.append({"tid": tid, "text": text, "label": label,
+                                     "ticker": a["ticker"], "low_52w": a.get("low_52w")})
                 _post_fa_approvals(fa_cands)
         except Exception as e:
             logger.warning("FA-approval post failed: %s", e)
@@ -2774,6 +2775,20 @@ def slack_interactive():
     if aid == ACTION_CLOSE and isinstance(tid, str) and tid.startswith("close_ticker:"):
         sym = tid.split(":", 1)[1].upper()
         threading.Thread(target=lambda: _close_option_structure(sym, resp_url), daemon=True).start()
+        return "", 200
+
+    # Restart-proof fallen-angel BUY: value "fa_buy:SYM:LOW52W" carries everything
+    # needed, so it still works after the ephemeral pending-store is wiped on a
+    # redeploy. _execute_stock_buy re-quotes + re-sizes live and is idempotent
+    # (client_order_id fa-<ticker>-<date>), so a reconstructed rec is safe.
+    if aid == ACTION_BUY and isinstance(tid, str) and tid.startswith("fa_buy:"):
+        parts = tid.split(":")
+        sym = parts[1].upper() if len(parts) > 1 else ""
+        low = float(parts[2]) if len(parts) > 2 and parts[2] else 0.0
+        if sym:
+            rec = {"id": f"fabtn-{sym}-{datetime.now(ET):%Y%m%d}", "kind": "stock_buy",
+                   "ticker": sym, "low_52w": low, "entry": None, "label": sym}
+            threading.Thread(target=lambda: _execute_stock_buy(rec, resp_url), daemon=True).start()
         return "", 200
 
     pending_store.purge_expired()
