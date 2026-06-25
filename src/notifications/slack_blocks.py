@@ -79,7 +79,8 @@ def buy_blocks(header: str, candidates: list[dict]) -> tuple[list, str]:
     for i, c in enumerate(candidates, 1):
         blocks.append({"type": "divider"})
         blocks.append(_section(f"*{i}.* {c['text']}"))
-        buy_val = f"fa_buy:{str(c.get('ticker','')).upper()}:{c.get('low_52w') or ''}"
+        buy_val = c.get("buy_value") or \
+            f"fa_buy:{str(c.get('ticker','')).upper()}:{c.get('low_52w') or ''}"
         blocks.append({
             "type": "actions",
             "block_id": f"buy_{c['tid']}",
