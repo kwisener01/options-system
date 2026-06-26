@@ -63,7 +63,13 @@ except Exception:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     _SSL_VERIFY = False
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+# CLI-only: make the Windows console UTF-8 safe. Skipped when imported (e.g. by the
+# server /cron/swing endpoint) — reassigning stdout breaks gunicorn and may lack .buffer.
+if __name__ == "__main__":
+    try:
+        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
 

@@ -1320,6 +1320,35 @@ def cron_manage():
     return jsonify({"ok": not errs, "ran": ran, "errors": errs})
 
 
+@app.route("/cron/swing", methods=["GET", "POST"])
+def cron_swing():
+    """External-cron trigger for the GEX swing scanner (advisory only — it scans
+    the watchlist and posts setups to Slack, it does NOT place orders). Runs in a
+    background thread (the scan takes ~30-90s) so the request returns immediately;
+    point cron-job.org at it a few times during market hours. Token-protected."""
+    token = request.args.get("token") or request.headers.get("X-Cron-Token", "")
+    expected = os.getenv("CRON_TOKEN", "")
+    if not expected:
+        return jsonify({"ok": False, "error": "CRON_TOKEN not configured"}), 503
+    if token != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    def _run():
+        try:
+            import swing_scanner            # lazy import: avoids import-time side effects at boot
+            swing_scanner.run_scan()
+        except Exception as e:
+            logger.error("cron_swing run failed: %s", e)
+            try:
+                from src.notifications.slack_notifier import send_message
+                send_message(f":rotating_light: Swing scan error: {e}")
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "started": True})
+
+
 # ── slack formatter ─────────────────────────────────────────────────────────────
 
 def _fmt_slack(d: dict) -> str:
