@@ -28,3 +28,7 @@ reports/
 # Logs
 logs/
 *.log
+
+# Backtest/shadow runtime artifacts
+.cache/
+shadow_picks.csv

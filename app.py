@@ -1349,6 +1349,42 @@ def cron_swing():
     return jsonify({"ok": True, "started": True})
 
 
+@app.route("/cron/shadow", methods=["GET", "POST"])
+def cron_shadow():
+    """External-cron trigger for the bull-put SHADOW logger (paper, no orders).
+    Logs today's STRONG scanner picks, marks the running book to market, and posts
+    both to Slack (Slack = durable record since Render's disk is ephemeral). Drive
+    it once each market day ~10:05 ET. Token-protected."""
+    token = request.args.get("token") or request.headers.get("X-Cron-Token", "")
+    expected = os.getenv("CRON_TOKEN", "")
+    if not expected:
+        return jsonify({"ok": False, "error": "CRON_TOKEN not configured"}), 503
+    if token != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    def _run():
+        try:
+            import shadow_bullput
+            added = shadow_bullput.log_picks()
+            book  = shadow_bullput.mark()
+            from src.notifications.slack_notifier import send_message
+            head = (f":ledger: *Shadow bull-put* — logged {len(added)} new pick(s)\n"
+                    + "\n".join(f"  • {r['ticker']} {r['short']}/{r['long']}P {r['expiry']} "
+                                f"credit ${r['entry_credit']} ({r['credit_pct']}%)" for r in added)
+                    + ("\n  _(none today)_" if not added else ""))
+            send_message(head + "\n" + book)
+        except Exception as e:
+            logger.error("cron_shadow failed: %s", e)
+            try:
+                from src.notifications.slack_notifier import send_message
+                send_message(f":rotating_light: Shadow logger error: {e}")
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "started": True})
+
+
 # ── slack formatter ─────────────────────────────────────────────────────────────
 
 def _fmt_slack(d: dict) -> str:
