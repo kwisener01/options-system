@@ -1385,6 +1385,84 @@ def cron_shadow():
     return jsonify({"ok": True, "started": True})
 
 
+def _dca_run():
+    """Income-core DCA: buy weekly_budget split by config/dca.json weights as
+    fractional MARKET orders (RTH only), idempotent per ISO week. Respects the
+    risk-engine cash floor but intentionally keeps buying through drawdowns."""
+    from src.live.alpaca_options import _trading
+    from alpaca.trading.requests import MarketOrderRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    path = os.path.join(os.path.dirname(__file__), "config", "dca.json")
+    cfg = {"enabled": False, "weekly_budget": 20.0, "respect_cash_floor": True, "weights": {}}
+    try:
+        with open(path) as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    if not cfg.get("enabled") or not cfg.get("weights"):
+        return [":information_source: DCA disabled or no weights configured."]
+    if not _market_is_open():
+        return [":hourglass: DCA skipped — market closed (fractional orders need RTH)."]
+    client = _trading()
+    acct   = client.get_account()
+    equity = float(acct.equity); cash = float(getattr(acct, "cash", 0) or 0)
+    budget = float(cfg["weekly_budget"])
+    if cfg.get("respect_cash_floor", True):
+        floor = _risk_config().get("cash_floor_pct", 0.30) * equity
+        if cash - budget < floor:
+            return [f":octagonal_sign: DCA skipped — would breach cash floor "
+                    f"(cash ${cash:.0f}, floor ${floor:.0f}, budget ${budget:.0f})."]
+    y, wk, _ = datetime.now(ET).isocalendar()
+    period   = f"{y}W{wk:02d}"
+    lines = [f":moneybag: *Income-core DCA* — ${budget:.0f} this week ({period})"]
+    for tk, wt in cfg["weights"].items():
+        notional = round(budget * float(wt), 2)
+        if notional < 1:
+            continue
+        coid = f"dca-{tk}-{period}"
+        try:
+            if client.get_order_by_client_id(coid):
+                lines.append(f"  • {tk}: already bought this week"); continue
+        except Exception:
+            pass
+        try:
+            o = client.submit_order(MarketOrderRequest(
+                symbol=tk, notional=notional, side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY, client_order_id=coid))
+            lines.append(f"  • {tk}: bought ${notional:.2f}  (`{str(o.id)[:8]}`)")
+        except Exception as e:
+            lines.append(f"  • {tk}: failed — {e}")
+    return lines
+
+
+@app.route("/cron/dca", methods=["GET", "POST"])
+def cron_dca():
+    """External-cron trigger for the income-core DCA. Drive once a week during
+    RTH (e.g. Wed 11:00 ET). Token-protected."""
+    token = request.args.get("token") or request.headers.get("X-Cron-Token", "")
+    expected = os.getenv("CRON_TOKEN", "")
+    if not expected:
+        return jsonify({"ok": False, "error": "CRON_TOKEN not configured"}), 503
+    if token != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    def _run():
+        try:
+            lines = _dca_run()
+            from src.notifications.slack_notifier import send_message
+            send_message("\n".join(lines))
+        except Exception as e:
+            logger.error("cron_dca failed: %s", e)
+            try:
+                from src.notifications.slack_notifier import send_message
+                send_message(f":rotating_light: DCA error: {e}")
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "started": True})
+
+
 # ── slack formatter ─────────────────────────────────────────────────────────────
 
 def _fmt_slack(d: dict) -> str:
@@ -3777,6 +3855,8 @@ def _coid_strategy(coid: str):
         return "fallen_angel"                 # fa-<ticker>-<date>
     if parts[0] == "val":
         return "value"                        # val-<ticker>-<date>
+    if parts[0] == "dca":
+        return "income_core"                  # dca-<ticker>-<isoweek>
     if parts[0] in ("condor", "bull_put", "bwb", "fly"):
         return parts[0]
     return None

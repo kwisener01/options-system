@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "weekly_budget": 20.0,
+  "respect_cash_floor": true,
+  "weights": {
+    "BND":  0.15,
+    "SCHD": 0.15,
+    "IXUS": 0.15,
+    "GQRE": 0.10,
+    "JEPI": 0.15,
+    "XLK":  0.15,
+    "SMH":  0.15
+  },
+  "note": "Income-core DCA for the stock sleeve. Each run buys weekly_budget split by weights as fractional MARKET orders (RTH only), idempotent per ISO week via client_order_id dca-<ticker>-<YYYYWww>. Income tilt (BND bonds / SCHD US dividend / IXUS international / GQRE REITs / JEPI covered-call) ~70%, growth (XLK tech / SMH semis) ~30% — XLK~VGT so only one tech held; swap freely. Respects the risk-engine cash floor (won't buy below it) but intentionally keeps buying through drawdowns. Drive via cron-job.org weekly during RTH. Disable with enabled:false."
+}
