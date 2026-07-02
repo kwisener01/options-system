@@ -1364,23 +1364,24 @@ def cron_shadow():
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
     def _run():
+        # Only log once mid-morning — guards against a too-frequent cron spamming
+        # all day. Outside the window it's a silent no-op regardless of schedule.
+        t = datetime.now(ET).time()
+        if not (dt_time(10, 0) <= t <= dt_time(10, 12)):
+            return
         try:
             import shadow_bullput
             added = shadow_bullput.log_picks()
             book  = shadow_bullput.mark()
+            if not added:                       # nothing new -> stay quiet
+                return
             from src.notifications.slack_notifier import send_message
             head = (f":ledger: *Shadow bull-put* — logged {len(added)} new pick(s)\n"
                     + "\n".join(f"  • {r['ticker']} {r['short']}/{r['long']}P {r['expiry']} "
-                                f"credit ${r['entry_credit']} ({r['credit_pct']}%)" for r in added)
-                    + ("\n  _(none today)_" if not added else ""))
+                                f"credit ${r['entry_credit']} ({r['credit_pct']}%)" for r in added))
             send_message(head + "\n" + book)
         except Exception as e:
             logger.error("cron_shadow failed: %s", e)
-            try:
-                from src.notifications.slack_notifier import send_message
-                send_message(f":rotating_light: Shadow logger error: {e}")
-            except Exception:
-                pass
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"ok": True, "started": True})
