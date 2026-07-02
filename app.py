@@ -2081,8 +2081,64 @@ def _fmt_rotation(rot: dict) -> str:
     ])
 
 
+def _alerts_cfg() -> dict:
+    path = os.path.join(os.path.dirname(__file__), "config", "alerts.json")
+    cfg = {"bwb": False, "xsp": False, "hourly_status": True}
+    try:
+        with open(path) as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    return cfg
+
+
+def _status_hourly_job():
+    """Compact SPY / QQQ / VIX snapshot, once an hour during market hours."""
+    try:
+        if not _market_is_open() or not _alerts_cfg().get("hourly_status", True):
+            return
+        from src.notifications.slack_notifier import send_message
+        d = get_data()
+        spy, qqq, vix = d["spy"], d["qqq"], d["vix"]
+        ts = datetime.now(ET).strftime("%H:%M ET")
+        send_message(
+            f":clock1: *Market Status — {ts}*\n"
+            f"  SPY ${spy['spot']:.2f} ({spy['change']:+.2f})   "
+            f"QQQ ${qqq['spot']:.2f} ({qqq['change']:+.2f})   "
+            f"VIX {vix['now']:.2f} ({vix['change']:+.2f})")
+    except Exception as e:
+        logger.error("hourly status failed: %s", e)
+
+
+def _adverse_position_alert(state, now):
+    """Immediate ping (max once/hour) when open OPTIONS P&L falls to/below the
+    adverse threshold — 'a trade has gone against me'. Runs every monitor tick."""
+    try:
+        thr = float(_alerts_cfg().get("adverse_alert_usd", -100))
+        from src.live.alpaca_options import _trading
+        opts = [p for p in _trading().get_all_positions() if len(p.symbol) > 8]
+        if not opts:
+            return
+        total = sum(float(getattr(p, "unrealized_pl", 0) or 0) for p in opts)
+        last  = float(state.get("adverse_ts", 0) or 0)
+        if total <= thr and (time.time() - last) > 3600:
+            reds = sorted((p for p in opts if float(getattr(p, "unrealized_pl", 0) or 0) < 0),
+                          key=lambda p: float(p.unrealized_pl))
+            lines = [f":rotating_light: *Position alert — {now}* — options P&L ${total:+,.0f}"]
+            for p in reds[:8]:
+                lines.append(f"  :red_circle: `{p.symbol}`  ${float(p.unrealized_pl):+,.0f}")
+            from src.notifications.slack_notifier import send_message
+            send_message("\n".join(lines))
+            state["adverse_ts"] = time.time()
+    except Exception as e:
+        logger.warning("adverse-position alert failed: %s", e)
+
+
 def _spy_trade_monitor_job():
-    """Every 5 min during RTH. Independent, change-gated alerts:
+    """Every 5 min during RTH. Silent by default — only pings on a trade going
+    against you (_adverse_position_alert). The recurring setup chatter (SPY idea /
+    GEX fly / condor / rotation) runs only when config/alerts.json monitor_setups
+    is true. Original change-gated alerts:
       1. SPY options trade   — fires only when the recommended HIGH-probability
          structure/strikes change from the last alert.
       2. GEX-pinned butterfly — positive-gamma pin play; fires when the best
@@ -2098,6 +2154,16 @@ def _spy_trade_monitor_job():
         from src.notifications.slack_notifier import send_message
         state = _load_spy_state()
         now   = datetime.now(ET).strftime("%H:%M ET")
+
+        # Always: ping if a trade has gone against us (the only routine 5-min alert).
+        _adverse_position_alert(state, now)
+
+        # The recurring setup chatter below is silenced unless explicitly enabled.
+        if not _alerts_cfg().get("monitor_setups", False):
+            state["ts"] = time.time()
+            with _spy_state_lock:
+                _save_spy_state(state)
+            return
 
         # 1 ── SPY options trade ------------------------------------------------
         d   = get_data()
@@ -2403,17 +2469,20 @@ def _unified_scan_job():
             sections += ["", vw_fmt(vw_results, regime, vix["now"], ts)]
         if bp_place_lines:
             sections += ["", ":moneybag: *Bull Put Spreads — place trade*"] + bp_place_lines
-        if bwb_lines:
+        _acfg = _alerts_cfg()
+        if bwb_lines and _acfg.get("bwb", False):
             sections += ["", ":butterfly: *BWB Watchlist Candidates*"] + bwb_lines
-        fly_block = fly_fmt(fly_result)
-        if fly_block:
-            sections += ["", fly_block]
-        condor_block = condor_fmt(condor_result)
-        if condor_block:
-            sections += ["", condor_block]
-        batman_block = batman_fmt(batman_result)
-        if batman_block:
-            sections += ["", batman_block]
+        if _acfg.get("monitor_setups", False):
+            fly_block = fly_fmt(fly_result)
+            if fly_block:
+                sections += ["", fly_block]
+            condor_block = condor_fmt(condor_result)
+            if condor_block:
+                sections += ["", condor_block]
+        if _acfg.get("xsp", False):
+            batman_block = batman_fmt(batman_result)
+            if batman_block:
+                sections += ["", batman_block]
 
         send_message("\n".join(sections))
 
@@ -5133,6 +5202,8 @@ def _start_scheduler():
     # SPY trade + rotation monitor — every 5 min during RTH (market-open guarded)
     sched.add_job(_spy_trade_monitor_job, "cron", day_of_week="mon-fri",
                   hour="9-15", minute="*/5", id="spy_monitor", replace_existing=True)
+    sched.add_job(_status_hourly_job, "cron", day_of_week="mon-fri",
+                  hour="9-16", minute=0, id="status_hourly", replace_existing=True)
     sched.add_job(_manage_5050_job,  "cron", day_of_week="mon-fri", hour=15, minute=30,
                   id="manage_1530",        replace_existing=True)
     sched.add_job(_eod_report_job,   "cron", day_of_week="mon-fri", hour=16, minute=5,

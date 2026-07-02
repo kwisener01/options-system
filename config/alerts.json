@@ -1,0 +1,8 @@
+{
+  "hourly_status": true,
+  "adverse_alert_usd": -100,
+  "monitor_setups": false,
+  "bwb": false,
+  "xsp": false,
+  "note": "Notification policy. hourly_status: post a compact SPY/QQQ/VIX snapshot once an hour during RTH. adverse_alert_usd: the 5-min monitor pings you (max once/hour) when total OPEN OPTIONS P&L falls to/below this dollar amount ('a trade has gone against me'). monitor_setups=false silences the recurring setup chatter (SPY trade idea / GEX fly / GEX condor / rotation in the 5-min monitor, and the fly/condor blocks in the unified scan). bwb=false hides the BWB watchlist section; xsp=false hides the XSP 'Batman' double-BWB alerts. Actionable Take/Buy proposals (bull put, fallen-angel, value, burrito) and fills/closes/risk-halts still notify. Flip any flag true to restore."
+}
