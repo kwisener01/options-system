@@ -1573,11 +1573,13 @@ def cron_burrito():
         return jsonify({"ok": False, "error": "CRON_TOKEN not configured"}), 503
     if token != expected:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+    force = str(request.args.get("force", "")).lower() in ("1", "true", "yes")
 
     def _run():
         try:
             from src.notifications.slack_notifier import send_message
-            if not _market_is_open():
+            if not _market_is_open() and not force:
+                send_message(":burrito: *Burrito* — market closed, no proposal (use &force=1 to preview)")
                 return
             send_message(_burrito_propose())
         except Exception as e:
