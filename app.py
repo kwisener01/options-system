@@ -1310,7 +1310,8 @@ def cron_manage():
     ran, errs = [], {}
     for name, fn in (("auto_manage", _auto_manage_job),
                      ("fa_manage", _fa_manage_job),
-                     ("zerodte_manage", _zerodte_manage_job)):
+                     ("zerodte_manage", _zerodte_manage_job),
+                     ("burrito_manage", _burrito_manage)):
         try:
             fn()
             ran.append(name)
@@ -1461,6 +1462,202 @@ def cron_dca():
 
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"ok": True, "started": True})
+
+
+# ── Burrito Butterfly (SPY swing) ─────────────────────────────────────────────
+# ATM butterfly + directional debit spread as ONE 4-leg MLEG. Proposed via Slack
+# Take button; auto-wrapped + managed off real Alpaca P&L in /cron/manage.
+
+def _burrito_config() -> dict:
+    path = os.path.join(os.path.dirname(__file__), "config", "burrito.json")
+    cfg = {"enabled": True, "width": 5, "dte_min": 4, "dte_max": 9, "direction": "auto",
+           "sma_days": 20, "profit_target_pct": 0.25, "stop_pct": 0.50,
+           "wrap_trigger_pct": 0.10, "force_close_dte": 1, "max_loss": 150}
+    try:
+        with open(path) as f:
+            cfg.update(json.load(f))
+    except Exception:
+        pass
+    return cfg
+
+
+def _spy_sma(days: int):
+    """Simple moving average of SPY daily closes (Alpaca), or None."""
+    import requests as _rq
+    from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY
+    H = {"APCA-API-KEY-ID": ALPACA_API_KEY, "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY}
+    end = (datetime.now(ET).date() - timedelta(days=1)).isoformat()
+    start = (datetime.now(ET).date() - timedelta(days=days * 2 + 15)).isoformat()
+    try:
+        r = _rq.get("https://data.alpaca.markets/v2/stocks/SPY/bars", headers=H,
+                    params={"timeframe": "1Day", "start": start, "end": end,
+                            "limit": 1000, "adjustment": "raw"}, timeout=20)
+        closes = [b["c"] for b in (r.json().get("bars") or [])] if r.status_code == 200 else []
+    except Exception:
+        closes = []
+    return (sum(closes[-days:]) / min(len(closes), days)) if closes else None
+
+
+def _burrito_expiry(cfg) -> date:
+    """Nearest Friday in the DTE window (SPY always lists Friday expirations)."""
+    today = datetime.now(ET).date()
+    for d in range(int(cfg["dte_min"]), int(cfg["dte_max"]) + 1):
+        cand = today + timedelta(days=d)
+        if cand.weekday() == 4:
+            return cand
+    return today + timedelta(days=int(cfg["dte_max"]))
+
+
+def _burrito_candidate():
+    """Build the SPY directional butterfly (fly + debit spread). Returns (cand, reason)."""
+    cfg = _burrito_config()
+    if not cfg.get("enabled"):
+        return None, "disabled"
+    W = float(cfg["width"])
+    spot = _stock_price("SPY")
+    if not spot:
+        return None, "no SPY price"
+    mode = cfg.get("direction", "auto")
+    if mode == "bull":
+        bull = True
+    elif mode == "bear":
+        bull = False
+    else:
+        sma = _spy_sma(int(cfg["sma_days"]))
+        bull = (sma is None) or (spot >= sma)
+    K = float(round(spot))
+    exp = _burrito_expiry(cfg)
+    if bull:                                          # fly + call debit spread
+        legs = [{"action": "BUY",  "strike": K - W,     "opt": "C", "qty": 1},
+                {"action": "SELL", "strike": K,         "opt": "C", "qty": 2},
+                {"action": "BUY",  "strike": K + W,     "opt": "C", "qty": 2},
+                {"action": "SELL", "strike": K + 2 * W, "opt": "C", "qty": 1}]
+    else:                                             # fly + put debit spread (mirror)
+        legs = [{"action": "BUY",  "strike": K + W,     "opt": "P", "qty": 1},
+                {"action": "SELL", "strike": K,         "opt": "P", "qty": 2},
+                {"action": "BUY",  "strike": K - W,     "opt": "P", "qty": 2},
+                {"action": "SELL", "strike": K - 2 * W, "opt": "P", "qty": 1}]
+    net, _ = _reprice_net(_legs_to_occ("SPY", exp, legs))
+    if net is None:
+        return None, "no quotes"
+    if net > 0:
+        return None, "priced as a credit (unexpected) — skipped"
+    max_loss = round(abs(net) * 100, 2)               # 0-delta wings -> max loss = net debit
+    if max_loss > float(cfg["max_loss"]):
+        return None, f"max loss ${max_loss:.0f} > cap ${cfg['max_loss']:.0f}"
+    dirn = "BULL" if bull else "BEAR"
+    dte  = (exp - datetime.now(ET).date()).days
+    label = f"Burrito {dirn} SPY {K:.0f}±{W:.0f} {exp}"
+    text  = (f"*{label}*  net debit ${max_loss/100:.2f}  (max loss ${max_loss:.0f})  {dte}DTE "
+             f"— fly + {'call' if bull else 'put'} debit spread")
+    return {"legs": legs, "expiry": exp, "net": net, "max_loss": max_loss,
+            "label": label, "text": text, "bull": bull, "K": K, "W": W}, "ok"
+
+
+def _burrito_propose():
+    cand, reason = _burrito_candidate()
+    if not cand:
+        return f":burrito: *Burrito* — no trade ({reason})"
+    tid = register_entry("burrito", "SPY", cand["expiry"], cand["legs"], 1,
+                         cand["net"], cand["label"], cand["text"])
+    _post_entry_approvals([{"tid": tid, "text": cand["text"], "label": cand["label"]}])
+    return f":burrito: *Burrito proposed* — {cand['label']} · max loss ${cand['max_loss']:.0f} · tap *Take*"
+
+
+@app.route("/cron/burrito", methods=["GET", "POST"])
+def cron_burrito():
+    """Propose a SPY Burrito Butterfly (Slack Take button). Hit once/market day."""
+    token = request.args.get("token") or request.headers.get("X-Cron-Token", "")
+    expected = os.getenv("CRON_TOKEN", "")
+    if not expected:
+        return jsonify({"ok": False, "error": "CRON_TOKEN not configured"}), 503
+    if token != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+
+    def _run():
+        try:
+            from src.notifications.slack_notifier import send_message
+            if not _market_is_open():
+                return
+            send_message(_burrito_propose())
+        except Exception as e:
+            logger.error("cron_burrito failed: %s", e)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "started": True})
+
+
+def _burrito_close(client, entry_legs, reason: str, exp) -> bool:
+    """Close a burrito by reversing its entry legs as one signed-limit MLEG."""
+    from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, PositionIntent, OrderClass
+    order_legs = [{"symbol": lg.symbol,
+                   "side": "BUY" if str(lg.side).endswith("SELL") else "SELL",   # reverse to close
+                   "ratio": int(lg.ratio_qty)} for lg in entry_legs]
+    net, priced = _reprice_net(order_legs)
+    if net is None:
+        return False
+    leg_objs = [OptionLegRequest(
+                    symbol=lg["symbol"], ratio_qty=lg["ratio"],
+                    side=OrderSide.SELL if lg["side"] == "SELL" else OrderSide.BUY,
+                    position_intent=(PositionIntent.SELL_TO_CLOSE if lg["side"] == "SELL"
+                                     else PositionIntent.BUY_TO_CLOSE))
+                for lg in priced]
+    try:
+        client.submit_order(LimitOrderRequest(
+            qty=1, order_class=OrderClass.MLEG, side=OrderSide.SELL if net > 0 else OrderSide.BUY,
+            type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
+            limit_price=round(-net, 2), legs=leg_objs,
+            client_order_id=f"burritoclose-SPY-{exp}"))
+        from src.notifications.slack_notifier import send_message
+        send_message(f":burrito: *Burrito closed* ({exp}) — {reason}")
+        logger.info("Burrito close %s — %s", exp, reason)
+        return True
+    except Exception as e:
+        logger.error("Burrito close failed %s: %s", exp, e)
+        return False
+
+
+def _burrito_manage():
+    """Every RTH tick (via /cron/manage): take profit / stop / force-close at 1-DTE
+    on open burritos, keyed off real Alpaca P&L. (Auto-wrap: phase 2.)"""
+    if not _market_is_open():
+        return
+    cfg = _burrito_config()
+    from src.live.alpaca_options import _trading
+    from alpaca.trading.requests import GetOrdersRequest
+    from alpaca.trading.enums import QueryOrderStatus
+    client = _trading()
+    try:
+        orders = client.get_orders(filter=GetOrdersRequest(
+            status=QueryOrderStatus.ALL, limit=300, after=datetime.now(ET) - timedelta(days=21)))
+    except Exception as e:
+        logger.warning("burrito-manage get_orders: %s", e); return
+    positions = {p.symbol: p for p in client.get_all_positions()}
+    closed_exp = {(getattr(o, "client_order_id", "") or "").replace("burritoclose-SPY-", "")
+                  for o in orders if (getattr(o, "client_order_id", "") or "").startswith("burritoclose-SPY-")}
+    for o in orders:
+        coid = getattr(o, "client_order_id", "") or ""
+        if not coid.startswith("burrito-SPY-") or not str(o.status).endswith("FILLED"):
+            continue
+        legs = [lg for lg in (getattr(o, "legs", None) or []) if lg.symbol in positions]
+        if not legs:
+            continue                                   # already closed / expired
+        p0 = _occ_parse(legs[0].symbol)
+        if not p0:
+            continue
+        exp = p0[1]
+        if str(exp) in closed_exp:
+            continue
+        dte = (exp - datetime.now(ET).date()).days
+        pnl = sum(float(getattr(positions[lg.symbol], "unrealized_pl", 0) or 0) for lg in legs)
+        risk = abs(float(getattr(o, "filled_avg_price", 0) or 0)) * 100 or float(cfg["max_loss"])
+        if dte <= int(cfg["force_close_dte"]):
+            _burrito_close(client, legs, f"1-DTE force-close (assignment/valley guard)", exp)
+        elif pnl >= float(cfg["profit_target_pct"]) * risk:
+            _burrito_close(client, legs, f"+{cfg['profit_target_pct']*100:.0f}% target (${pnl:+.0f})", exp)
+        elif pnl <= -float(cfg["stop_pct"]) * risk:
+            _burrito_close(client, legs, f"-{cfg['stop_pct']*100:.0f}% stop (${pnl:+.0f})", exp)
 
 
 # ── slack formatter ─────────────────────────────────────────────────────────────
@@ -3857,7 +4054,7 @@ def _coid_strategy(coid: str):
         return "value"                        # val-<ticker>-<date>
     if parts[0] == "dca":
         return "income_core"                  # dca-<ticker>-<isoweek>
-    if parts[0] in ("condor", "bull_put", "bwb", "fly"):
+    if parts[0] in ("condor", "bull_put", "bwb", "fly", "burrito"):
         return parts[0]
     return None
 

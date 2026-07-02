@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "width": 3,
+  "dte_min": 4,
+  "dte_max": 9,
+  "direction": "auto",
+  "sma_days": 20,
+  "profit_target_pct": 0.25,
+  "stop_pct": 0.50,
+  "wrap_trigger_pct": 0.10,
+  "force_close_dte": 1,
+  "max_loss": 150,
+  "note": "Boomer Dan 'Burrito Butterfly' on SPY, run as a swing. Entry = one 4-leg MLEG: an ATM butterfly + a directional debit spread leaning with the trend (bullish calls +1(K-w)/-2 K/+2(K+w)/-1(K+2w); bearish = put mirror). direction: auto (SPY vs sma_days SMA) | bull | bear. Proposed via Slack Take button (/cron/burrito), placed by the fixed MLEG path, tagged burrito-*. Managed off REAL Alpaca P&L in /cron/manage: AUTO-WRAP the opposite debit spread once up wrap_trigger_pct of risk (locks the float), take profit at profit_target_pct, stop at stop_pct, and FORCE-CLOSE at force_close_dte (assignment + 'valley of death' guard). Defined risk = net debit (<= max_loss and the risk-engine cap). All %s are of net debit (capital at risk)."
+}
