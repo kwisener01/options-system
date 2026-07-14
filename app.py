@@ -2764,6 +2764,101 @@ def _cmd_spy(resp_url: str):
     _slack_respond(resp_url, "\n".join(sections))
 
 
+def _cmd_spypnl(resp_url: str):
+    """Live P&L on all open SPY options positions, grouped by expiry/spread."""
+    from src.live.alpaca_options import _trading
+    try:
+        client    = _trading()
+        positions = client.get_all_positions()
+        acct      = client.get_account()
+        equity    = float(getattr(acct, "portfolio_value", 0) or 0)
+        bp        = float(getattr(acct, "options_buying_power", 0) or 0)
+    except Exception as e:
+        _slack_respond(resp_url, f":rotating_light: Could not fetch positions: {e}")
+        return
+
+    spy_opts = [p for p in positions
+                if len(p.symbol) > 6 and p.symbol.upper().startswith("SPY")]
+
+    if not spy_opts:
+        _slack_respond(resp_url, ":bar_chart: *SPY Options P&L* — no open SPY option positions.")
+        return
+
+    today = date.today()
+    total_unreal = 0.0
+    total_mkt    = 0.0
+    lines = [":bar_chart: *SPY Options P&L*", ""]
+
+    # Group by expiry date (parsed from OCC symbol)
+    by_expiry: dict[str, list] = {}
+    for p in spy_opts:
+        sym = p.symbol.upper()
+        try:
+            # OCC: SPYYYMMDDCnnnnnnn or SPYYYMMDDPnnnnnnn
+            # underlying length = 3 (SPY), date = chars 3-8, type = char 9
+            raw_date = sym[3:9]
+            exp_str  = f"20{raw_date[0:2]}-{raw_date[2:4]}-{raw_date[4:6]}"
+        except Exception:
+            exp_str = "unknown"
+        by_expiry.setdefault(exp_str, []).append(p)
+
+    for exp_str in sorted(by_expiry.keys()):
+        try:
+            exp_date = date.fromisoformat(exp_str)
+            dte = (exp_date - today).days
+            dte_str = f"{dte}DTE" if dte >= 0 else "EXPIRED"
+        except Exception:
+            dte_str = ""
+
+        exp_unreal = 0.0
+        exp_mkt    = 0.0
+        leg_lines  = []
+
+        for p in by_expiry[exp_str]:
+            sym    = p.symbol.upper()
+            qty    = float(p.qty)
+            unreal = float(getattr(p, "unrealized_pl",   0) or 0)
+            pct    = float(getattr(p, "unrealized_plpc", 0) or 0) * 100
+            mkt    = float(getattr(p, "market_value",    0) or 0)
+            cost   = float(getattr(p, "cost_basis",      0) or 0)
+            avg_px = float(getattr(p, "avg_entry_price", 0) or 0)
+            cur_px = float(getattr(p, "current_price",   0) or 0)
+
+            # Decode option type and strike from OCC symbol
+            try:
+                opt_type = "CALL" if sym[9] == "C" else "PUT"
+                strike   = int(sym[10:]) / 1000
+                side_tag = "SHORT" if qty < 0 else "LONG"
+                desc     = f"{side_tag} {opt_type[0]} ${strike:.1f}"
+            except Exception:
+                desc = sym
+
+            icon = ":green_circle:" if unreal >= 0 else ":red_circle:"
+            leg_lines.append(
+                f"  {icon} `{sym}`  {desc}  qty {qty:+.0f}\n"
+                f"    entry ${avg_px:.2f}  mark ${cur_px:.2f}  "
+                f"mkt ${mkt:,.2f}  P&L *${unreal:+,.2f}* ({pct:+.1f}%)"
+            )
+            exp_unreal += unreal
+            exp_mkt    += mkt
+
+        exp_icon = ":green_circle:" if exp_unreal >= 0 else ":red_circle:"
+        lines.append(f"*Expiry {exp_str}*  _{dte_str}_  "
+                     f"net mkt ${exp_mkt:,.2f}  {exp_icon} P&L *${exp_unreal:+,.2f}*")
+        lines.extend(leg_lines)
+        lines.append("")
+        total_unreal += exp_unreal
+        total_mkt    += exp_mkt
+
+    total_icon = ":chart_with_upwards_trend:" if total_unreal >= 0 else ":chart_with_downwards_trend:"
+    tp_pct = total_unreal / equity * 100 if equity else 0
+    lines += [
+        f"{total_icon} *Total SPY Options P&L: ${total_unreal:+,.2f}* "
+        f"({tp_pct:+.2f}% of equity)  |  Options BP: ${bp:,.2f}",
+    ]
+    _slack_respond(resp_url, "\n".join(lines))
+
+
 def _cmd_fly(resp_url: str):
     """On-demand GEX-pinned butterfly scan."""
     try:
@@ -2927,6 +3022,7 @@ HELP_TEXT = (
     "  _e.g._ `/place KO 82.5 80 2026-07-17`\n\n"
     "`/scan`  — run bull put scanner now + send results\n"
     "`/spy`   — current SPY trade signal + stock-rotation check\n"
+    "`/spypnl` — live P&L on all open SPY options positions\n"
     "`/fly`   — GEX-pinned butterfly (positive-gamma pin play)\n"
     "`/condor` — GEX-anchored iron condor (high-POP premium play)\n"
     "`/batman` — GEX-anchored Batman for XSP (positive-cowl double BWB)\n"
@@ -2961,6 +3057,7 @@ def slack_command():
         "place":     f":hourglass: Placing spread `{text}`...",
         "scan":      ":hourglass: Running bull put scan...",
         "spy":       ":hourglass: Checking SPY trade + rotation...",
+        "spypnl":    ":hourglass: Fetching SPY options P&L...",
         "fly":       ":hourglass: Scanning GEX-pinned butterflies...",
         "condor":    ":hourglass: Scanning GEX-anchored condors...",
         "batman":    ":hourglass: Scanning XSP Batman setups...",
@@ -2988,6 +3085,7 @@ def slack_command():
         "place":     lambda: _cmd_place(text, resp_url),
         "scan":      lambda: _cmd_scan(resp_url),
         "spy":       lambda: _cmd_spy(resp_url),
+        "spypnl":    lambda: _cmd_spypnl(resp_url),
         "fly":       lambda: _cmd_fly(resp_url),
         "condor":    lambda: _cmd_condor(resp_url),
         "batman":    lambda: _cmd_batman(resp_url),
