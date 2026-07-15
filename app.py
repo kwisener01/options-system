@@ -2599,24 +2599,39 @@ def _unified_scan_job():
         except Exception as e:
             logger.warning("Entry-approval post failed: %s", e)
 
-        # -- Fallen-angel Buy approvals (STRONG conviction only) -------------
+        # -- Fallen-angel SPREAD approvals (managed verticals, not stock buys) --
+        # Bull-put credit spread on every name at score >= spread_min_score, plus
+        # a bull-call debit spread at score >= call_min_score. HITL: each posts a
+        # Take button that re-prices live and submits an MLEG order on approval.
         try:
             facfg = _fa_config()
-            if facfg.get("enabled"):
-                conv = facfg.get("conviction", "STRONG")
-                fa_cands = []
+            if facfg.get("enabled") and facfg.get("fa_spreads_enabled", True):
+                min_sc = int(facfg.get("spread_min_score", 6))
+                fa_spread_cands = []
                 for a in fa_results:
-                    if a.get("signal") != conv:
+                    if int(a.get("score", 0)) < min_sc or not a.get("spot"):
                         continue
-                    label = f"{a['ticker']} ${a['spot']:.2f} ({a['pct_from_high']:.0f}% from high)"
-                    text  = (f"*{label}*  score {a['score']}/13  RSI {a.get('rsi','?')}  "
-                             f"P/C {a.get('put_call_ratio','?')}")
-                    tid = register_fa_buy(a["ticker"], a["spot"], a.get("low_52w"), label, text)
-                    fa_cands.append({"tid": tid, "text": text, "label": label,
-                                     "ticker": a["ticker"], "low_52w": a.get("low_52w")})
-                _post_fa_approvals(fa_cands)
+                    try:
+                        verts = _fa_spread_candidates(a["ticker"], float(a["spot"]),
+                                                      int(a["score"]), facfg)
+                    except Exception as e:
+                        logger.warning("FA spread build failed for %s: %s", a.get("ticker"), e)
+                        continue
+                    for v in verts:
+                        if v["kind"] == "bull_put":
+                            label = f"FA bull-put {a['ticker']} {v['short']:g}/{v['long']:g}P {v['expiry']}"
+                            text  = (f"*{label}*  {v['dte']}DTE  credit +${v['ref_net']:.2f}  "
+                                     f"max loss -${v['max_loss']}  _(FA score {a['score']}/13)_")
+                        else:
+                            label = f"FA bull-call {a['ticker']} {v['long']:g}/{v['short']:g}C {v['expiry']}"
+                            text  = (f"*{label}*  {v['dte']}DTE  debit -${abs(v['ref_net']):.2f}  "
+                                     f"max profit +${v['max_profit']}  _(FA score {a['score']}/13)_")
+                        tid = register_entry(v["kind"], a["ticker"], v["expiry"], v["legs"],
+                                             qty=1, ref_net=v["ref_net"], label=label, text=text)
+                        fa_spread_cands.append({"tid": tid, "text": text, "label": label})
+                _post_entry_approvals(fa_spread_cands)
         except Exception as e:
-            logger.warning("FA-approval post failed: %s", e)
+            logger.warning("FA-spread approval post failed: %s", e)
 
         # -- Value-watchlist Buy approvals (STRONG + earnings-clear) ---------
         try:
@@ -4192,7 +4207,7 @@ def _coid_strategy(coid: str):
         return "value"                        # val-<ticker>-<date>
     if parts[0] == "dca":
         return "income_core"                  # dca-<ticker>-<isoweek>
-    if parts[0] in ("condor", "bull_put", "bwb", "fly", "burrito"):
+    if parts[0] in ("condor", "bull_put", "bull_call", "bwb", "fly", "burrito"):
         return parts[0]
     return None
 
@@ -4301,13 +4316,88 @@ def _fa_config() -> dict:
     cfg = {"enabled": True, "conviction": "STRONG", "risk_pct_per_position": 0.01,
            "stop_drawdown_pct": 0.12, "stop_below_52w_low_pct": 0.01,
            "max_position_pct": 0.15, "max_positions": 4, "max_category_pct": 0.40,
-           "trim_at_gain_pct": 0.20, "trail_pct": 0.15}
+           "trim_at_gain_pct": 0.20, "trail_pct": 0.15,
+           # Fallen-angel names are proposed as MANAGED verticals, not stock buys:
+           # a bull-put credit spread on every triggered name, plus a bull-call
+           # debit spread when score >= call_min_score (the backtested differentiator).
+           "fa_spreads_enabled": True, "spread_min_score": 6, "call_min_score": 6,
+           "put_short_otm": 0.05, "put_width_otm": 0.07,
+           "call_long_otm": 0.0, "call_short_otm": 0.08,
+           "spread_dte_min": 20, "spread_dte_max": 45, "spread_target_dte": 30}
     try:
         with open(path) as f:
             cfg.update(json.load(f))
     except Exception:
         pass
     return cfg
+
+
+def _build_fa_verticals(spot: float, put_mids: dict, call_mids: dict,
+                        score: int, cfg: dict) -> list:
+    """Pure: from one expiry's {strike: mid} for puts and calls, build the FA
+    verticals. Bull-put credit spread on every name; bull-call debit spread when
+    score >= call_min_score. ref_net > 0 = credit, < 0 = debit (register_entry's
+    convention). Returns [] if strikes/quotes don't support a spread."""
+    def nearest(strikes, target):
+        return min(strikes, key=lambda k: abs(k - target)) if strikes else None
+
+    out = []
+    # Bull-put credit spread: short ~put_short_otm below spot, long put_width_otm lower.
+    ps = sorted(put_mids)
+    Ks = nearest([k for k in ps if k <= spot], spot * (1 - cfg["put_short_otm"]))
+    if Ks is not None:
+        Kl = nearest([k for k in ps if k < Ks],
+                     spot * (1 - cfg["put_short_otm"] - cfg["put_width_otm"]))
+        if Kl is not None:
+            credit = round(put_mids[Ks] - put_mids[Kl], 2)
+            width  = round(Ks - Kl, 2)
+            if credit > 0 and width > 0:
+                out.append({"kind": "bull_put", "short": Ks, "long": Kl, "width": width,
+                            "ref_net": credit, "max_loss": round(width * 100 - credit * 100),
+                            "legs": [{"action": "SELL", "strike": Ks, "opt": "P", "qty": 1},
+                                     {"action": "BUY",  "strike": Kl, "opt": "P", "qty": 1}]})
+
+    # Bull-call debit spread (score-gated): long ~ATM, short call_short_otm above.
+    cs = sorted(call_mids)
+    if score >= cfg["call_min_score"]:
+        Kl = nearest(cs, spot * (1 + cfg["call_long_otm"]))
+        if Kl is not None:
+            Ku = nearest([k for k in cs if k > Kl], spot * (1 + cfg["call_short_otm"]))
+            if Ku is not None:
+                debit = round(call_mids[Kl] - call_mids[Ku], 2)
+                width = round(Ku - Kl, 2)
+                if debit > 0 and width > 0:
+                    out.append({"kind": "bull_call", "long": Kl, "short": Ku, "width": width,
+                                "ref_net": -debit, "max_profit": round(width * 100 - debit * 100),
+                                "legs": [{"action": "BUY",  "strike": Kl, "opt": "C", "qty": 1},
+                                         {"action": "SELL", "strike": Ku, "opt": "C", "qty": 1}]})
+    return out
+
+
+def _fa_spread_candidates(ticker: str, spot: float, score: int, cfg: dict) -> list:
+    """Live chain → FA vertical candidates (with expiry/dte attached)."""
+    from src.live.alpaca_options import fetch_chain_combined
+    chain = fetch_chain_combined(ticker, spot,
+                                 dte_min=cfg["spread_dte_min"], dte_max=cfg["spread_dte_max"])
+    puts  = chain.get("puts_liquid", [])
+    calls = chain.get("calls_liquid", [])
+    if not puts:
+        return []
+    exp_dte = {p["expiry"]: p["dte"] for p in puts}
+    want_call = score >= cfg["call_min_score"]
+    exps = ({p["expiry"] for p in puts} & {c["expiry"] for c in calls}) if want_call else set(exp_dte)
+    exps = exps or set(exp_dte)
+    exp = min(exps, key=lambda e: abs(exp_dte.get(e, 999) - cfg["spread_target_dte"]))
+
+    def mids(rows):
+        return {r["strike"]: round((r["bid"] + r["ask"]) / 2, 3)
+                for r in rows if r["expiry"] == exp and r.get("bid") and r.get("ask")}
+
+    verts = _build_fa_verticals(spot, mids(puts), mids(calls), score, cfg)
+    for v in verts:
+        v["expiry"] = exp
+        v["dte"] = exp_dte.get(exp)
+    return verts
 
 
 def _fa_stop_and_size(entry: float, low_52w: float, equity: float, cfg: dict) -> dict:

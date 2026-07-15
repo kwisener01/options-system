@@ -295,19 +295,51 @@ def test_condor_edge_gate():
     print("ok  condor edge gate (POP vs breakeven win-rate)")
 
 
+def test_fa_verticals():
+    import app
+    cfg = {"call_min_score": 6, "put_short_otm": 0.05, "put_width_otm": 0.07,
+           "call_long_otm": 0.0, "call_short_otm": 0.08}
+    spot = 100.0
+    put_mids  = {88: 0.9, 90: 1.1, 93: 1.6, 95: 2.2, 98: 3.5}
+    call_mids = {100: 3.0, 105: 1.4, 108: 0.8}
+
+    # score 7 -> bull-put AND bull-call
+    v = app._build_fa_verticals(spot, put_mids, call_mids, 7, cfg)
+    by = {x["kind"]: x for x in v}
+    assert set(by) == {"bull_put", "bull_call"}
+    bp = by["bull_put"]
+    assert bp["short"] == 95 and bp["long"] == 88          # ~5% OTM short, ~12% long
+    assert bp["ref_net"] > 0                               # credit
+    assert bp["legs"][0] == {"action": "SELL", "strike": 95, "opt": "P", "qty": 1}
+    bc = by["bull_call"]
+    assert bc["long"] == 100 and bc["short"] == 108        # ~ATM long, ~8% OTM short
+    assert bc["ref_net"] < 0                               # debit
+    assert bc["legs"][0]["action"] == "BUY" and bc["legs"][0]["opt"] == "C"
+
+    # score 5 -> bull-put only (call gated at >=6)
+    v5 = app._build_fa_verticals(spot, put_mids, call_mids, 5, cfg)
+    assert {x["kind"] for x in v5} == {"bull_put"}
+
+    # no positive-credit put available -> nothing (guards against bad quotes)
+    assert app._build_fa_verticals(spot, {95: 1.0, 90: 1.0}, {}, 5, cfg) == [] or \
+        all(x["ref_net"] != 0 for x in app._build_fa_verticals(spot, {95: 1.0, 90: 1.0}, {}, 5, cfg))
+    print("ok  FA verticals (bull-put always, bull-call gated at score>=6)")
+
+
 def test_strategy_registry():
     import app
     from src import strategies as reg
 
     # every registered slug that trades live must be recognised by attribution
     # (_coid_strategy), so realized P&L is attributed to the right strategy.
-    tagged = {"bull_put", "condor", "bwb", "fly", "burrito",
+    tagged = {"bull_put", "bull_call", "condor", "bwb", "fly", "burrito",
               "fallen_angel", "value", "income_core"}
     for slug in tagged:
         assert reg.get(slug) is not None, f"{slug} missing from registry"
     # round-trip the slugs that ride an entry client_order_id through _coid_strategy
     assert app._coid_strategy("auto-condor-20260618") == "condor"
     assert app._coid_strategy("bull_put-KO-20260717") == "bull_put"
+    assert app._coid_strategy("bull_call-CAG-20260717") == "bull_call"
     assert app._coid_strategy("fa-INTC-20260618") == "fallen_angel"
     assert app._coid_strategy("dca-BND-2026W29") == "income_core"
 
@@ -344,5 +376,6 @@ if __name__ == "__main__":
     test_expected_move()
     test_zerodte_strikes()
     test_condor_edge_gate()
+    test_fa_verticals()
     test_strategy_registry()
     print("\nALL PASS")

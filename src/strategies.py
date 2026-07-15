@@ -70,6 +70,12 @@ _ALL: list[Strategy] = [
         formatter="src.analysis.bull_put_scanner:fmt_slack",
         command="/scan", cron="/api/bull-put/scan"),
     Strategy(
+        slug="bull_call", name="Bull Call Debit Spread", structure="vertical",
+        legs=2, kind="debit",
+        summary="Buy a near-ATM call spread on high-conviction fallen angels (score>=6) — leveraged bounce play.",
+        scanner="src.analysis.fallen_angel_scanner:scan_fallen_angels",
+        config="fallen_angel.json"),
+    Strategy(
         slug="condor", name="Iron Condor", structure="iron_condor",
         legs=4, kind="credit",
         summary="GEX-anchored put+call spreads between the walls — high-POP premium play.",
@@ -127,9 +133,9 @@ _ALL: list[Strategy] = [
         scanner="swing_scanner:scan_ticker",
         cron="/cron/swing"),
     Strategy(
-        slug="fallen_angel", name="Fallen-Angel Equity", structure="equity",
-        legs=0, kind="equity",
-        summary="Buy beaten-down high-conviction stocks near 52w lows with a hard stop.",
+        slug="fallen_angel", name="Fallen-Angel (spread-expressed)", structure="vertical",
+        legs=2, kind="mixed",
+        summary="Beaten-down high-conviction names (score>=6) proposed as managed verticals: bull-put credit spread + bull-call debit spread. See [[bull_call]].",
         scanner="src.analysis.fallen_angel_scanner:scan_fallen_angels",
         formatter="src.analysis.fallen_angel_scanner:fmt_slack",
         cron="/api/fallen-angels", config="fallen_angel.json"),
