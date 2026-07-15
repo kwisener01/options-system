@@ -29,7 +29,12 @@ it is unreliable behind corporate SSL. Requires ALPACA_API_KEY / ALPACA_SECRET_K
 Usage:
     python run_suggestion_backtest.py [export.txt]
     python run_suggestion_backtest.py --as-vertical [--source FA|VW|both]
-        [--vertical put|call|both] [--target 0.5] [--close-dte 2]
+        [--vertical put|call|both] [--target 0.5] [--close-dte 2] [--min-score N]
+
+    --min-score gates on the alert's conviction score. For the directional
+    bull-call on Fallen Angel names, score >= 6 was the differentiator that
+    turned a lumpy 69% win rate into ~90% (the score-5 bucket was the drag);
+    the bull-put credit spread is roughly score-agnostic.
 """
 from __future__ import annotations
 
@@ -480,15 +485,19 @@ def manage_vertical(kind: str, pick: dict, target: float, close_dte: int) -> dic
 
 
 def run_verticals(picks: list[dict], closes: dict, sources: set[str],
-                  kinds: list[str], target: float, close_dte: int) -> None:
-    sel = [p for p in picks if p["source"] in sources]
+                  kinds: list[str], target: float, close_dte: int, min_score: int = 0) -> None:
+    sel = [p for p in picks if p["source"] in sources and p["score"] >= min_score]
     src_label = "+".join(sorted(sources))
     print("=" * 74)
     print(f"  --as-vertical  —  {src_label} equity signals re-expressed as MANAGED verticals")
     print("=" * 74)
     print(f"  exit rule: take profit at +{int(target*100)}% of max profit, else force-close")
     print(f"             {close_dte}d before expiry. Never held to expiration (no assignment).")
-    print(f"  entry/marks from Alpaca option daily bars; monthly expiry.\n")
+    print(f"  entry/marks from Alpaca option daily bars; monthly expiry.")
+    if min_score:
+        print(f"  filter: conviction score >= {min_score}  "
+              f"(differentiator for the directional bull-call)")
+    print()
 
     results = {k: [] for k in kinds}
     for p in sel:
@@ -500,7 +509,8 @@ def run_verticals(picks: list[dict], closes: dict, sources: set[str],
                 parts.append(f"{k}: ${r['pnl']:+5.0f}/{r['max_risk']:>3.0f}r "
                              f"{r['ror']*100:+4.0f}% ({r['reason']})")
         if parts:
-            print(f"  {p['ticker']:5} {p['date']}  " + "   ".join(parts))
+            print(f"  {p['ticker']:5} {p['date']} sc{p['score']}/{p['score_max']}  "
+                  + "   ".join(parts))
 
     print(f"\n=== SUMMARY (capital-aware) — {src_label} ===")
     for k in kinds:
@@ -530,7 +540,7 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-    value_flags = {"--source", "--vertical", "--target", "--close-dte"}
+    value_flags = {"--source", "--vertical", "--target", "--close-dte", "--min-score"}
     positional, skip = [], False
     for i, a in enumerate(sys.argv[1:]):
         if skip:
@@ -551,6 +561,7 @@ def main() -> None:
     kinds_arg = _flag_value("--vertical", "both")    # put | call | both
     target = float(_flag_value("--target", "0.5"))
     close_dte = int(_flag_value("--close-dte", "2"))
+    min_score = int(_flag_value("--min-score", "0"))
 
     equity = parse_equity(lines)
     options = parse_options(lines)
@@ -569,7 +580,7 @@ def main() -> None:
     if as_vertical:
         sources = {"FA", "VW"} if src_arg == "both" else {src_arg}
         kinds = ["put", "call"] if kinds_arg == "both" else [kinds_arg]
-        run_verticals(equity, closes, sources, kinds, target, close_dte)
+        run_verticals(equity, closes, sources, kinds, target, close_dte, min_score)
         return
 
     run_equity(equity, closes)
