@@ -1712,11 +1712,46 @@ def _fmt_slack(d: dict) -> str:
 
 # ── Bull Put Scheduled Scanner (HITL alerts) ──────────────────────────────────
 
+def _structure_name(legs: list) -> str:
+    """Human name for an option structure from its legs (each: qty, strike,
+    otype 'C'/'P'). Legs are one (underlying, expiry) group, so a vertical is 2,
+    a butterfly/BWB is 3, a condor/iron condor is 4. Calendars span expiries and
+    show up as separate single/vertical groups (Alpaca doesn't tag structures)."""
+    n = len(legs)
+    types = {lg["otype"] for lg in legs}
+    if n == 1:
+        lg   = legs[0]
+        side = "long" if lg["qty"] > 0 else "short"
+        return f"{side} {'call' if lg['otype'] == 'C' else 'put'}"
+    if n == 2:
+        if types == {"C", "P"}:                       # straddle/strangle/combo
+            strikes = {lg["strike"] for lg in legs}
+            return "straddle" if len(strikes) == 1 else "strangle"
+        return "vertical"
+    if n == 3:
+        sl = sorted(legs, key=lambda x: x["strike"])
+        w1 = sl[1]["strike"] - sl[0]["strike"]
+        w2 = sl[2]["strike"] - sl[1]["strike"]
+        return "butterfly" if abs(w1 - w2) < 0.01 else "BWB"
+    if n == 4:
+        return "iron condor" if types == {"C", "P"} else "condor"
+    return f"{n}-leg spread"
+
+
+def _fmt_strikes(legs: list) -> str:
+    """Compact strike label for a structure, e.g. '5895/5900P' or '5850/5860/5940/5950CP'."""
+    ks   = "/".join(f"{lg['strike']:g}" for lg in sorted(legs, key=lambda x: x["strike"]))
+    kind = "".join(sorted({lg["otype"] for lg in legs}))   # C, P, or CP
+    return f"{ks}{kind}"
+
+
 def _build_position_summary() -> tuple[str, str]:
     """
     Returns (close_block, positions_block) for open positions.
     close_block  — urgent close suggestions with runnable commands.
-    positions_block — one-line summary of every open position.
+    positions_block — one line per position: equities individually, and option
+    legs grouped into their structure (vertical/butterfly/condor/…) with the
+    structure's combined market value and P&L.
     """
     from src.live.alpaca_options import _trading
     from datetime import date
@@ -1737,56 +1772,73 @@ def _build_position_summary() -> tuple[str, str]:
     pos_lines  = []
     close_tips = []
 
+    # -- split equities from option legs, grouping options by (underlying, expiry) --
+    equities: list       = []
+    opt_groups: dict     = {}
     for p in positions:
         sym    = p.symbol
-        qty    = float(p.qty)
+        parsed = _occ_parse(sym) if len(sym) > 6 else None
+        if parsed is None:
+            equities.append(p)
+            continue
+        underlying, exp, strike, otype = parsed
+        opt_groups.setdefault((underlying, exp), []).append({
+            "qty":    float(p.qty),
+            "strike": strike, "otype": otype,
+            "mkt":    float(getattr(p, "market_value", 0) or 0),
+            "unreal": float(getattr(p, "unrealized_pl", 0) or 0),
+            "cost":   float(getattr(p, "cost_basis", 0) or 0),
+        })
+
+    # -- equities: one line each -------------------------------------------
+    for p in equities:
+        sym    = p.symbol
         unreal = float(getattr(p, "unrealized_pl",   0) or 0)
         pct    = float(getattr(p, "unrealized_plpc", 0) or 0) * 100
         mkt    = float(getattr(p, "market_value",    0) or 0)
         icon   = ":green_circle:" if unreal >= 0 else ":red_circle:"
-        is_opt = len(sym) > 6
-
         pos_lines.append(
             f"  {icon} `{sym}`  ${mkt:,.2f}  P&L ${unreal:+,.2f} ({pct:+.1f}%)"
         )
+        if pct <= -8:
+            close_tips.append(
+                f":rotating_light: *`{sym}`* — down {pct:.1f}%, stop-loss zone.\n"
+                f"  > `python close_position.py --ticker {sym}`"
+            )
+        elif pct >= 20:
+            close_tips.append(
+                f":moneybag: *`{sym}`* — up {pct:.1f}%, consider trimming.\n"
+                f"  > `python close_position.py --ticker {sym}`"
+            )
 
-        if is_opt:
-            # Parse underlying and DTE from OCC symbol
-            try:
-                tp         = len(sym) - 9
-                raw        = sym[tp - 6: tp]
-                exp_date   = date(2000 + int(raw[0:2]), int(raw[2:4]), int(raw[4:6]))
-                dte        = (exp_date - today).days
-                underlying = sym[:tp - 6]
-            except Exception:
-                dte        = 99
-                underlying = sym
+    # -- option structures: one line per (underlying, expiry) group --------
+    for (underlying, exp), legs in sorted(opt_groups.items(), key=lambda kv: kv[0][1]):
+        dte     = (exp - today).days
+        mkt     = sum(lg["mkt"]    for lg in legs)
+        unreal  = sum(lg["unreal"] for lg in legs)
+        cost    = sum(lg["cost"]   for lg in legs)          # signed; <0 = net credit
+        pct     = (unreal / abs(cost) * 100) if cost else 0.0
+        icon    = ":green_circle:" if unreal >= 0 else ":red_circle:"
+        name    = _structure_name(legs)
+        strikes = _fmt_strikes(legs)
+        pos_lines.append(
+            f"  {icon} *{underlying}* {name} `{strikes}` {exp.strftime('%m/%d')}"
+            f"  ${mkt:,.2f}  P&L ${unreal:+,.2f} ({pct:+.1f}%)  {dte}DTE"
+        )
 
-            if dte <= 3:
-                close_tips.append(
-                    f":warning: *`{sym}`* — {dte} DTE, expires soon.\n"
-                    f"  > `python close_bwb.py --ticker {underlying}`  _(or let expire — defined-risk)_"
-                )
-            # Short option at 50%+ profit
-            cost = float(getattr(p, "cost_basis", 0) or 0)
-            if qty < 0 and cost != 0:
-                profit_pct = (abs(cost) - abs(mkt)) / abs(cost) * 100
-                if profit_pct >= 50:
-                    close_tips.append(
-                        f":moneybag: *`{sym}`* — {profit_pct:.0f}% of max profit captured.\n"
-                        f"  > `python close_bwb.py --ticker {underlying}`"
-                    )
-        else:
-            if pct <= -8:
-                close_tips.append(
-                    f":rotating_light: *`{sym}`* — down {pct:.1f}%, stop-loss zone.\n"
-                    f"  > `python close_position.py --ticker {sym}`"
-                )
-            elif pct >= 20:
-                close_tips.append(
-                    f":moneybag: *`{sym}`* — up {pct:.1f}%, consider trimming.\n"
-                    f"  > `python close_position.py --ticker {sym}`"
-                )
+        if dte <= 3:
+            close_tips.append(
+                f":warning: *{underlying} {name}* ({strikes}) — {dte} DTE, expires soon.\n"
+                f"  > `python close_bwb.py --ticker {underlying}`  _(or let expire — defined-risk)_"
+            )
+        # Credit structure at 50%+ of max profit captured
+        net_credit = -cost
+        if net_credit > 0 and unreal >= 0.5 * net_credit:
+            profit_pct = unreal / net_credit * 100
+            close_tips.append(
+                f":moneybag: *{underlying} {name}* ({strikes}) — {profit_pct:.0f}% of max profit captured.\n"
+                f"  > `python close_bwb.py --ticker {underlying}`"
+            )
 
     pos_block   = "\n".join(pos_lines) + f"\n  BP available: ${bp:,.2f}"
     close_block = "\n\n".join(close_tips) if close_tips else ""
@@ -3599,6 +3651,15 @@ def _cmd_eod(resp_url: str):
     _eod_report_job()
 
 
+def _cmd_strategies(resp_url: str):
+    """Render the full strategy registry (the bot's playbook)."""
+    try:
+        from src.strategies import format_overview
+        _slack_respond(resp_url, format_overview())
+    except Exception as e:
+        _slack_respond(resp_url, f":rotating_light: Strategy registry failed: {e}")
+
+
 def _spy_idea_line() -> str:
     """One-line confidence + stability read of the current SPY trade idea."""
     try:
@@ -3729,6 +3790,7 @@ HELP_TEXT = (
     "`/attribution` — realized P&L by strategy (which strategy makes money)\n"
     "`/allocation` — stock / option / cash split vs caps\n"
     "`/eod`   — generate EOD P&L report now\n"
+    "`/strategies` — the bot's full strategy playbook (registry)\n"
     "`/help`  — show this message"
 )
 
@@ -3766,6 +3828,8 @@ def slack_command():
         "allocation": ":hourglass: Computing allocation...",
         "alloc":     ":hourglass: Computing allocation...",
         "eod":       ":hourglass: Generating EOD report...",
+        "strategies": ":hourglass: Loading strategy registry...",
+        "strats":    ":hourglass: Loading strategy registry...",
         "help":      None,
     }
 
@@ -3795,6 +3859,8 @@ def slack_command():
         "allocation": lambda: _cmd_allocation(resp_url),
         "alloc":     lambda: _cmd_allocation(resp_url),
         "eod":       lambda: _cmd_eod(resp_url),
+        "strategies": lambda: _cmd_strategies(resp_url),
+        "strats":    lambda: _cmd_strategies(resp_url),
     }
     threading.Thread(target=dispatch[command], daemon=True).start()
     return jsonify({"text": ack_map[command], "response_type": "in_channel"}), 200

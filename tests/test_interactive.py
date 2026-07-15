@@ -295,6 +295,39 @@ def test_condor_edge_gate():
     print("ok  condor edge gate (POP vs breakeven win-rate)")
 
 
+def test_strategy_registry():
+    import app
+    from src import strategies as reg
+
+    # every registered slug that trades live must be recognised by attribution
+    # (_coid_strategy), so realized P&L is attributed to the right strategy.
+    tagged = {"bull_put", "condor", "bwb", "fly", "burrito",
+              "fallen_angel", "value", "income_core"}
+    for slug in tagged:
+        assert reg.get(slug) is not None, f"{slug} missing from registry"
+    # round-trip the slugs that ride an entry client_order_id through _coid_strategy
+    assert app._coid_strategy("auto-condor-20260618") == "condor"
+    assert app._coid_strategy("bull_put-KO-20260717") == "bull_put"
+    assert app._coid_strategy("fa-INTC-20260618") == "fallen_angel"
+    assert app._coid_strategy("dca-BND-2026W29") == "income_core"
+
+    # command lookups resolve to the right strategy
+    assert reg.by_command("/condor").slug == "condor"
+    assert reg.by_command("fly").slug == "fly"
+
+    # every scanner/formatter reference actually imports (no stale module paths)
+    for s in reg.all_strategies():
+        if s.scanner:
+            assert callable(s.load()), f"{s.slug} scanner {s.scanner} broken"
+        if s.formatter:
+            assert callable(s.load_formatter()), f"{s.slug} formatter broken"
+
+    # structure grouping in the P&L view maps to a real registry structure
+    assert reg.for_structure("iron_condor"), "no iron_condor strategy"
+    assert reg.format_overview().startswith(":books:")
+    print("ok  strategy registry (slug alignment / command lookup / scanner refs)")
+
+
 if __name__ == "__main__":
     test_pending_store()
     test_blocks()
@@ -311,4 +344,5 @@ if __name__ == "__main__":
     test_expected_move()
     test_zerodte_strikes()
     test_condor_edge_gate()
+    test_strategy_registry()
     print("\nALL PASS")
