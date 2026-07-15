@@ -16,12 +16,20 @@ of ranked suggestion:
                   option bars are pulled on the entry date to confirm the credit
                   was achievable.  [#2]
 
+  --as-vertical — re-express the equity signals as MANAGED option verticals
+                  (bull-put credit / bull-call debit) instead of buying stock.
+                  Take profit at a target, else force-close a few days before
+                  expiry — never held to expiration, so no assignment risk.
+                  Entry and every mark come from real Alpaca option daily bars.
+
 Data comes from Alpaca historical bars (stock + option) — yfinance is not used,
 it is unreliable behind corporate SSL. Requires ALPACA_API_KEY / ALPACA_SECRET_KEY
 (loaded from .env if present).
 
 Usage:
-    python run_suggestion_backtest.py [slack_export.txt]
+    python run_suggestion_backtest.py [export.txt]
+    python run_suggestion_backtest.py --as-vertical [--source FA|VW|both]
+        [--vertical put|call|both] [--target 0.5] [--close-dte 2]
 """
 from __future__ import annotations
 
@@ -34,6 +42,16 @@ from datetime import datetime, timedelta
 warnings.filterwarnings("ignore")
 
 DEFAULT_EXPORT = "slack_test/ck test — trader connected.txt"
+
+
+def _flag_value(flag: str, default: str) -> str:
+    """Read `--flag value` or `--flag=value` from argv, else default."""
+    for i, a in enumerate(sys.argv):
+        if a == flag and i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+        if a.startswith(flag + "="):
+            return a.split("=", 1)[1]
+    return default
 
 
 # ── credentials ────────────────────────────────────────────────────────────────
@@ -320,6 +338,191 @@ def run_options(structs: list[dict], closes: dict, validate: bool) -> None:
     print()
 
 
+# ── --as-vertical: re-express an equity signal as a managed vertical ──────────────
+#
+# Instead of buying the stock, sell a bull-put credit spread (or buy a bull-call
+# debit spread) below/around the alert price and MANAGE it — take profit at a
+# target, else force-close a few days before expiry. Nothing is ever held through
+# expiration, so there is no assignment risk. Entry and every mark come from real
+# Alpaca option daily bars.
+
+from calendar import monthcalendar
+
+_OPT = None
+
+
+def _opt_client():
+    global _OPT
+    if _OPT is None:
+        from alpaca.data.historical.option import OptionHistoricalDataClient
+        _OPT = OptionHistoricalDataClient(os.environ["ALPACA_API_KEY"], os.environ["ALPACA_SECRET_KEY"])
+    return _OPT
+
+
+def _third_friday(y: int, m: int) -> datetime:
+    fr = [w[4] for w in monthcalendar(y, m) if w[4]]
+    return datetime(y, m, fr[2])
+
+
+def _monthly_after(dt: datetime, min_dte: int = 25) -> datetime:
+    e = _third_friday(dt.year, dt.month)
+    if e < dt + timedelta(days=min_dte):
+        ny, nm = (dt.year, dt.month + 1) if dt.month < 12 else (dt.year + 1, 1)
+        e = _third_friday(ny, nm)
+    return e
+
+
+def _strike_grid(spot: float, lo: float, hi: float) -> list[float]:
+    inc = 0.5 if spot < 20 else 1.0 if spot < 60 else 2.5 if spot < 150 else 5.0
+    import math
+    out, k = [], math.floor(spot * lo / inc) * inc
+    while k <= spot * hi:
+        out.append(round(k, 1)); k += inc
+    return out
+
+
+def _spread_bars(tkr: str, exp: datetime, typ: str, strikes: list[float],
+                 start: datetime, end: datetime) -> dict:
+    """{strike: close-series (naive daily index)} for candidate strikes that traded."""
+    import pandas as pd
+    from alpaca.data.requests import OptionBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    from src.live.alpaca_options import occ_symbol
+    syms = {occ_symbol(tkr, exp.date(), typ, k): k for k in strikes}
+    try:
+        df = _opt_client().get_option_bars(OptionBarsRequest(
+            symbol_or_symbols=list(syms), timeframe=TimeFrame.Day, start=start, end=end)).df
+    except Exception:
+        return {}
+    if df is None or len(df) == 0:
+        return {}
+    out = {}
+    for sym in df.index.get_level_values(0).unique():
+        s = df.xs(sym, level=0)["close"]
+        s.index = pd.to_datetime(s.index).tz_localize(None).normalize()
+        out[syms[sym]] = s
+    return out
+
+
+def _nearest(cands, target):
+    return min(cands, key=lambda k: abs(k - target)) if cands else None
+
+
+def manage_vertical(kind: str, pick: dict, target: float, close_dte: int) -> dict | None:
+    """Backtest one managed vertical from an equity alert. `kind` is 'put'
+    (bull-put credit) or 'call' (bull-call debit). Returns realized-P&L dict or
+    None if the spread can't be built from traded option bars."""
+    import pandas as pd
+    dt = datetime.strptime(pick["date"], "%Y-%m-%d")
+    spot = pick["price"]
+    exp = _monthly_after(dt)
+    typ = "PUT" if kind == "put" else "CALL"
+    lo, hi = (0.80, 1.00) if kind == "put" else (0.98, 1.20)
+    fetch_end = min(exp, datetime.now())             # Alpaca returns nothing for a future end
+    bars = _spread_bars(pick["ticker"], exp, typ, _strike_grid(spot, lo, hi), dt, fetch_end)
+    entry_px = {k: float(s.iloc[0]) for k, s in bars.items() if len(s)}
+    if len(entry_px) < 2:
+        return None
+
+    if kind == "put":                                   # short ~5% OTM / long lower
+        otm = {k: v for k, v in entry_px.items() if k <= spot}
+        Ks = _nearest(list(otm), spot * 0.95)
+        Kl = _nearest([k for k in otm if k < (Ks or -1)], spot * 0.88)
+        if not Ks or not Kl:
+            return None
+        legs = [(Ks, -1), (Kl, +1)]                     # sell high strike, buy low
+        width = (Ks - Kl) * 100
+    else:                                               # long ~ATM / short higher
+        Kl = _nearest(list(entry_px), spot * 1.00)
+        Ku = _nearest([k for k in entry_px if k > (Kl or 1e9)], spot * 1.08)
+        if not Kl or not Ku:
+            return None
+        legs = [(Kl, +1), (Ku, -1)]                     # buy low strike, sell high
+        width = (Ku - Kl) * 100
+
+    # align the two legs' daily marks
+    ser = {k: bars[k] for k, _ in legs}
+    common = sorted(set(ser[legs[0][0]].index) & set(ser[legs[1][0]].index))
+    common = [d for d in common if d >= pd.Timestamp(dt)]
+    if len(common) < 2:
+        return None
+
+    def net(d):                                          # position value to holder
+        return sum(q * float(ser[k].loc[d]) for k, q in legs) * 100
+
+    p_entry = net(common[0])
+    credit = -p_entry                                    # >0 for the put credit spread
+    debit = p_entry                                      # >0 for the call debit spread
+    if kind == "put":
+        if credit <= 0:
+            return None
+        max_profit, max_risk = credit, width - credit
+    else:
+        if debit <= 0:
+            return None
+        max_profit, max_risk = width - debit, debit
+    if max_risk <= 0:
+        return None
+
+    force_close = pd.Timestamp(exp) - pd.Timedelta(days=close_dte)
+    exit_d, reason = common[-1], "data-end mark"
+    for d in common[1:]:
+        pnl = net(d) - p_entry
+        if pnl >= target * max_profit:
+            exit_d, reason = d, f"+{int(target*100)}% target"; break
+        if d >= force_close:
+            exit_d, reason = d, f"force-close {close_dte}d pre-exp"; break
+    pnl = max(min(net(exit_d) - p_entry, max_profit), -max_risk)
+    return dict(kind=kind, ticker=pick["ticker"], date=pick["date"],
+                strikes="/".join(f"{k:g}" for k, _ in legs),
+                entry=p_entry, pnl=round(pnl, 2), max_risk=round(max_risk, 2),
+                ror=pnl / max_risk, days=(exit_d - common[0]).days, reason=reason)
+
+
+def run_verticals(picks: list[dict], closes: dict, sources: set[str],
+                  kinds: list[str], target: float, close_dte: int) -> None:
+    sel = [p for p in picks if p["source"] in sources]
+    src_label = "+".join(sorted(sources))
+    print("=" * 74)
+    print(f"  --as-vertical  —  {src_label} equity signals re-expressed as MANAGED verticals")
+    print("=" * 74)
+    print(f"  exit rule: take profit at +{int(target*100)}% of max profit, else force-close")
+    print(f"             {close_dte}d before expiry. Never held to expiration (no assignment).")
+    print(f"  entry/marks from Alpaca option daily bars; monthly expiry.\n")
+
+    results = {k: [] for k in kinds}
+    for p in sel:
+        parts = []
+        for k in kinds:
+            r = manage_vertical(k, p, target, close_dte)
+            if r:
+                results[k].append(r)
+                parts.append(f"{k}: ${r['pnl']:+5.0f}/{r['max_risk']:>3.0f}r "
+                             f"{r['ror']*100:+4.0f}% ({r['reason']})")
+        if parts:
+            print(f"  {p['ticker']:5} {p['date']}  " + "   ".join(parts))
+
+    print(f"\n=== SUMMARY (capital-aware) — {src_label} ===")
+    for k in kinds:
+        rs = results[k]
+        if not rs:
+            print(f"  bull-{k:4} n=0"); continue
+        pnls = [r["pnl"] for r in rs]
+        rors = [r["ror"] * 100 for r in rs]
+        risk = sum(r["max_risk"] for r in rs)
+        wins = sum(1 for x in pnls if x > 0)
+        label = "credit spread" if k == "put" else "debit spread"
+        print(f"  bull-{k} {label:14} n={len(rs):3}  "
+              f"mean ${sum(pnls)/len(pnls):+5.0f}/trade  mean ROR {sum(rors)/len(rors):+4.0f}%  "
+              f"win {wins/len(rs)*100:3.0f}%")
+        print(f"    gross P&L ${sum(pnls):+.0f}  across ${risk:,.0f} of cumulative risk "
+              f"(NOT concurrent — these overlap and re-alert)")
+    print("\n  ⚠️  Gross P&L is a SUM over overlapping, non-independent re-alerts that")
+    print("      would need far more capital than the ~$2k account had. Read the")
+    print("      PER-TRADE mean/ROR/win as the edge; the gross total is not account P&L.")
+    print()
+
+
 # ── main ─────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -327,12 +530,27 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
-    path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_EXPORT
+    value_flags = {"--source", "--vertical", "--target", "--close-dte"}
+    positional, skip = [], False
+    for i, a in enumerate(sys.argv[1:]):
+        if skip:
+            skip = False; continue
+        if a in value_flags:                         # consumes the next arg as its value
+            skip = True; continue
+        if not a.startswith("--"):
+            positional.append(a)
+    path = positional[0] if positional else DEFAULT_EXPORT
     validate = "--no-validate" not in sys.argv
     if not os.path.exists(path):
         sys.exit(f"export not found: {path}")
     _load_env()
     lines = open(path, encoding="utf-8").read().splitlines()
+
+    as_vertical = "--as-vertical" in sys.argv
+    src_arg = _flag_value("--source", "FA")          # FA | VW | both
+    kinds_arg = _flag_value("--vertical", "both")    # put | call | both
+    target = float(_flag_value("--target", "0.5"))
+    close_dte = int(_flag_value("--close-dte", "2"))
 
     equity = parse_equity(lines)
     options = parse_options(lines)
@@ -345,14 +563,21 @@ def main() -> None:
     start = datetime.strptime(min(dates), "%Y-%m-%d") - timedelta(days=5)
     end = datetime.now()
     print(f"Fetching Alpaca daily bars for {len(tickers)} symbols "
-          f"({start.date()} → {end.date()})...")
+          f"({start.date()} → {end.date()})...\n")
     closes = fetch_stock_closes(tickers, start, end)
+
+    if as_vertical:
+        sources = {"FA", "VW"} if src_arg == "both" else {src_arg}
+        kinds = ["put", "call"] if kinds_arg == "both" else [kinds_arg]
+        run_verticals(equity, closes, sources, kinds, target, close_dte)
+        return
 
     run_equity(equity, closes)
     run_options(options, closes, validate)
 
     print("Notes: overlapping re-alerts are not independent; forward windows are")
     print("truncated for recent picks; options are held-to-expiry (no early mgmt).")
+    print("Run with --as-vertical to re-express equity signals as managed spreads.")
 
 
 if __name__ == "__main__":
