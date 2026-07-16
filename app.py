@@ -1333,6 +1333,8 @@ def cron_swing():
         return jsonify({"ok": False, "error": "CRON_TOKEN not configured"}), 503
     if token != expected:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if not _alerts_cfg().get("swing", True):
+        return jsonify({"ok": True, "paused": True})
 
     def _run():
         try:
@@ -1362,6 +1364,8 @@ def cron_shadow():
         return jsonify({"ok": False, "error": "CRON_TOKEN not configured"}), 503
     if token != expected:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+    if not _alerts_cfg().get("shadow", True):
+        return jsonify({"ok": True, "paused": True})
 
     def _run():
         # Only log once mid-morning — guards against a too-frequent cron spamming
@@ -2138,7 +2142,11 @@ def _fmt_rotation(rot: dict) -> str:
 
 def _alerts_cfg() -> dict:
     path = os.path.join(os.path.dirname(__file__), "config", "alerts.json")
-    cfg = {"bwb": False, "xsp": False, "hourly_status": True}
+    # Focus mode (2026-07-15): only market updates, FA verticals, and the SPY
+    # Burrito are active. These flags gate the rest; absent = prior behavior.
+    cfg = {"bwb": False, "xsp": False, "hourly_status": True,
+           "bull_put_entries": True, "spy_idea": True, "value_alerts": True,
+           "swing": True, "shadow": True}
     try:
         with open(path) as f:
             cfg.update(json.load(f))
@@ -2508,11 +2516,12 @@ def _unified_scan_job():
             )
 
         # -- Assemble message ------------------------------------------------
+        _acfg = _alerts_cfg()
         sections = [f":mag: *{session} Scan — {ts}*"]
 
         if gex_block:
             sections += ["", gex_block]
-        if trade_block:
+        if trade_block and _acfg.get("spy_idea", True):
             sections += ["", "*--- SPY TRADE IDEA ---*", trade_block]
         if close_block:
             sections += ["", "*--- CLOSE / ACTION ---*", close_block]
@@ -2520,11 +2529,10 @@ def _unified_scan_job():
             sections += ["", "*--- OPEN POSITIONS ---*", pos_block]
         if fa_hits:
             sections += ["", fa_fmt(fa_results, ts)]
-        if vw_hits:
+        if vw_hits and _acfg.get("value_alerts", True):
             sections += ["", vw_fmt(vw_results, regime, vix["now"], ts)]
-        if bp_place_lines:
+        if bp_place_lines and _acfg.get("bull_put_entries", True):
             sections += ["", ":moneybag: *Bull Put Spreads — place trade*"] + bp_place_lines
-        _acfg = _alerts_cfg()
         if bwb_lines and _acfg.get("bwb", False):
             sections += ["", ":butterfly: *BWB Watchlist Candidates*"] + bwb_lines
         if _acfg.get("monitor_setups", False):
@@ -2542,9 +2550,11 @@ def _unified_scan_job():
         send_message("\n".join(sections))
 
         # -- Interactive entry approvals (Alpaca-executable structures) -------
+        # Focus mode: bull-put/bwb/fly/condor buttons are gated by alerts.json.
+        # FA verticals (below) and the SPY Burrito (/cron/burrito) stay active.
         try:
             entry_cands = []
-            for r in bp_hits:
+            for r in (bp_hits if _acfg.get("bull_put_entries", True) else []):
                 c = r.get("candidate")
                 if not c:
                     continue
@@ -2563,7 +2573,8 @@ def _unified_scan_job():
                                             f"({c['credit_pct']:.0f}%)  max loss -${c['max_loss_usd']}"
                                             + _earn_note(r["ticker"]),
                                     "label": label})
-            for r in sorted(bwb_hits, key=lambda x: x["candidate"]["analysis"]["score"], reverse=True):
+            for r in (sorted(bwb_hits, key=lambda x: x["candidate"]["analysis"]["score"], reverse=True)
+                      if _acfg.get("bwb", False) else []):
                 c = r["candidate"]
                 legs = [
                     {"action": "BUY",  "strike": c["long_upper"],   "opt": "P", "qty": 1},
@@ -2575,7 +2586,8 @@ def _unified_scan_job():
                                      ref_net=float(c.get("credit", 0)), label=label,
                                      text=f"*{label}*  {c['dte']}DTE" + _earn_note(r["ticker"]))
                 entry_cands.append({"tid": tid, "text": f"*{label}*  {c['dte']}DTE", "label": label})
-            for c in fly_hits[:3]:
+            _setups_on = _acfg.get("monitor_setups", False)
+            for c in (fly_hits[:3] if _setups_on else []):
                 label = f"Pin fly {c['ticker']} {c['long_upper']:.0f}/{c['short_body']:.0f}/{c['long_lower']:.0f} {c['expiry']}"
                 tid = register_entry("fly", c["ticker"], c["expiry"], c["legs"], qty=1,
                                      ref_net=-float(c["debit"]), label=label,
@@ -2584,7 +2596,7 @@ def _unified_scan_job():
                 entry_cands.append({"tid": tid,
                                     "text": f"*{label}*  debit -${c['debit']:.2f}  R/R {c['rr']}",
                                     "label": label})
-            if condor_hit:
+            if condor_hit and _setups_on:
                 c = condor_hit
                 label = (f"Condor {c['ticker']} {c['short_put']:.0f}/{c['long_put']:.0f}P "
                          f"{c['short_call']:.0f}/{c['long_call']:.0f}C {c['expiry']}")

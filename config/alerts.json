@@ -4,5 +4,10 @@
   "monitor_setups": false,
   "bwb": false,
   "xsp": false,
-  "note": "Notification policy. hourly_status: post a compact SPY/QQQ/VIX snapshot once an hour during RTH. adverse_alert_usd: the 5-min monitor pings you (max once/hour) when total OPEN OPTIONS P&L falls to/below this dollar amount ('a trade has gone against me'). monitor_setups=false silences the recurring setup chatter (SPY trade idea / GEX fly / GEX condor / rotation in the 5-min monitor, and the fly/condor blocks in the unified scan). bwb=false hides the BWB watchlist section; xsp=false hides the XSP 'Batman' double-BWB alerts. Actionable Take/Buy proposals (bull put, fallen-angel, value, burrito) and fills/closes/risk-halts still notify. Flip any flag true to restore."
+  "bull_put_entries": false,
+  "spy_idea": false,
+  "value_alerts": false,
+  "swing": false,
+  "shadow": false,
+  "note": "FOCUS MODE (2026-07-15): only market updates, Fallen-Angel VERTICALS, and the SPY Burrito Butterfly are active; everything else is paused. hourly_status: hourly SPY/QQQ/VIX snapshot (market update, ON). adverse_alert_usd: 5-min monitor pings when open-options P&L falls to/below this (management, ON). Paused entry/chatter flags (flip true to restore): bull_put_entries=false (no bull-put buttons or /place text), spy_idea=false (no SPY GEX trade-idea text; the SPY Burrito button is separate and stays on), value_alerts=false (no Value Watchlist text; buys already off in fallen_angel.json), monitor_setups=false (no fly/condor buttons or blocks, no 5-min setup chatter), bwb=false (no BWB buttons/section), xsp=false (no Batman), swing=false (/cron/swing no-op), shadow=false (/cron/shadow no-op). Also paused via their own configs: auto_trade.enabled=false, dca.enabled=false, zerodte.enabled=false. STILL ON: fills/closes/risk-halts, 50%-target closes, stops, EOD report, and the FA vertical Take buttons."
 }

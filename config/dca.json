@@ -1,5 +1,5 @@
 {
-  "enabled": true,
+  "enabled": false,
   "weekly_budget": 20.0,
   "respect_cash_floor": true,
   "weights": {
