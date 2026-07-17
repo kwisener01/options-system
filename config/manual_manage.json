@@ -1,0 +1,4 @@
+{
+  "underlyings": ["IBM"],
+  "note": "Underlyings whose OPEN option structures should be pulled into auto-manage (50% profit target + 1-DTE force-close) even though they were placed manually (UUID client_order_id, so _auto_open_structures' 'auto-*' filter skips them). Legs are reconstructed from open positions and grouped by (underlying, expiry). Added IBM 2026-07-17 (manual bull-call from a fallen-angel signal). Remove an underlying here once its structure is closed."
+}

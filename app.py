@@ -5255,7 +5255,8 @@ def _auto_open_structures():
     except Exception as e:
         logger.warning("auto-manage: get_orders failed: %s", e)
         return []
-    open_syms = {p.symbol for p in client.get_all_positions()}
+    positions = client.get_all_positions()
+    open_syms = {p.symbol for p in positions}
     out = []
     for o in orders:
         coid = getattr(o, "client_order_id", "") or ""
@@ -5270,7 +5271,36 @@ def _auto_open_structures():
         if not parsed:
             continue
         out.append({"coid": coid, "underlying": parsed[0], "expiry": parsed[1], "legs": still_open})
+
+    # Manually-added structures: pull open option legs for allowlisted underlyings
+    # (config/manual_manage.json) into auto-manage even though they weren't tagged
+    # 'auto-*'. Grouped by (underlying, expiry); skips legs already captured above.
+    manual = {u.upper() for u in _manual_manage_underlyings()}
+    if manual:
+        captured = {s for st in out for s in st["legs"]}
+        from collections import defaultdict
+        groups: dict = defaultdict(list)
+        for p in positions:
+            s = p.symbol
+            if len(s) <= 6 or s in captured:
+                continue
+            parsed = _occ_parse(s)
+            if parsed and parsed[0] in manual:
+                groups[(parsed[0], parsed[1])].append(s)
+        for (u, exp), syms in groups.items():
+            out.append({"coid": f"manual-{u}-{exp}", "underlying": u, "expiry": exp, "legs": syms})
     return out
+
+
+def _manual_manage_underlyings() -> list:
+    """Underlyings whose manually-placed option structures should also be
+    auto-managed (config/manual_manage.json)."""
+    path = os.path.join(os.path.dirname(__file__), "config", "manual_manage.json")
+    try:
+        with open(path) as f:
+            return json.load(f).get("underlyings", [])
+    except Exception:
+        return []
 
 
 def _auto_close_structure(st: dict, reason: str):
