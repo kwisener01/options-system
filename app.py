@@ -1569,6 +1569,36 @@ def _burrito_propose():
     return f":burrito: *Burrito proposed* — {cand['label']} · max loss ${cand['max_loss']:.0f} · tap *Take*"
 
 
+@app.route("/cron/levitation", methods=["GET", "POST"])
+def cron_levitation():
+    """Propose the daily SPY Levitation trade (0DTE bull-put + temp hedge).
+    Hit once per market day inside the 9:45-11:30 ET entry window."""
+    token = request.args.get("token") or request.headers.get("X-Cron-Token", "")
+    expected = os.getenv("CRON_TOKEN", "")
+    if not expected:
+        return jsonify({"ok": False, "error": "CRON_TOKEN not configured"}), 503
+    if token != expected:
+        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    force = str(request.args.get("force", "")).lower() in ("1", "true", "yes")
+
+    def _run():
+        try:
+            from src.notifications.slack_notifier import send_message
+            from src.analysis.levitation_scanner import scan_levitation, fmt_slack
+            if not _market_is_open() and not force:
+                send_message(":feather: *Levitation* — market closed, no proposal "
+                             "(use &force=1 to preview)")
+                return
+            vix = get_data()["vix"]
+            r = scan_levitation(vix_now=vix["now"], vix_prev=vix["prev"])
+            send_message(fmt_slack(r))
+        except Exception as e:
+            logger.error("cron_levitation failed: %s", e)
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "started": True})
+
+
 @app.route("/cron/burrito", methods=["GET", "POST"])
 def cron_burrito():
     """Propose a SPY Burrito Butterfly (Slack Take button). Hit once/market day."""

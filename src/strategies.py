@@ -116,6 +116,13 @@ _ALL: list[Strategy] = [
         scanner="src.analysis.double_calendar_scanner:scan",
         status="manual"),
     Strategy(
+        slug="levitation", name="SPY Levitation (0DTE hedged bull-put)", structure="bwb",
+        legs=3, kind="credit",
+        summary="Daily 0DTE ATM bull-put + cheap temp hedge put — proposed only when the modeled T+0 curve stays positive.",
+        scanner="src.analysis.levitation_scanner:scan_levitation",
+        formatter="src.analysis.levitation_scanner:fmt_slack",
+        cron="/cron/levitation", config="levitation.json"),
+    Strategy(
         slug="xsp_0dte_bwb", name="XSP 0DTE BWB", structure="bwb",
         legs=3, kind="credit",
         summary="Same-day broken-wing butterfly on XSP anchored to the expected move.",

@@ -1,0 +1,16 @@
+{
+  "width":             3.0,
+  "hedge_budget_frac": 0.50,
+  "min_net_credit":    0.10,
+  "vol_beta":          1.5,
+  "t0_entry_dip_usd":  50,
+  "t0_check_hour":     13.0,
+  "t0_chk_buffer_usd": 10,
+  "t0_range_pct":      0.025,
+  "tp_frac":           0.50,
+  "stop_frac":         2.00,
+  "hedge_lock":        2.0,
+  "max_loss_usd":      300,
+  "entry_start":       "09:45",
+  "entry_end":         "11:30"
+}
