@@ -182,9 +182,13 @@ def place_single_leg(symbol: str, side: str, qty: int,
 
 
 def place_spread(short_symbol: str, long_symbol: str,
-                 qty: int, short_credit: float, long_debit: float) -> dict:
+                 qty: int, short_credit: float, long_debit: float,
+                 long_first: bool = False) -> dict:
     """
-    Place both legs of a credit spread.
+    Place both legs of a two-leg spread.
+    long_first=True (debit spreads): buy the long leg before selling the
+    short — selling first leaves a naked short that a live account will
+    reject (or worse, fill unhedged).
     Returns dict with order IDs for both legs.
     """
     results = {"short_order_id": None, "long_order_id": None, "success": False}
@@ -193,12 +197,21 @@ def place_spread(short_symbol: str, long_symbol: str,
     short_mid = get_mid_price(short_symbol) or short_credit
     long_mid  = get_mid_price(long_symbol)  or long_debit
 
-    # Sell the short leg first (reduces capital risk if long doesn't fill)
-    results["short_order_id"] = place_single_leg(short_symbol, "sell", qty,
-                                                  limit_price=max(short_mid * 0.95, 0.01))
-    # Buy the long leg (protection — always fill even if slightly above mid)
-    results["long_order_id"]  = place_single_leg(long_symbol, "buy", qty,
-                                                  limit_price=long_mid * 1.05)
+    def _sell_short():
+        results["short_order_id"] = place_single_leg(
+            short_symbol, "sell", qty, limit_price=max(short_mid * 0.95, 0.01))
+
+    def _buy_long():
+        results["long_order_id"] = place_single_leg(
+            long_symbol, "buy", qty, limit_price=long_mid * 1.05)
+
+    if long_first:
+        _buy_long()
+        if results["long_order_id"] is not None:   # never sell naked
+            _sell_short()
+    else:
+        _sell_short()
+        _buy_long()
 
     results["success"] = (results["short_order_id"] is not None and
                           results["long_order_id"]  is not None)
@@ -303,13 +316,14 @@ def fetch_chain_for_gex(underlying: str = "SPY",
                 except Exception:
                     continue
             try:
+                from src.analysis.gex_scanner import time_to_expiry_years
                 expiry_date = date.fromisoformat(expiry_str[:10])
-                T = max((expiry_date - today).days, 0) / 365
+                dte = (expiry_date - today).days
+                T = time_to_expiry_years(dte)   # 0DTE -> hours to the close, not 0
             except Exception:
                 continue
 
             # only take the n nearest expirations
-            dte = (expiry_date - today).days
             if dte < 0 or dte > 60:
                 continue
 
@@ -416,9 +430,10 @@ def fetch_chain_combined(underlying: str, spot: float,
                     continue
 
             try:
+                from src.analysis.gex_scanner import time_to_expiry_years
                 expiry_date = _date.fromisoformat(expiry_str[:10])
                 dte = (expiry_date - today).days
-                T   = max(dte, 0) / 365
+                T   = time_to_expiry_years(dte)   # 0DTE -> hours to the close, not 0
             except Exception:
                 continue
 

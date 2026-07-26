@@ -84,11 +84,13 @@ def _spy_price() -> float:
 
 
 def _next_spy_expiry(today: date) -> date:
-    """SPY options expire Mon / Wed / Fri. Return today if it's one, else next one."""
-    wd = today.weekday()   # 0=Mon 1=Tue 2=Wed 3=Thu 4=Fri
-    if wd in (0, 2, 4):
+    """SPY has daily (Mon-Fri) expirations. The trade is opened 9:45 AM and
+    force-closed 3:45 PM the same day, so same-day expiry is always correct;
+    on a weekend fall forward to Monday."""
+    wd = today.weekday()   # 0=Mon ... 4=Fri
+    if wd <= 4:
         return today
-    return today + timedelta(days=1)   # Tue->Wed, Thu->Fri
+    return today + timedelta(days=7 - wd)   # Sat->Mon, Sun->Mon
 
 
 def _bs_price(spot: float, strike: float, T: float, sigma: float, is_call: bool) -> float:
@@ -148,9 +150,15 @@ def _build_spread(signal: TradeSignal, spot: float, vix: float,
         logger.warning("Spread max_gain <= 0 (debit=%.2f width=%d) — skipping", debit, spread_width)
         return None
 
-    # Size: risk 1% of equity = debit × 100 × contracts
+    # Size: risk 1% of equity = debit × 100 × contracts.
+    # If even one contract exceeds the risk budget, skip — never force a
+    # minimum position that risks more than the account allows.
     risk_dollars = equity * GEX_RISK_PCT
-    contracts    = max(int(risk_dollars / (debit * 100)), 1)
+    contracts    = int(risk_dollars / (debit * 100))
+    if contracts < 1:
+        logger.warning("Debit %.2f x100 exceeds risk budget $%.0f — no trade",
+                       debit, risk_dollars)
+        return None
 
     return {
         "spread_type":   spread_type,
@@ -199,13 +207,14 @@ def open_trade(signal: TradeSignal, equity: float,
         send_message(":rotating_light: *GEX Options* — contract lookup failed, no trade placed")
         return None
 
-    # place_spread: sells short_sym, buys long_sym
+    # Debit spread: buy the long leg first so the short is always covered
     result = place_spread(
         short_symbol=short_sym,
         long_symbol=long_sym,
         qty=spread["contracts"],
         short_credit=spread["debit_paid"] * 0.35,
         long_debit=spread["debit_paid"],
+        long_first=True,
     )
 
     trade = {
