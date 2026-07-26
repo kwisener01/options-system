@@ -119,6 +119,11 @@ def scan(spot: float, gex, ticker: str = "SPY", label_as: str = "XSP",
             if not prof:
                 continue
 
+            # The Boomer Dan "Levitation" condition, reached in one order: if
+            # the grid-computed worst point across the whole tested range is
+            # still >= 0, the entire risk graph sits above zero at entry.
+            floating = max_loss >= -0.005
+
             cand = {
                 "ticker": label_as, "expiry": exp, "dte": dte,
                 "put_inner": p_inner, "put_short": Bp, "put_outer": p_outer,
@@ -127,6 +132,7 @@ def scan(spot: float, gex, ticker: str = "SPY", label_as: str = "XSP",
                 "credit": net, "cowl_usd": cowl,
                 "ear_left_usd": ear_l, "ear_right_usd": ear_r,
                 "max_loss_usd": round(max_loss),
+                "floating": floating,
                 "range_lo": min(prof), "range_hi": max(prof),
                 "range_pts": max(prof) - min(prof),
                 "be_lo": min(prof), "be_hi": max(prof),
@@ -139,9 +145,10 @@ def scan(spot: float, gex, ticker: str = "SPY", label_as: str = "XSP",
                     {"action": "BUY",  "strike": c_outer, "opt": "C", "qty": 1, "mid": cm[c_outer]},
                 ],
             }
-            # Prefer the widest profitable band that keeps a positive cowl and
-            # the smallest tail loss; tie-break on higher cowl.
-            key = (cand["range_pts"], cand["cowl_usd"], cand["max_loss_usd"])
+            # A floating structure (cannot lose anywhere) always outranks a
+            # non-floating one; otherwise prefer the widest profitable band,
+            # tie-broken by cowl then by smallest tail loss.
+            key = (floating, cand["range_pts"], cand["cowl_usd"], cand["max_loss_usd"])
             if best is None or key > best[0]:
                 best = (key, cand)
 
@@ -156,9 +163,13 @@ def fmt_slack(result: dict) -> str:
     c = result.get("candidate")
     if not c:
         return ""
+    floating   = c.get("floating", False)
+    header_tag = "  :balloon: *FLOATING — cannot lose at expiry*" if floating else ""
+    loss_line  = ("Max loss $0 — floats above zero at entry" if floating
+                  else f"Max loss -${abs(c['max_loss_usd'])}")
     return "\n".join([
         f":bat: *GEX-Anchored Batman* — {c['ticker']} ({c['expiry']}, {c['dte']}DTE)  "
-        f"_positive gamma · execute as XSP (European/cash-settled)_",
+        f"_positive gamma · execute as XSP (European/cash-settled)_{header_tag}",
         f"  PUT  BWB:  BUY ${c['put_inner']:.0f}P / SELL 2x ${c['put_short']:.0f}P / "
         f"BUY ${c['put_outer']:.0f}P",
         f"  CALL BWB:  BUY ${c['call_inner']:.0f}C / SELL 2x ${c['call_short']:.0f}C / "
@@ -167,6 +178,6 @@ def fmt_slack(result: dict) -> str:
         f"  Ears: ${c['put_short']:.0f} +${c['ear_left_usd']}  |  "
         f"${c['call_short']:.0f} +${c['ear_right_usd']}",
         f"  Profitable ${c['range_lo']:.0f}–${c['range_hi']:.0f} "
-        f"({c['range_pts']:.0f} pts)  |  Max loss -${abs(c['max_loss_usd'])}",
+        f"({c['range_pts']:.0f} pts)  |  {loss_line}",
         f"  _wings {c['inner_wing']}/{c['outer_wing']}pt · manage at 50%_",
     ])

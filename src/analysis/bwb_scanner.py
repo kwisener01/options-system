@@ -276,6 +276,7 @@ def _scan_one(ticker: str, spot: float, prev: float, tier: str,
                 "score":           bwb_result.setup_score,
                 "max_profit_usd":  round(bwb_result.max_profit_usd),
                 "max_loss_usd":    round(bwb_result.max_loss_usd),
+                "is_floating":     bwb_result.is_floating,
                 "lower_breakeven": round(bwb_result.lower_breakeven, 2),
                 "rr_ratio":        round(bwb_result.rr_ratio, 2),
                 "exit_plan":       bwb_result.exit_plan,
@@ -409,22 +410,30 @@ def fmt_slack(results: list[dict], tier: str, spy_regime: str,
             lines.append(f"_Scanned: {', '.join(r['ticker'] for r in results)} — no qualifying setups._")
         return "\n".join(lines)
 
+    # Floating structures (zero max loss — the Levitation condition, reached
+    # in one order) are rare and worth surfacing first.
+    candidates.sort(key=lambda r: not ((r["candidate"].get("analysis") or {}).get("is_floating")))
+
     for r in candidates:
         c   = r["candidate"]
         an  = c.get("analysis") or {}
         gc  = r.get("gex_context") or {}
 
+        floating = an.get("is_floating", False)
         rating = an.get("rating", "—")
-        rating_icon = ":white_check_mark:" if rating == "A+" else ":large_blue_circle:" if rating == "Acceptable" else ":warning:"
+        rating_icon = (":balloon:" if floating else
+                       ":white_check_mark:" if rating == "A+" else
+                       ":large_blue_circle:" if rating == "Acceptable" else ":warning:")
         chg_str = f"{r['change_pct']:+.1f}%"
         credit_str = f"+${c['credit']:.2f}" if c.get("credit") is not None and c["credit"] >= 0 else f"-${abs(c.get('credit',0)):.2f}"
         risk_str   = f"${int(an['max_loss_usd'])}" if an.get("max_loss_usd") else "?"
         rr_str     = f"{an['rr_ratio']:.1f}×" if an.get("rr_ratio") else "?"
         regime_str = gc.get("regime", "").replace("_", " ").title() if gc else "SPY proxy"
         ew_str     = f"  ⚠ Earnings {c.get('earnings_date')}" if c.get("earnings_warning") else ""
+        float_tag  = "  *FLOATING — cannot lose at expiry*" if floating else ""
 
         lines += [
-            f"{rating_icon} *{r['ticker']} ${r['spot']:.2f}* ({chg_str})  ·  {rating}",
+            f"{rating_icon} *{r['ticker']} ${r['spot']:.2f}* ({chg_str})  ·  {rating}{float_tag}",
             f"  `BUY ${c['long_upper']}P / SELL 2× ${c['short_strike']}P / BUY ${c['long_lower']}P`  ·  {c['dte']}DTE",
             f"  Credit {credit_str}  ·  Max risk {risk_str}  ·  R:R {rr_str}  ·  GEX: {regime_str}{ew_str}",
             "",

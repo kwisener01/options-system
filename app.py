@@ -437,6 +437,7 @@ def _live_trade_impl(spy: dict, vix_now: float, vix_prev: float) -> dict:
                 "call_upper_breakeven": d.call_upper_breakeven,
                 "put_flat_loss_usd":    d.put_flat_loss_usd,
                 "call_flat_loss_usd":   d.call_flat_loss_usd,
+                "fully_floating":       d.fully_floating,
                 "put_strikes":  [lp_s, mp_s, hp_s],
                 "call_strikes": [lc_s, mc_s, hc_s],
             })

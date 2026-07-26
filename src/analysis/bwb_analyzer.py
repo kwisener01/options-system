@@ -42,6 +42,7 @@ class BWBResult:
     max_loss_usd: float
     lower_breakeven: float
     rr_ratio: float
+    is_floating: bool    # credit >= extra_risk: zero max loss, floats above zero at entry
 
     # ── checklist ──────────────────────────────────────────────────────────────
     checks: dict         # label -> bool
@@ -75,6 +76,10 @@ def analyze(inp: BWBInputs) -> BWBResult:
     #   at or below L   → loss = extra_risk - credit  (capped by lower long)
     max_profit_usd = (upper_wing + inp.credit) * 100
     max_loss_usd   = max((extra_risk - inp.credit) * 100, 0.0)
+    # The Boomer Dan "Levitation" condition, reached in one order instead of
+    # a two-stage leg-in: if credit already covers the wing mismatch, there
+    # is no losing zone anywhere at expiry.
+    is_floating    = max_loss_usd <= 0.005
 
     # Lower breakeven (inside the tent, price falling toward M):
     #   solve (price - (2M - H)) * 100 + credit * 100 = 0
@@ -208,7 +213,8 @@ def analyze(inp: BWBInputs) -> BWBResult:
     cr_str = (f"${inp.credit:.2f} credit" if inp.credit >= 0
               else f"${abs(inp.credit):.2f} debit")
     summary = (
-        f"{inp.ticker} {inp.long_upper:.0f}/{inp.short_strike:.0f}/{inp.long_lower:.0f} "
+        (":balloon: FLOATING | " if is_floating else "")
+        + f"{inp.ticker} {inp.long_upper:.0f}/{inp.short_strike:.0f}/{inp.long_lower:.0f} "
         f"put BWB | {cr_str} | "
         f"Max profit ${max_profit_usd:.0f} | Max loss ${max_loss_usd:.0f} | "
         f"Lower BE ${lower_breakeven:.2f} | Score {setup_score}/10 | {rating}"
@@ -222,6 +228,7 @@ def analyze(inp: BWBInputs) -> BWBResult:
         max_loss_usd=max_loss_usd,
         lower_breakeven=lower_breakeven,
         rr_ratio=rr_ratio,
+        is_floating=is_floating,
         checks=checks,
         setup_score=setup_score,
         cs_max_risk_usd=cs_max_risk_usd,
@@ -285,6 +292,9 @@ class DoubleBWBResult:
     call_peak_profit_usd:  float    # combined P&L when SPY pins M_call
     put_flat_loss_usd:     float    # combined P&L below L_put (flat zone, 0 if total_credit ≥ extra_risk)
     call_flat_loss_usd:    float    # combined P&L above H_call
+    put_floating:          bool     # put-side tail has zero loss
+    call_floating:         bool     # call-side tail has zero loss
+    fully_floating:        bool     # BOTH tails zero loss — the whole risk graph is >= 0 at entry
     # Combined breakevens (use total_credit — each side benefits from the other's premium)
     put_lower_breakeven:   float    # descending put tent hits zero
     call_upper_breakeven:  float    # descending call tent hits zero
@@ -345,6 +355,13 @@ def analyze_double_bwb(inp: DoubleBWBInputs) -> DoubleBWBResult:
     # Above H_call (flat): total_credit − call_extra_risk
     call_flat_pnl    = total_credit - call_extra_risk
     call_flat_loss_usd = round(min(call_flat_pnl, 0) * 100, 2)
+
+    # The Boomer Dan "Levitation" condition on each tail, reached in one order:
+    # if the combined credit already covers that side's wing mismatch, that
+    # tail cannot lose. Both tails floating means the entire graph is >= 0.
+    put_floating    = put_flat_loss_usd  >= -0.005
+    call_floating   = call_flat_loss_usd >= -0.005
+    fully_floating  = put_floating and call_floating
 
     # ── Combined breakevens (on the slope of each tent) ───────────────────────
     # Descending put tent (L_put ≤ S ≤ M_put):
@@ -429,7 +446,8 @@ def analyze_double_bwb(inp: DoubleBWBInputs) -> DoubleBWBResult:
     )
 
     summary = (
-        f"Batman SPY  PUT {inp.put_upper:.0f}/{inp.put_short:.0f}/{inp.put_lower:.0f}  "
+        (":balloon: FULLY FLOATING | " if fully_floating else "")
+        + f"Batman SPY  PUT {inp.put_upper:.0f}/{inp.put_short:.0f}/{inp.put_lower:.0f}  "
         f"CALL {inp.call_lower:.0f}/{inp.call_short:.0f}/{inp.call_upper:.0f}  "
         f"Credit ${total_credit:.2f}  Middle ${middle_width:.0f}pt (${middle_profit_usd:.0f})  "
         f"Peaks PUT ${put_peak_profit_usd:.0f} / CALL ${call_peak_profit_usd:.0f}  "
@@ -448,6 +466,9 @@ def analyze_double_bwb(inp: DoubleBWBInputs) -> DoubleBWBResult:
         call_peak_profit_usd=call_peak_profit_usd,
         put_flat_loss_usd=put_flat_loss_usd,
         call_flat_loss_usd=call_flat_loss_usd,
+        put_floating=put_floating,
+        call_floating=call_floating,
+        fully_floating=fully_floating,
         put_lower_breakeven=round(put_lower_breakeven, 2),
         call_upper_breakeven=round(call_upper_breakeven, 2),
         checks=checks,
