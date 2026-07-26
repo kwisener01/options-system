@@ -15,8 +15,9 @@ import math
 import os
 import pickle
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 from scipy.stats import norm
@@ -84,6 +85,20 @@ def load_chain(as_of: date | None = None) -> list[dict] | None:
 
 _RF = 0.045    # risk-free rate
 _SHARES = 100  # shares per contract
+_ET = ZoneInfo("America/New_York")
+
+
+def time_to_expiry_years(dte: int) -> float:
+    """Calendar-year fraction until expiry.
+
+    For 0DTE use the hours remaining to the 4 PM ET close instead of 0 —
+    T=0 zeroes every greek, silently dropping the largest gamma expiry
+    on SPY (0DTE OI dominates intraday dealer gamma)."""
+    if dte > 0:
+        return dte / 365
+    now = datetime.now(_ET)
+    hours_left = max(16 - now.hour - now.minute / 60, 0.5)
+    return hours_left / (24 * 365)
 
 
 # ── BS greeks ─────────────────────────────────────────────────────────────────
@@ -107,16 +122,17 @@ def _vanna_bs(S: float, K: float, T: float, sig: float) -> float:
     return -norm.pdf(d1) * d2 / sig if T > 1e-6 and sig > 1e-6 else 0.0
 
 
-def _charm_bs(S: float, K: float, T: float, sig: float, is_call: bool) -> float:
-    """dDelta/dTime — delta bleed per day."""
+def _charm_bs(S: float, K: float, T: float, sig: float) -> float:
+    """∂Delta/∂T per day — identical for calls and puts under q=0
+    (Δ_put = Δ_call − 1). The dealer sign convention is applied at
+    aggregation time, same as GEX."""
     if T <= 1e-6 or sig <= 1e-6:
         return 0.0
-    d1, d2 = _d1d2(S, K, T, sig)
+    d1, _ = _d1d2(S, K, T, sig)
     sqrtT = math.sqrt(T)
-    # ∂d1/∂T = (r + σ²/2)/(σ√T) - d1/(2T) normalised to per-day
-    dd1_dT = (_RF / (sig * sqrtT)) - (d1 / (2 * T))
-    charm = norm.pdf(d1) * dd1_dT / 365  # scale to per-day
-    return charm if is_call else -charm
+    # ∂d1/∂T = (r + σ²/2)/(σ√T) − d1/(2T), verified vs finite differences
+    dd1_dT = ((_RF + 0.5 * sig**2) / (sig * sqrtT)) - (d1 / (2 * T))
+    return norm.pdf(d1) * dd1_dT / 365  # per calendar day
 
 
 # ── data fetch ────────────────────────────────────────────────────────────────
@@ -197,8 +213,11 @@ def _fetch_chain_from_api(spot: float, n_expiries: int = 3) -> list[dict]:
 
     for ts in all_exp_ts[:n_expiries]:
         try:
-            exp_date = date.fromtimestamp(ts)
-            T = max((exp_date - today).days, 0) / 365
+            # YF expiry timestamps are midnight UTC — converting through local
+            # (ET) time shifts them to the previous day, making every DTE off
+            # by one and turning today's expiry into "yesterday".
+            exp_date = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+            T = time_to_expiry_years((exp_date - today).days)
             resp = session.get(f"{base}&date={ts}", headers=_YF_HEADERS,
                                verify=False).json()
             chain_data = resp["optionChain"]["result"][0]["options"][0]
@@ -223,7 +242,7 @@ def _fetch_chain_from_api(spot: float, n_expiries: int = 3) -> list[dict]:
 
 
 def _fetch_chain(spot: float, n_expiries: int = 3,
-                 as_of: date | None = None) -> list[dict]:
+                 as_of: date | None = None) -> tuple[list[dict], str]:
     """
     Return SPY option chain contracts, using today's disk cache when available.
 
@@ -267,13 +286,13 @@ class GEXResult:
     spot:             float
     vix:              float
     vix_prev:         float
-    net_gex_bn:       float          # net GEX in $ billions (positive = long gamma)
+    net_gex_bn:       float          # net GEX, $bn per 1% move (positive = long gamma)
     gex_regime:       str            # POSITIVE_GAMMA | NEGATIVE_GAMMA | UNKNOWN
     gamma_wall:       float          # strike nearest spot with highest net GEX
     put_wall:         float          # highest put GEX below spot
     call_wall:        float          # highest call GEX above spot
     flip_level:       float          # where cumulative GEX crosses zero
-    net_vanna_bn:     float          # net Vanna in $ billions
+    net_vanna_bn:     float          # net Vanna, $bn per 1 vol-pt
     vanna_signal:     str            # BULLISH | BEARISH | NEUTRAL
     net_charm:        float          # net charm notional (+ = dealer buying, - = selling)
     charm_signal:     str            # BUYING_PRESSURE | SELLING_PRESSURE | NEUTRAL
@@ -304,10 +323,12 @@ def compute_exposures(spot: float, vix: float, vix_prev: float,
 
         # Use Alpaca's pre-computed gamma when available (more accurate than BS recalc)
         native_gamma = c.get("gamma")
+        # $bn of dealer delta-hedge flow per 1% spot move (standard GEX convention)
         gx = (native_gamma if native_gamma and native_gamma > 0
-              else _gamma_bs(spot, K, T, iv)) * oi * _SHARES * (spot ** 2) / 1e9
-        vn  = _vanna_bs(spot, K, T, iv) * oi * _SHARES * spot / 1e9
-        ch  = _charm_bs(spot, K, T, iv, is_call) * oi * _SHARES
+              else _gamma_bs(spot, K, T, iv)) * oi * _SHARES * (spot ** 2) * 0.01 / 1e9
+        # $bn of dealer delta-hedge flow per 1 vol-point move
+        vn  = _vanna_bs(spot, K, T, iv) * oi * _SHARES * spot * 0.01 / 1e9
+        ch  = _charm_bs(spot, K, T, iv) * oi * _SHARES
 
         # Dealer convention: dealers typically short calls to retail (positive call OI = dealer short)
         # Standard GEX: calls contribute positive, puts negative
@@ -368,9 +389,9 @@ def compute_exposures(spot: float, vix: float, vix_prev: float,
             break
         prev_k = k
 
-    # Vanna signal
+    # Vanna signal (threshold in $bn per vol-pt — 0.5 in the old per-100-pt units)
     vix_chg_pct = (vix - vix_prev) / vix_prev if vix_prev else 0
-    if abs(vix_chg_pct) < 0.02 or abs(net_vanna) < 0.5:
+    if abs(vix_chg_pct) < 0.02 or abs(net_vanna) < 0.005:
         vanna_signal = "NEUTRAL"
     elif vix_chg_pct < 0 and net_vanna > 0:
         vanna_signal = "BULLISH"   # VIX falling + positive vanna → dealer buying
@@ -491,9 +512,10 @@ def format_gex_message(result: GEXResult, session: str = "morning",
         f":pushpin: *Top Gamma Levels*",
     ]
 
+    max_lvl = max((abs(g) for _, g in result.top_levels[:5]), default=0) or 1
     for strike, gex in result.top_levels[:5]:
         marker = f" <- {ticker}" if abs(strike - result.spot) / result.spot < 0.005 else ""
-        bar = (":green_square:" if gex > 0 else ":red_square:") * min(int(abs(gex) * 3), 5)
+        bar = (":green_square:" if gex > 0 else ":red_square:") * max(int(abs(gex) / max_lvl * 5), 1)
         lines.append(f">  `${strike:.1f}` : `{gex:+.3f}B` {bar}{marker}")
 
     # Session-specific advisory
