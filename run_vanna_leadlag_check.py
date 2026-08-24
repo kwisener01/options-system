@@ -37,6 +37,8 @@ GREEKS = {
     "charm": ("net_charm",    "TIME-driven, not spot-driven -- the one actually worth watching for leading"),
     "vega":  ("net_vega_bn",  "IV-driven, call-vs-put imbalance -- no forced hedging flow like the "
                               "others, so a real lead here would be a genuine surprise, not expected"),
+    "theta": ("net_theta_bn", "TIME-driven like charm, but decay is P&L, not a delta/hedge-ratio "
+                              "change -- no direct forced-flow mechanism, so also not expected to lead"),
 }
 
 

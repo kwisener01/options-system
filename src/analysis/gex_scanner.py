@@ -133,6 +133,22 @@ def _vega_bs(S: float, K: float, T: float, sig: float) -> float:
     return S * norm.pdf(d1) * math.sqrt(T) if T > 1e-6 and sig > 1e-6 else 0.0
 
 
+def _theta_bs(S: float, K: float, T: float, sig: float, is_call: bool) -> float:
+    """Option value change per CALENDAR DAY passing (negative = decay, the
+    usual convention). Unlike gamma/vanna/charm, calls and puts are NOT
+    symmetric here (the r*K*e^-rT*N(d2) term flips sign, not just the whole
+    expression), so is_call must be passed in rather than signed at
+    aggregation time. Verified against a direct one-day price difference
+    (not just an epsilon derivative) across several strikes/DTEs."""
+    if T <= 1e-6 or sig <= 1e-6:
+        return 0.0
+    d1, d2 = _d1d2(S, K, T, sig)
+    term1 = -S * norm.pdf(d1) * sig / (2 * math.sqrt(T))
+    term2 = (-_RF * K * math.exp(-_RF * T) * norm.cdf(d2) if is_call
+             else _RF * K * math.exp(-_RF * T) * norm.cdf(-d2))
+    return (term1 + term2) / 365
+
+
 def _charm_bs(S: float, K: float, T: float, sig: float) -> float:
     """∂Delta/∂T per day — identical for calls and puts under q=0
     (Δ_put = Δ_call − 1). The dealer sign convention is applied at
@@ -308,6 +324,7 @@ class GEXResult:
     net_charm:        float          # net charm notional (+ = dealer buying, - = selling)
     charm_signal:     str            # BUYING_PRESSURE | SELLING_PRESSURE | NEUTRAL
     net_vega_bn:      float = 0.0    # call-vs-put vega imbalance, $bn per 1 vol-pt (see _vega_bs)
+    net_theta_bn:     float = 0.0    # call-vs-put theta imbalance, $bn decay per calendar day (see _theta_bs)
     top_levels:       list = field(default_factory=list)  # [(strike, gex_bn), ...]
     top_vanna_levels: list = field(default_factory=list)  # [(strike, vanna_bn), ...]
     dte_nearest:      int  = 0
@@ -324,6 +341,7 @@ def compute_exposures(spot: float, vix: float, vix_prev: float,
     vanna_by_strike: dict[float, float] = {}
     charm_total = 0.0
     vega_total  = 0.0
+    theta_total = 0.0
 
     call_gex_by_strike: dict[float, float] = {}
     put_gex_by_strike:  dict[float, float] = {}
@@ -344,6 +362,9 @@ def compute_exposures(spot: float, vix: float, vix_prev: float,
         vn  = _vanna_bs(spot, K, T, iv) * oi * _SHARES * spot * 0.01 / 1e9
         ch  = _charm_bs(spot, K, T, iv) * oi * _SHARES
         vg  = _vega_bs(spot, K, T, iv)  * oi * _SHARES * 0.01 / 1e9
+        # theta is NOT call/put symmetric (unlike gamma/vanna/charm), so is_call
+        # goes into the formula itself rather than being applied as a sign flip
+        th  = _theta_bs(spot, K, T, iv, is_call) * oi * _SHARES / 1e9
 
         # Dealer convention: dealers typically short calls to retail (positive call OI = dealer short)
         # Standard GEX: calls contribute positive, puts negative
@@ -352,6 +373,7 @@ def compute_exposures(spot: float, vix: float, vix_prev: float,
         vanna_by_strike[K] = vanna_by_strike.get(K, 0.0) + (vn if is_call else -vn)
         charm_total        += ch if is_call else -ch
         vega_total          += vg if is_call else -vg
+        theta_total         += th if is_call else -th
 
         if is_call:
             call_gex_by_strike[K] = call_gex_by_strike.get(K, 0.0) + gx
@@ -437,7 +459,7 @@ def compute_exposures(spot: float, vix: float, vix_prev: float,
         flip_level=flip_level,
         net_vanna_bn=round(net_vanna, 3), vanna_signal=vanna_signal,
         net_charm=round(charm_total, 0), charm_signal=charm_signal,
-        net_vega_bn=round(vega_total, 3),
+        net_vega_bn=round(vega_total, 3), net_theta_bn=round(theta_total, 4),
         top_levels=top_levels, top_vanna_levels=top_vanna_levels,
         dte_nearest=dte_nearest if dte_nearest < 999 else 0,
     )

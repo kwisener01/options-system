@@ -5569,7 +5569,8 @@ def _level_snapshot_job():
             f"Flip ${gx.flip_level:.0f} ({pct(gx.flip_level):+.1f}%)\n"
             f"  Vanna: {gx.vanna_signal} (net {gx.net_vanna_bn:+.2f}bn/vol-pt)  top strikes: {vanna_str}\n"
             f"  Charm: {gx.charm_signal} (net {gx.net_charm:+.0f})  |  "
-            f"Vega imbalance: {gx.net_vega_bn:+.2f}bn/vol-pt (call-vs-put, not total vol risk)"
+            f"Vega imbalance: {gx.net_vega_bn:+.2f}bn/vol-pt (call-vs-put, not total vol risk)\n"
+            f"  Theta imbalance: {gx.net_theta_bn:+.3f}bn/day (call-vs-put, not total decay)"
         )
 
         # Log every tick to CSV so price-vs-level movement can be charted (see /levels)
@@ -5582,7 +5583,7 @@ _LEVEL_SNAPSHOT_CSV = os.path.join(os.path.dirname(__file__), "data", "level_sna
 _LEVEL_SNAPSHOT_COLS = ["ts", "hhmm", "spot", "gamma_wall", "call_wall", "put_wall",
                         "flip_level", "gex_regime", "net_gex_bn",
                         "vanna_signal", "net_vanna_bn", "charm_signal", "net_charm",
-                        "net_vega_bn"]
+                        "net_vega_bn", "net_theta_bn"]
 
 
 def _log_level_snapshot(now_dt, gx):
@@ -5608,7 +5609,7 @@ def _log_level_snapshot(now_dt, gx):
         w.writerow([now_dt.isoformat(), now_dt.strftime("%H:%M"), gx.spot, gx.gamma_wall,
                     gx.call_wall, gx.put_wall, gx.flip_level, gx.gex_regime, gx.net_gex_bn,
                     gx.vanna_signal, gx.net_vanna_bn, gx.charm_signal, gx.net_charm,
-                    gx.net_vega_bn])
+                    gx.net_vega_bn, gx.net_theta_bn])
 
 
 def _start_scheduler():
