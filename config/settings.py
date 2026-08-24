@@ -68,4 +68,8 @@ REPORTS_DIR      = str(_ROOT / "reports")
 SP500_CACHE_PATH = str(_ROOT / "data" / "sp500_tickers.csv")
 PRICE_CACHE_PATH = str(_ROOT / "data" / "prices_cache.pkl")
 MODEL_PATH       = str(_ROOT / "data" / "ml_model.joblib")
-GEX_CHAIN_DIR    = str(_ROOT / "data" / "gex_chain")
+# Overridable so a Render persistent disk can be pointed at without another code
+# change -- e.g. set GEX_CHAIN_DIR=/var/data/gex_chain once a disk is mounted at
+# /var/data, so the daily archive survives redeploys (Render's local disk is
+# otherwise ephemeral -- see the comments in app.py / shadow_bullput.py).
+GEX_CHAIN_DIR    = os.getenv("GEX_CHAIN_DIR", str(_ROOT / "data" / "gex_chain"))
