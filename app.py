@@ -5561,12 +5561,15 @@ def _level_snapshot_job():
             return (k - gx.spot) / gx.spot * 100
         vanna_str = ", ".join(f"${k:.0f} ({pct(k):+.1f}%)" for k, _ in gx.top_vanna_levels[:3]) or "n/a"
         send_message(
-            f":chart_with_upwards_trend: *SPY {gx.spot:.2f}*  _{now}_  [{gx.gex_regime}]\n"
+            f":chart_with_upwards_trend: *SPY {gx.spot:.2f}*  _{now}_  "
+            f"[{gx.gex_regime}, net {gx.net_gex_bn:+.1f}bn]\n"
             f"  Gamma wall ${gx.gamma_wall:.0f} ({pct(gx.gamma_wall):+.1f}%)  |  "
             f"Call wall ${gx.call_wall:.0f} ({pct(gx.call_wall):+.1f}%)  |  "
             f"Put wall ${gx.put_wall:.0f} ({pct(gx.put_wall):+.1f}%)  |  "
             f"Flip ${gx.flip_level:.0f} ({pct(gx.flip_level):+.1f}%)\n"
-            f"  Vanna: {gx.vanna_signal} (net {gx.net_vanna_bn:+.2f}bn/vol-pt)  top strikes: {vanna_str}"
+            f"  Vanna: {gx.vanna_signal} (net {gx.net_vanna_bn:+.2f}bn/vol-pt)  top strikes: {vanna_str}\n"
+            f"  Charm: {gx.charm_signal} (net {gx.net_charm:+.0f})  |  "
+            f"Vega imbalance: {gx.net_vega_bn:+.2f}bn/vol-pt (call-vs-put, not total vol risk)"
         )
 
         # Log every tick to CSV so price-vs-level movement can be charted (see /levels)
@@ -5577,20 +5580,35 @@ def _level_snapshot_job():
 
 _LEVEL_SNAPSHOT_CSV = os.path.join(os.path.dirname(__file__), "data", "level_snapshots.csv")
 _LEVEL_SNAPSHOT_COLS = ["ts", "hhmm", "spot", "gamma_wall", "call_wall", "put_wall",
-                        "flip_level", "gex_regime", "vanna_signal", "net_vanna_bn"]
+                        "flip_level", "gex_regime", "net_gex_bn",
+                        "vanna_signal", "net_vanna_bn", "charm_signal", "net_charm",
+                        "net_vega_bn"]
 
 
 def _log_level_snapshot(now_dt, gx):
+    """Appends one row. If the file already exists with an older column set
+    (schema change — e.g. 2026-08-25 added net_gex_bn/net_charm), the old file
+    is rotated aside (.bak-<ts> suffix) rather than corrupting it with
+    mismatched columns partway through, and a fresh file starts with the
+    current header."""
     import csv
     os.makedirs(os.path.dirname(_LEVEL_SNAPSHOT_CSV), exist_ok=True)
+    if os.path.exists(_LEVEL_SNAPSHOT_CSV):
+        with open(_LEVEL_SNAPSHOT_CSV, newline="") as f:
+            existing_header = next(csv.reader(f), [])
+        if existing_header and existing_header != _LEVEL_SNAPSHOT_COLS:
+            bak = _LEVEL_SNAPSHOT_CSV + f".bak-{now_dt:%Y%m%d%H%M%S}"
+            os.replace(_LEVEL_SNAPSHOT_CSV, bak)
+            logger.warning("level_snapshots.csv schema changed — old file rotated to %s", bak)
     is_new = not os.path.exists(_LEVEL_SNAPSHOT_CSV)
     with open(_LEVEL_SNAPSHOT_CSV, "a", newline="") as f:
         w = csv.writer(f)
         if is_new:
             w.writerow(_LEVEL_SNAPSHOT_COLS)
         w.writerow([now_dt.isoformat(), now_dt.strftime("%H:%M"), gx.spot, gx.gamma_wall,
-                    gx.call_wall, gx.put_wall, gx.flip_level, gx.gex_regime,
-                    gx.vanna_signal, gx.net_vanna_bn])
+                    gx.call_wall, gx.put_wall, gx.flip_level, gx.gex_regime, gx.net_gex_bn,
+                    gx.vanna_signal, gx.net_vanna_bn, gx.charm_signal, gx.net_charm,
+                    gx.net_vega_bn])
 
 
 def _start_scheduler():

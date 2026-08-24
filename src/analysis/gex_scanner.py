@@ -122,6 +122,17 @@ def _vanna_bs(S: float, K: float, T: float, sig: float) -> float:
     return -norm.pdf(d1) * d2 / sig if T > 1e-6 and sig > 1e-6 else 0.0
 
 
+def _vega_bs(S: float, K: float, T: float, sig: float) -> float:
+    """dValue/dVol per 1.00 (100%) vol -- identical formula/sign for calls and
+    puts (an option's value always rises with IV, unlike delta/gamma). Signed
+    +call/-put at aggregation time below purely for consistency with how this
+    module signs every other Greek (GEX, vanna, charm) -- net_vega_bn is a
+    call-vs-put vega IMBALANCE, not total dealer vol-risk magnitude (that
+    would be the unsigned sum, which this does not compute)."""
+    d1, _ = _d1d2(S, K, T, sig)
+    return S * norm.pdf(d1) * math.sqrt(T) if T > 1e-6 and sig > 1e-6 else 0.0
+
+
 def _charm_bs(S: float, K: float, T: float, sig: float) -> float:
     """∂Delta/∂T per day — identical for calls and puts under q=0
     (Δ_put = Δ_call − 1). The dealer sign convention is applied at
@@ -296,6 +307,7 @@ class GEXResult:
     vanna_signal:     str            # BULLISH | BEARISH | NEUTRAL
     net_charm:        float          # net charm notional (+ = dealer buying, - = selling)
     charm_signal:     str            # BUYING_PRESSURE | SELLING_PRESSURE | NEUTRAL
+    net_vega_bn:      float = 0.0    # call-vs-put vega imbalance, $bn per 1 vol-pt (see _vega_bs)
     top_levels:       list = field(default_factory=list)  # [(strike, gex_bn), ...]
     top_vanna_levels: list = field(default_factory=list)  # [(strike, vanna_bn), ...]
     dte_nearest:      int  = 0
@@ -311,6 +323,7 @@ def compute_exposures(spot: float, vix: float, vix_prev: float,
     gex_by_strike:   dict[float, float] = {}
     vanna_by_strike: dict[float, float] = {}
     charm_total = 0.0
+    vega_total  = 0.0
 
     call_gex_by_strike: dict[float, float] = {}
     put_gex_by_strike:  dict[float, float] = {}
@@ -330,6 +343,7 @@ def compute_exposures(spot: float, vix: float, vix_prev: float,
         # $bn of dealer delta-hedge flow per 1 vol-point move
         vn  = _vanna_bs(spot, K, T, iv) * oi * _SHARES * spot * 0.01 / 1e9
         ch  = _charm_bs(spot, K, T, iv) * oi * _SHARES
+        vg  = _vega_bs(spot, K, T, iv)  * oi * _SHARES * 0.01 / 1e9
 
         # Dealer convention: dealers typically short calls to retail (positive call OI = dealer short)
         # Standard GEX: calls contribute positive, puts negative
@@ -337,6 +351,7 @@ def compute_exposures(spot: float, vix: float, vix_prev: float,
         gex_by_strike[K]   = gex_by_strike.get(K, 0.0)   + signed_gex
         vanna_by_strike[K] = vanna_by_strike.get(K, 0.0) + (vn if is_call else -vn)
         charm_total        += ch if is_call else -ch
+        vega_total          += vg if is_call else -vg
 
         if is_call:
             call_gex_by_strike[K] = call_gex_by_strike.get(K, 0.0) + gx
@@ -422,6 +437,7 @@ def compute_exposures(spot: float, vix: float, vix_prev: float,
         flip_level=flip_level,
         net_vanna_bn=round(net_vanna, 3), vanna_signal=vanna_signal,
         net_charm=round(charm_total, 0), charm_signal=charm_signal,
+        net_vega_bn=round(vega_total, 3),
         top_levels=top_levels, top_vanna_levels=top_vanna_levels,
         dte_nearest=dte_nearest if dte_nearest < 999 else 0,
     )
