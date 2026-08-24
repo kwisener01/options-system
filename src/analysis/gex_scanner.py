@@ -297,6 +297,7 @@ class GEXResult:
     net_charm:        float          # net charm notional (+ = dealer buying, - = selling)
     charm_signal:     str            # BUYING_PRESSURE | SELLING_PRESSURE | NEUTRAL
     top_levels:       list = field(default_factory=list)  # [(strike, gex_bn), ...]
+    top_vanna_levels: list = field(default_factory=list)  # [(strike, vanna_bn), ...]
     dte_nearest:      int  = 0
     # HIGH = Yahoo Finance real OI; LOW = Alpaca indicative (bid/ask size proxy, not real OI)
     regime_confidence: str = "HIGH"
@@ -410,8 +411,9 @@ def compute_exposures(spot: float, vix: float, vix_prev: float,
     else:
         charm_signal = "SELLING_PRESSURE"
 
-    # Top 6 levels by absolute GEX
-    top_levels = sorted(gex_by_strike.items(), key=lambda x: abs(x[1]), reverse=True)[:6]
+    # Top 6 levels by absolute GEX / absolute Vanna
+    top_levels       = sorted(gex_by_strike.items(),   key=lambda x: abs(x[1]), reverse=True)[:6]
+    top_vanna_levels = sorted(vanna_by_strike.items(), key=lambda x: abs(x[1]), reverse=True)[:6]
 
     return GEXResult(
         spot=spot, vix=vix, vix_prev=vix_prev,
@@ -420,7 +422,8 @@ def compute_exposures(spot: float, vix: float, vix_prev: float,
         flip_level=flip_level,
         net_vanna_bn=round(net_vanna, 3), vanna_signal=vanna_signal,
         net_charm=round(charm_total, 0), charm_signal=charm_signal,
-        top_levels=top_levels, dte_nearest=dte_nearest if dte_nearest < 999 else 0,
+        top_levels=top_levels, top_vanna_levels=top_vanna_levels,
+        dte_nearest=dte_nearest if dte_nearest < 999 else 0,
     )
 
 

@@ -299,8 +299,10 @@ def test_condor_edge_gate():
 
 def test_fa_verticals():
     import app
+    # max_loss set high here on purpose -- this test covers strike selection /
+    # leg construction, not the $ cap (see test_fa_verticals_max_loss_cap below).
     cfg = {"call_min_score": 6, "put_short_otm": 0.05, "put_width_otm": 0.07,
-           "call_long_otm": 0.0, "call_short_otm": 0.08}
+           "call_long_otm": 0.0, "call_short_otm": 0.08, "max_loss": 1000}
     spot = 100.0
     put_mids  = {88: 0.9, 90: 1.1, 93: 1.6, 95: 2.2, 98: 3.5}
     call_mids = {100: 3.0, 105: 1.4, 108: 0.8}
@@ -326,6 +328,31 @@ def test_fa_verticals():
     assert app._build_fa_verticals(spot, {95: 1.0, 90: 1.0}, {}, 5, cfg) == [] or \
         all(x["ref_net"] != 0 for x in app._build_fa_verticals(spot, {95: 1.0, 90: 1.0}, {}, 5, cfg))
     print("ok  FA verticals (bull-put always, bull-call gated at score>=6)")
+
+
+def test_fa_verticals_max_loss_cap():
+    import app
+    # Same shape as test_fa_verticals but max_loss=100 (the live default): both
+    # this put spread (max loss ~$570) and call spread (max loss ~$220) are over
+    # budget at these strikes/widths and must be skipped, not proposed.
+    cfg = {"call_min_score": 6, "put_short_otm": 0.05, "put_width_otm": 0.07,
+           "call_long_otm": 0.0, "call_short_otm": 0.08, "max_loss": 100}
+    spot = 100.0
+    put_mids  = {88: 0.9, 90: 1.1, 93: 1.6, 95: 2.2, 98: 3.5}
+    call_mids = {100: 3.0, 105: 1.4, 108: 0.8}
+    v = app._build_fa_verticals(spot, put_mids, call_mids, 7, cfg)
+    assert v == []
+
+    # Narrower strikes/widths (closer to the live defaults) fit under the cap.
+    cfg_narrow = dict(cfg, put_width_otm=0.01, call_short_otm=0.01)
+    put_mids_narrow  = {94: 1.5, 95: 2.2, 96: 3.0}
+    call_mids_narrow = {100: 3.0, 101: 2.5}
+    v2 = app._build_fa_verticals(spot, put_mids_narrow, call_mids_narrow, 7, cfg_narrow)
+    by = {x["kind"]: x for x in v2}
+    assert set(by) == {"bull_put", "bull_call"}
+    assert by["bull_put"]["max_loss"] <= 100
+    assert by["bull_call"]["max_loss"] <= 100
+    print("ok  FA verticals max_loss cap skips over-budget candidates")
 
 
 def test_strategy_registry():

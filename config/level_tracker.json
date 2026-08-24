@@ -1,0 +1,4 @@
+{
+  "enabled": true,
+  "note": "Every-5-min SPY price + gamma/call/put wall + flip level + top vanna strikes, posted to Slack. Added 2026-08-23 for a one-day observational watch (_level_snapshot_job in app.py). Flip to enabled:false and redeploy to turn it off once you're done watching -- it posts ~78 messages/day during RTH, which is chatty by design (unlike the other change-gated monitor jobs)."
+}

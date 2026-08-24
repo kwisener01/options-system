@@ -817,6 +817,29 @@ def dashboard():
     return render_template("dashboard.html")
 
 
+@app.route("/levels")
+def levels_page():
+    """Live price-vs-level chart for the every-5-min snapshot job. Plain canvas,
+    no external chart lib — polls /api/level_snapshots and redraws."""
+    return render_template("levels.html")
+
+
+@app.route("/api/level_snapshots")
+def api_level_snapshots():
+    """Today's rows from data/level_snapshots.csv, as JSON, for the /levels chart."""
+    import csv
+    today = date.today().isoformat()
+    rows = []
+    try:
+        with open(_LEVEL_SNAPSHOT_CSV, newline="") as f:
+            for r in csv.DictReader(f):
+                if r["ts"].startswith(today):
+                    rows.append(r)
+    except FileNotFoundError:
+        pass
+    return jsonify({"rows": rows})
+
+
 @app.route("/api/gex")
 def api_gex():
     force = request.args.get("force", "false").lower() == "true"
@@ -2661,16 +2684,24 @@ def _unified_scan_job():
                         logger.warning("FA spread build failed for %s: %s", a.get("ticker"), e)
                         continue
                     for v in verts:
+                        # strike1/strike2 order matches _build_fa_verticals' leg order for
+                        # each kind, so the restart-proof handler in slack_interactive can
+                        # rebuild the exact same legs from these two numbers alone.
                         if v["kind"] == "bull_put":
+                            strike1, strike2 = v["short"], v["long"]
                             label = f"FA bull-put {a['ticker']} {v['short']:g}/{v['long']:g}P {v['expiry']}"
                             text  = (f"*{label}*  {v['dte']}DTE  credit +${v['ref_net']:.2f}  "
                                      f"max loss -${v['max_loss']}  _(FA score {a['score']}/13)_")
                         else:
+                            strike1, strike2 = v["long"], v["short"]
                             label = f"FA bull-call {a['ticker']} {v['long']:g}/{v['short']:g}C {v['expiry']}"
                             text  = (f"*{label}*  {v['dte']}DTE  debit -${abs(v['ref_net']):.2f}  "
-                                     f"max profit +${v['max_profit']}  _(FA score {a['score']}/13)_")
-                        tid = register_entry(v["kind"], a["ticker"], v["expiry"], v["legs"],
-                                             qty=1, ref_net=v["ref_net"], label=label, text=text)
+                                     f"max loss -${v['max_loss']}  _(FA score {a['score']}/13)_")
+                        # Restart-proof: encode the whole order in the button value instead of
+                        # a pending_store id (that store is wiped on a Render redeploy — see
+                        # the fa_vert handler in slack_interactive for why this matters).
+                        tid = (f"fa_vert:{v['kind']}:{a['ticker']}:{v['expiry']}:"
+                               f"{strike1:g}:{strike2:g}:{v['ref_net']:.2f}")
                         fa_spread_cands.append({"tid": tid, "text": text, "label": label})
                 _post_entry_approvals(fa_spread_cands)
         except Exception as e:
@@ -3313,6 +3344,37 @@ def slack_interactive():
     if aid == ACTION_CLOSE and isinstance(tid, str) and tid.startswith("close_ticker:"):
         sym = tid.split(":", 1)[1].upper()
         threading.Thread(target=lambda: _close_option_structure(sym, resp_url), daemon=True).start()
+        return "", 200
+
+    # Restart-proof fallen-angel VERTICAL SPREAD Take/Skip: value
+    # "fa_vert:{kind}:{ticker}:{expiry}:{strike1}:{strike2}:{ref_net}" carries the
+    # whole order directly, so it survives the pending-store being wiped on a
+    # redeploy — this was missing (unlike fa_buy/close_ticker below) and is almost
+    # certainly why these Take buttons weren't taking trades. _execute_entry
+    # re-prices live and is idempotent (client_order_id includes the date + a tid
+    # slice), so a reconstructed rec is safe.
+    if isinstance(tid, str) and tid.startswith("fa_vert:") and aid in (ACTION_TAKE, ACTION_SKIP):
+        try:
+            _, kind, sym, exp_s, s1, s2, ref_s = tid.split(":")
+            label = f"FA {kind.replace('_', '-')} {sym} {s1}/{s2} {exp_s}"
+            if aid == ACTION_SKIP:
+                threading.Thread(target=lambda: _slack_replace(resp_url, f":x: *Skipped — {label}*"),
+                                 daemon=True).start()
+                return "", 200
+            if kind == "bull_put":
+                legs = [{"action": "SELL", "strike": float(s1), "opt": "P", "qty": 1},
+                        {"action": "BUY",  "strike": float(s2), "opt": "P", "qty": 1}]
+            else:
+                legs = [{"action": "BUY",  "strike": float(s1), "opt": "C", "qty": 1},
+                        {"action": "SELL", "strike": float(s2), "opt": "C", "qty": 1}]
+            rec = {"id": tid, "kind": "entry", "strategy": kind, "underlying": sym.upper(),
+                   "label": label, "order": {"legs": _legs_to_occ(sym, exp_s, legs), "qty": 1,
+                                              "ref_net": float(ref_s), "tolerance": REPRICE_TOLERANCE}}
+            threading.Thread(target=lambda: _execute_entry(rec, resp_url), daemon=True).start()
+        except Exception as e:
+            logger.error("fa_vert restart-proof handler failed for %s: %s", tid, e)
+            threading.Thread(target=lambda: _slack_replace(resp_url, f":rotating_light: *Take failed*: {e}"),
+                             daemon=True).start()
         return "", 200
 
     # Restart-proof fallen-angel BUY: value "fa_buy:SYM:LOW52W" carries everything
@@ -4364,8 +4426,9 @@ def _fa_config() -> dict:
            # a bull-put credit spread on every triggered name, plus a bull-call
            # debit spread when score >= call_min_score (the backtested differentiator).
            "fa_spreads_enabled": True, "spread_min_score": 6, "call_min_score": 6,
-           "put_short_otm": 0.05, "put_width_otm": 0.07,
-           "call_long_otm": 0.0, "call_short_otm": 0.08,
+           "max_loss": 100,
+           "put_short_otm": 0.05, "put_width_otm": 0.04,
+           "call_long_otm": 0.0, "call_short_otm": 0.05,
            "spread_dte_min": 20, "spread_dte_max": 45, "spread_target_dte": 30}
     try:
         with open(path) as f:
@@ -4394,9 +4457,10 @@ def _build_fa_verticals(spot: float, put_mids: dict, call_mids: dict,
         if Kl is not None:
             credit = round(put_mids[Ks] - put_mids[Kl], 2)
             width  = round(Ks - Kl, 2)
-            if credit > 0 and width > 0:
+            max_loss = round(width * 100 - credit * 100)
+            if credit > 0 and width > 0 and max_loss <= cfg.get("max_loss", 100):
                 out.append({"kind": "bull_put", "short": Ks, "long": Kl, "width": width,
-                            "ref_net": credit, "max_loss": round(width * 100 - credit * 100),
+                            "ref_net": credit, "max_loss": max_loss,
                             "legs": [{"action": "SELL", "strike": Ks, "opt": "P", "qty": 1},
                                      {"action": "BUY",  "strike": Kl, "opt": "P", "qty": 1}]})
 
@@ -4409,9 +4473,11 @@ def _build_fa_verticals(spot: float, put_mids: dict, call_mids: dict,
             if Ku is not None:
                 debit = round(call_mids[Kl] - call_mids[Ku], 2)
                 width = round(Ku - Kl, 2)
-                if debit > 0 and width > 0:
+                max_loss = round(debit * 100)   # a debit spread's max loss is the debit paid
+                if debit > 0 and width > 0 and max_loss <= cfg.get("max_loss", 100):
                     out.append({"kind": "bull_call", "long": Kl, "short": Ku, "width": width,
-                                "ref_net": -debit, "max_profit": round(width * 100 - debit * 100),
+                                "ref_net": -debit, "max_loss": max_loss,
+                                "max_profit": round(width * 100 - debit * 100),
                                 "legs": [{"action": "BUY",  "strike": Kl, "opt": "C", "qty": 1},
                                          {"action": "SELL", "strike": Ku, "opt": "C", "qty": 1}]})
     return out
@@ -5416,6 +5482,117 @@ def _auto_manage_job():
         logger.error("_auto_manage_job error: %s", e)
 
 
+def _archive_gex_chain_job():
+    """Once per market day (~10:15 ET, after opening OI has settled): save today's
+    SPY options chain to data/gex_chain/. Nothing else in this app writes to that
+    cache automatically — without this job it only has the handful of snapshots
+    someone happened to trigger manually via download_gex_chain.py, which isn't
+    enough history to backtest GEX-regime/vanna signals. Archive-only: no orders,
+    no risk exposure."""
+    try:
+        if not _market_is_open():
+            return
+        from src.analysis.gex_scanner import _fetch_chain_from_api, save_chain, load_chain, _spot_and_vix
+        today = date.today()
+        if load_chain(today):
+            return   # already archived today
+        spot, vix, _ = _spot_and_vix()
+        contracts = _fetch_chain_from_api(spot, n_expiries=4)
+        if not contracts:
+            logger.warning("_archive_gex_chain_job: no contracts returned")
+            return
+        save_chain(contracts, today)
+        logger.info("_archive_gex_chain_job: archived %d contracts for %s", len(contracts), today)
+    except Exception as e:
+        logger.error("_archive_gex_chain_job error: %s", e)
+
+
+_level_snapshot_chain_cache = {"date": None, "contracts": None}
+
+
+def _level_snapshot_job():
+    """Every 5 min during RTH: post SPY spot + gamma/call/put wall + flip level +
+    top vanna strikes to Slack. Unconditional (not change-gated like
+    _spy_trade_monitor_job) — built 2026-08-24 for a one-day observational watch.
+    config/level_tracker.json enabled:false turns it off (needs a redeploy either
+    way since this runs on Render, same as any other config change).
+
+    Only fetches the full options chain ONCE per day (cached in-process, or reused
+    from the archiver's snapshot if it already ran) — walls/vanna are dealer OI
+    positioning, which barely moves intraday, so recomputing from a fresh chain
+    every 5 min would just be 78 wasted API calls/day for the same numbers. Only
+    spot + VIX (cheap) are re-fetched live each tick; % distance to each level
+    moves with them."""
+    try:
+        if not _market_is_open():
+            return
+        cfg_path = os.path.join(os.path.dirname(__file__), "config", "level_tracker.json")
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except Exception:
+            cfg = {"enabled": True}
+        if not cfg.get("enabled", True):
+            return
+
+        from src.analysis.gex_scanner import (_fetch_chain_from_api, compute_exposures,
+                                               _spot_and_vix, load_chain)
+        from src.notifications.slack_notifier import send_message
+
+        today = date.today()
+        contracts = _level_snapshot_chain_cache["contracts"]
+        if _level_snapshot_chain_cache["date"] != today or not contracts:
+            contracts = load_chain(today)              # today's archived snapshot, if it exists yet
+            if not contracts:
+                spot0, _, _ = _spot_and_vix()
+                contracts = _fetch_chain_from_api(spot0, n_expiries=4)   # one live fetch/day, fallback
+            _level_snapshot_chain_cache.update(date=today, contracts=contracts)
+        if not contracts:
+            return
+
+        spot, vix, vix_prev = _spot_and_vix()
+        if not spot or not vix:
+            return
+        gx = compute_exposures(spot, vix, vix_prev, contracts)
+
+        now_dt = datetime.now(ET)
+        now = now_dt.strftime("%H:%M ET")
+        def pct(k):
+            return (k - gx.spot) / gx.spot * 100
+        vanna_str = ", ".join(f"${k:.0f} ({pct(k):+.1f}%)" for k, _ in gx.top_vanna_levels[:3]) or "n/a"
+        send_message(
+            f":chart_with_upwards_trend: *SPY {gx.spot:.2f}*  _{now}_  [{gx.gex_regime}]\n"
+            f"  Gamma wall ${gx.gamma_wall:.0f} ({pct(gx.gamma_wall):+.1f}%)  |  "
+            f"Call wall ${gx.call_wall:.0f} ({pct(gx.call_wall):+.1f}%)  |  "
+            f"Put wall ${gx.put_wall:.0f} ({pct(gx.put_wall):+.1f}%)  |  "
+            f"Flip ${gx.flip_level:.0f} ({pct(gx.flip_level):+.1f}%)\n"
+            f"  Vanna: {gx.vanna_signal} (net {gx.net_vanna_bn:+.2f}bn/vol-pt)  top strikes: {vanna_str}"
+        )
+
+        # Log every tick to CSV so price-vs-level movement can be charted (see /levels)
+        _log_level_snapshot(now_dt, gx)
+    except Exception as e:
+        logger.error("_level_snapshot_job error: %s", e)
+
+
+_LEVEL_SNAPSHOT_CSV = os.path.join(os.path.dirname(__file__), "data", "level_snapshots.csv")
+_LEVEL_SNAPSHOT_COLS = ["ts", "hhmm", "spot", "gamma_wall", "call_wall", "put_wall",
+                        "flip_level", "gex_regime", "vanna_signal", "net_vanna_bn"]
+
+
+def _log_level_snapshot(now_dt, gx):
+    import csv
+    os.makedirs(os.path.dirname(_LEVEL_SNAPSHOT_CSV), exist_ok=True)
+    is_new = not os.path.exists(_LEVEL_SNAPSHOT_CSV)
+    with open(_LEVEL_SNAPSHOT_CSV, "a", newline="") as f:
+        w = csv.writer(f)
+        if is_new:
+            w.writerow(_LEVEL_SNAPSHOT_COLS)
+        w.writerow([now_dt.isoformat(), now_dt.strftime("%H:%M"), gx.spot, gx.gamma_wall,
+                    gx.call_wall, gx.put_wall, gx.flip_level, gx.gex_regime,
+                    gx.vanna_signal, gx.net_vanna_bn])
+
+
 def _start_scheduler():
     """Start background scheduler once — guarded against double-start in reloaders."""
     from apscheduler.schedulers.background import BackgroundScheduler
@@ -5456,6 +5633,12 @@ def _start_scheduler():
     # Monthly NAV statement — 1st of the month, 8 AM ET
     sched.add_job(_monthly_nav_job,  "cron", day=1, hour=8, minute=0,
                   id="monthly_nav",        replace_existing=True)
+    # Archive today's SPY chain for GEX-regime/vanna backtesting (data collection only)
+    sched.add_job(_archive_gex_chain_job, "cron", day_of_week="mon-fri", hour=10, minute=15,
+                  id="archive_gex_chain",  replace_existing=True)
+    # Every-5-min SPY price + wall/vanna level snapshot to Slack (one-day watch, config-gated)
+    sched.add_job(_level_snapshot_job, "cron", day_of_week="mon-fri", hour="9-15", minute="*/5",
+                  id="level_snapshot",    replace_existing=True)
     sched.start()
     logger.info("Scheduler started: prep 8:30 / scan 9:45/10:00/10:30/12:30 / "
                 "SPY monitor */5 / manage 3:30 / EOD 4:05 / auto-trade 10:00-12:30 + "

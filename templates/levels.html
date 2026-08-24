@@ -1,0 +1,103 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>SPY price vs. GEX levels</title>
+  <style>
+    body { background:#0b0e14; color:#c9d1d9; font-family:-apple-system,Segoe UI,sans-serif; margin:0; padding:16px; }
+    h1 { font-size:16px; font-weight:600; margin:0 0 4px; }
+    #meta { font-size:12px; color:#8b949e; margin-bottom:12px; }
+    #legend { display:flex; gap:16px; flex-wrap:wrap; font-size:12px; margin-bottom:8px; }
+    #legend span { display:inline-flex; align-items:center; gap:5px; }
+    #legend i { width:10px; height:10px; display:inline-block; border-radius:2px; }
+    canvas { width:100%; height:520px; background:#11151c; border-radius:6px; }
+    #empty { color:#8b949e; font-size:13px; padding:40px; text-align:center; }
+  </style>
+</head>
+<body>
+  <h1>SPY price vs. gamma / call / put wall / flip</h1>
+  <div id="meta">refreshes every 20s — reads /api/level_snapshots (today only)</div>
+  <div id="legend">
+    <span><i style="background:#58a6ff"></i> SPY spot</span>
+    <span><i style="background:#3fb950"></i> gamma wall</span>
+    <span><i style="background:#f85149"></i> call wall</span>
+    <span><i style="background:#d29922"></i> put wall</span>
+    <span><i style="background:#a371f7"></i> flip level</span>
+  </div>
+  <canvas id="chart" width="1200" height="520"></canvas>
+  <div id="empty" style="display:none">No snapshots yet today — the job runs every 5 min during market hours (9:30-16:00 ET).</div>
+
+<script>
+const COLORS = { spot: "#58a6ff", gamma_wall: "#3fb950", call_wall: "#f85149",
+                 put_wall: "#d29922", flip_level: "#a371f7" };
+
+function draw(rows) {
+  const canvas = document.getElementById("chart");
+  const empty = document.getElementById("empty");
+  if (!rows.length) { canvas.style.display = "none"; empty.style.display = "block"; return; }
+  canvas.style.display = "block"; empty.style.display = "none";
+
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const pad = { l: 60, r: 16, t: 16, b: 30 };
+  const series = ["spot", "gamma_wall", "call_wall", "put_wall", "flip_level"];
+  const vals = rows.flatMap(r => series.map(s => parseFloat(r[s])));
+  let lo = Math.min(...vals), hi = Math.max(...vals);
+  const span = (hi - lo) || 1;
+  lo -= span * 0.08; hi += span * 0.08;
+
+  const x = i => pad.l + (w - pad.l - pad.r) * (rows.length === 1 ? 0.5 : i / (rows.length - 1));
+  const y = v => pad.t + (h - pad.t - pad.b) * (1 - (v - lo) / (hi - lo));
+
+  // gridlines + y-axis labels
+  ctx.strokeStyle = "#21262d"; ctx.fillStyle = "#8b949e"; ctx.font = "11px sans-serif";
+  const nTicks = 6;
+  for (let i = 0; i <= nTicks; i++) {
+    const v = lo + (hi - lo) * i / nTicks;
+    const yy = y(v);
+    ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(w - pad.r, yy); ctx.stroke();
+    ctx.fillText(v.toFixed(1), 4, yy + 3);
+  }
+  // x-axis time labels (every ~8th point)
+  const step = Math.max(1, Math.floor(rows.length / 10));
+  for (let i = 0; i < rows.length; i += step) {
+    ctx.fillText(rows[i].hhmm, x(i) - 14, h - pad.b + 14);
+  }
+
+  function line(key, color, dash) {
+    ctx.strokeStyle = color; ctx.lineWidth = key === "spot" ? 2.2 : 1.4;
+    ctx.setLineDash(dash || []);
+    ctx.beginPath();
+    rows.forEach((r, i) => {
+      const v = parseFloat(r[key]);
+      const px = x(i), py = y(v);
+      i === 0 ? ctx.moveTo(px, py) : ctx.lineTo(px, py);
+    });
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  line("gamma_wall", COLORS.gamma_wall, [5, 4]);
+  line("call_wall",  COLORS.call_wall,  [5, 4]);
+  line("put_wall",   COLORS.put_wall,   [5, 4]);
+  line("flip_level", COLORS.flip_level, [2, 3]);
+  line("spot", COLORS.spot);
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/api/level_snapshots");
+    const d = await r.json();
+    draw(d.rows || []);
+  } catch (e) { console.error(e); }
+}
+tick();
+setInterval(tick, 20000);
+window.addEventListener("resize", tick);
+</script>
+</body>
+</html>
