@@ -5040,6 +5040,7 @@ def _submit_close(client, legs, coid):
 
 _AUTO_RUNTIME = os.path.join(os.path.dirname(__file__), "data", "auto_trade_runtime.json")
 _AUTO_ERR: dict = {}        # de-dupe: last date we posted a submit-error to Slack
+_AUTO_SIGNAL_POSTED: dict = {}   # de-dupe: last date we posted a signal_only candidate to Slack
 
 
 def _auto_runtime_get() -> dict | None:
@@ -5293,6 +5294,22 @@ def _auto_trade_job():
                 send_message(f":robot_face: *Auto-trade stood down* — no setup cleared the "
                              f"${max_loss:.0f} max-loss gate by 12:30 ET. No trade today.")
             return   # otherwise keep checking next tick
+
+        # SIGNAL-ONLY mode: report what the core strategy WOULD have picked, place
+        # nothing. Uses its own once-per-day de-dupe (not _auto_fired_today, which
+        # checks real Alpaca orders — there won't be one in this mode) so this
+        # doesn't repost every 5 min for the rest of the scan window.
+        if cfg.get("signal_only"):
+            if _AUTO_SIGNAL_POSTED.get("date") != date_tag:
+                _AUTO_SIGNAL_POSTED["date"] = date_tag
+                send_message(
+                    f":large_blue_circle: *Auto-trade SIGNAL ONLY — not placed* — {cand['strategy']}\n"
+                    f"  *{cand['label']}*\n  {cand['detail']}\n"
+                    f"  max loss ≤ ${max_loss:.0f}\n"
+                    f"  This is observation only — config/auto_trade.json signal_only=true. "
+                    f"No order was submitted."
+                )
+            return
 
         # AUTO-PLACE the one daily trade (fully automatic; the rest of the system
         # is button-approval). Marketable limit + fill confirmation built in.

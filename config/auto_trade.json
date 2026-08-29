@@ -1,10 +1,11 @@
 {
-  "enabled": false,
+  "enabled": true,
+  "signal_only": true,
   "recurring": true,
   "require_live": true,
   "armed_date": "2026-06-17",
   "max_loss": 100,
   "fire_start": "10:00",
   "fire_end": "12:30",
-  "note": "Live auto-trade. recurring=true → fires every market day (one defined-risk structure/day, idempotent per day). recurring=false → one-shot on armed_date only. Each day: best passing candidate condor > bull put > fly, max loss <= max_loss, no 0DTE, re-priced + drift-guarded, gated by the risk engine (5%/VIX/cash-floor/drawdown), exit 50%/1-DTE. Stop: /autotrade off, or env AUTO_TRADE_KILL=1, or enabled=false. armed_date is ignored while recurring=true."
+  "note": "Live auto-trade -- core strategy, currently SIGNAL ONLY (2026-08-28): posts what it WOULD trade to Slack every market day, places nothing. This is so the core strategy can finally start accumulating a track record (per RULES.md: judge at 3mo, decide at 6mo, ~30-50 trades) without committing to live orders yet. To go fully live later: set signal_only=false (or delete it) -- at that point it goes back to fully automatic (no Take button, unlike fallen-angel/burrito), so only do that deliberately. Each day: best passing candidate condor > bull put > fly, max loss <= max_loss, no 0DTE, re-priced + drift-guarded, gated by the risk engine (5%/VIX/cash-floor/drawdown), exit 50%/1-DTE (exit logic only applies once live, obviously). Stop: /autotrade off, or env AUTO_TRADE_KILL=1, or enabled=false. armed_date is ignored while recurring=true."
 }
