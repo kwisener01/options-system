@@ -3527,29 +3527,52 @@ def _close_option_structure(ticker: str, resp_url: str):
             _slack_respond(resp_url, f":x: Could not price `{ticker}` legs (market closed?).")
             return
         is_debit  = net_debit > 0
-        net_share = round(abs(net_debit) / 100, 2)
-        order = client.submit_order(LimitOrderRequest(
-            qty=1, order_class=OrderClass.MLEG,
-            side=OrderSide.BUY if is_debit else OrderSide.SELL,
-            type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
-            limit_price=(net_share if is_debit else -net_share),
-            legs=leg_objs, client_order_id=f"close-{ticker}-{datetime.now(ET):%Y%m%d%H%M%S}"))
-        status, filled, note = _confirm_fill(client, order.id)
-        icon = ":green_circle:" if unreal >= 0 else ":red_circle:"
-        if status == "filled":
-            _slack_respond(resp_url,
-                f"{icon} *Closed `{ticker}` spread* ({len(leg_objs)} legs)\n"
-                f"  Net {'debit' if is_debit else 'credit'} ${net_share:.2f}  |  P&L ${unreal:+,.2f}\n"
-                f"  Order ID: `{order.id}`")
-        elif status in ("rejected", "canceled"):
-            _slack_respond(resp_url,
-                f":rotating_light: *Close {status} — `{ticker}`*\n  {note or 'broker refused'}\n"
-                f"  Order ID: `{order.id}`")
-        else:
-            _slack_respond(resp_url,
-                f":hourglass_flowing_sand: *Close working — `{ticker}`* ({len(leg_objs)} legs)\n"
-                f"  Limit net {'debit' if is_debit else 'credit'} ${net_share:.2f} resting; "
-                f"fills if the market reaches it.\n  Order ID: `{order.id}`")
+        # Round to nearest $0.05 (index option minimum tick)
+        net_share = round(round(abs(net_debit) / 100 / 0.05) * 0.05, 2)
+        net_share = max(net_share, 0.05)
+        try:
+            order = client.submit_order(LimitOrderRequest(
+                qty=1, order_class=OrderClass.MLEG,
+                side=OrderSide.BUY if is_debit else OrderSide.SELL,
+                type=OrderType.LIMIT, time_in_force=TimeInForce.DAY,
+                limit_price=(net_share if is_debit else -net_share),
+                legs=leg_objs, client_order_id=f"close-{ticker}-{datetime.now(ET):%Y%m%d%H%M%S}"))
+            status, filled, note = _confirm_fill(client, order.id)
+            icon = ":green_circle:" if unreal >= 0 else ":red_circle:"
+            if status == "filled":
+                _slack_respond(resp_url,
+                    f"{icon} *Closed `{ticker}` spread* ({len(leg_objs)} legs)\n"
+                    f"  Net {'debit' if is_debit else 'credit'} ${net_share:.2f}  |  P&L ${unreal:+,.2f}\n"
+                    f"  Order ID: `{order.id}`")
+            elif status in ("rejected", "canceled"):
+                raise RuntimeError(f"MLEG {status}: {note or 'broker refused'} (id={order.id})")
+            else:
+                _slack_respond(resp_url,
+                    f":hourglass_flowing_sand: *Close working — `{ticker}`* ({len(leg_objs)} legs)\n"
+                    f"  Limit net {'debit' if is_debit else 'credit'} ${net_share:.2f} resting; "
+                    f"fills if the market reaches it.\n  Order ID: `{order.id}`")
+        except Exception as mleg_err:
+            # Fallback: close each leg individually with a market order
+            logger.warning("close %s MLEG failed (%s) — falling back to per-leg market close", ticker, mleg_err)
+            from alpaca.trading.requests import MarketOrderRequest
+            ids, errors = [], []
+            for pos in legs_pos:
+                try:
+                    qn = float(pos.qty)
+                    side = OrderSide.BUY if qn < 0 else OrderSide.SELL
+                    o = client.submit_order(MarketOrderRequest(
+                        symbol=pos.symbol, qty=int(abs(qn)),
+                        side=side, time_in_force=TimeInForce.DAY))
+                    ids.append(f"`{pos.symbol}` → `{o.id}`")
+                except Exception as leg_err:
+                    errors.append(f"`{pos.symbol}`: {leg_err}")
+            icon = ":green_circle:" if unreal >= 0 else ":red_circle:"
+            msg = (f"{icon} *Closing `{ticker}` legs individually* "
+                   f"(MLEG rejected: {mleg_err})\n" +
+                   "\n".join(f"  {i}" for i in ids))
+            if errors:
+                msg += "\n  :warning: " + "  ".join(errors)
+            _slack_respond(resp_url, msg)
     except Exception as e:
         _slack_respond(resp_url, f":rotating_light: Close failed for `{ticker}`: {e}")
 
