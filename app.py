@@ -4404,8 +4404,7 @@ def _cmd_closeopt(underlying: str, resp_url: str):
         client    = _trading()
         positions = client.get_all_positions()
         opts      = [p for p in positions
-                     if len(p.symbol) > ul_len + 3 and p.symbol.upper().startswith(ul)
-                     and getattr(p, "asset_class", "") in ("us_option", "option")]
+                     if p.symbol.upper().startswith(ul) and len(p.symbol) > ul_len + 6]
     except Exception as e:
         _slack_respond(resp_url, f":rotating_light: Could not fetch positions: {e}")
         return
