@@ -3911,6 +3911,8 @@ HELP_TEXT = (
     "`/allocation` — stock / option / cash split vs caps\n"
     "`/spypnl` — live P&L on all open SPY option positions\n"
     "`/closespy` — interactive close buttons for all open SPY option spreads\n"
+    "`/xsppnl` — live P&L on all open XSP option positions\n"
+    "`/closexsp` — interactive close buttons for all open XSP option spreads\n"
     "`/eod`   — generate EOD P&L report now\n"
     "`/strategies` — the bot's full strategy playbook (registry)\n"
     "`/help`  — show this message"
@@ -3951,6 +3953,8 @@ def slack_command():
         "alloc":     ":hourglass: Computing allocation...",
         "spypnl":    ":hourglass: Fetching SPY options P&L...",
         "closespy":  ":hourglass: Preparing SPY close orders...",
+        "xsppnl":   ":hourglass: Fetching XSP options P&L...",
+        "closexsp":  ":hourglass: Preparing XSP close orders...",
         "eod":       ":hourglass: Generating EOD report...",
         "strategies": ":hourglass: Loading strategy registry...",
         "strats":    ":hourglass: Loading strategy registry...",
@@ -3984,6 +3988,8 @@ def slack_command():
         "alloc":     lambda: _cmd_allocation(resp_url),
         "spypnl":    lambda: _cmd_spypnl(resp_url),
         "closespy":  lambda: _cmd_closespy(resp_url),
+        "xsppnl":   lambda: _cmd_xsppnl(resp_url),
+        "closexsp":  lambda: _cmd_closexsp(resp_url),
         "eod":       lambda: _cmd_eod(resp_url),
         "strategies": lambda: _cmd_strategies(resp_url),
         "strats":    lambda: _cmd_strategies(resp_url),
@@ -4286,9 +4292,10 @@ def _cmd_performance(resp_url: str):
         _slack_respond(resp_url, f":rotating_light: Performance report failed: {e}")
 
 
-def _cmd_spypnl(resp_url: str):
-    """Live P&L on all open SPY options positions, grouped by expiry/spread."""
+def _cmd_optpnl(underlying: str, resp_url: str):
+    """Live P&L on all open options positions for `underlying`, grouped by expiry."""
     from src.live.alpaca_options import _trading
+    ul = underlying.upper()
     try:
         client    = _trading()
         positions = client.get_all_positions()
@@ -4299,23 +4306,24 @@ def _cmd_spypnl(resp_url: str):
         _slack_respond(resp_url, f":rotating_light: Could not fetch positions: {e}")
         return
 
-    spy_opts = [p for p in positions
-                if len(p.symbol) > 6 and p.symbol.upper().startswith("SPY")]
+    opts = [p for p in positions
+            if len(p.symbol) > len(ul) + 3 and p.symbol.upper().startswith(ul)]
 
-    if not spy_opts:
-        _slack_respond(resp_url, ":bar_chart: *SPY Options P&L* — no open SPY option positions.")
+    if not opts:
+        _slack_respond(resp_url, f":bar_chart: *{ul} Options P&L* — no open {ul} option positions.")
         return
 
     today = date.today()
     total_unreal = 0.0
     total_mkt    = 0.0
-    lines = [":bar_chart: *SPY Options P&L*", ""]
+    lines = [f":bar_chart: *{ul} Options P&L*", ""]
 
     by_expiry: dict[str, list] = {}
-    for p in spy_opts:
+    ul_len = len(ul)
+    for p in opts:
         sym = p.symbol.upper()
         try:
-            raw_date = sym[3:9]
+            raw_date = sym[ul_len:ul_len + 6]
             exp_str  = f"20{raw_date[0:2]}-{raw_date[2:4]}-{raw_date[4:6]}"
         except Exception:
             exp_str = "unknown"
@@ -4343,8 +4351,9 @@ def _cmd_spypnl(resp_url: str):
             cur_px = float(getattr(p, "current_price",   0) or 0)
 
             try:
-                opt_type = "CALL" if sym[9] == "C" else "PUT"
-                strike   = int(sym[10:]) / 1000
+                type_idx = ul_len + 6
+                opt_type = "CALL" if sym[type_idx] == "C" else "PUT"
+                strike   = int(sym[type_idx + 1:]) / 1000
                 side_tag = "SHORT" if qty < 0 else "LONG"
                 desc     = f"{side_tag} {opt_type[0]} ${strike:.1f}"
             except Exception:
@@ -4370,38 +4379,48 @@ def _cmd_spypnl(resp_url: str):
     total_icon = ":chart_with_upwards_trend:" if total_unreal >= 0 else ":chart_with_downwards_trend:"
     tp_pct = total_unreal / equity * 100 if equity else 0
     lines += [
-        f"{total_icon} *Total SPY Options P&L: ${total_unreal:+,.2f}* "
+        f"{total_icon} *Total {ul} Options P&L: ${total_unreal:+,.2f}* "
         f"({tp_pct:+.2f}% of equity)  |  Options BP: ${bp:,.2f}",
     ]
     _slack_respond(resp_url, "\n".join(lines))
 
 
-def _cmd_closespy(resp_url: str):
-    """Interactive close for all open SPY option spreads, one Close/Hold per expiry."""
+def _cmd_spypnl(resp_url: str):
+    _cmd_optpnl("SPY", resp_url)
+
+
+def _cmd_xsppnl(resp_url: str):
+    _cmd_optpnl("XSP", resp_url)
+
+
+def _cmd_closeopt(underlying: str, resp_url: str):
+    """Interactive close for all open option spreads for `underlying`, one Close/Hold per expiry."""
     from src.live.alpaca_options import _trading, get_mid_price
     from src.notifications.slack_blocks import exit_blocks
     from src.notifications.slack_notifier import send_blocks
+    ul = underlying.upper()
+    ul_len = len(ul)
     try:
         client    = _trading()
         positions = client.get_all_positions()
-        spy_opts  = [p for p in positions
-                     if len(p.symbol) > 6 and p.symbol.upper().startswith("SPY")
+        opts      = [p for p in positions
+                     if len(p.symbol) > ul_len + 3 and p.symbol.upper().startswith(ul)
                      and getattr(p, "asset_class", "") in ("us_option", "option")]
     except Exception as e:
         _slack_respond(resp_url, f":rotating_light: Could not fetch positions: {e}")
         return
 
-    if not spy_opts:
-        _slack_respond(resp_url, ":white_check_mark: No open SPY option positions to close.")
+    if not opts:
+        _slack_respond(resp_url, f":white_check_mark: No open {ul} option positions to close.")
         return
 
     today = date.today()
 
     by_expiry: dict[str, list] = {}
-    for p in spy_opts:
+    for p in opts:
         sym = p.symbol.upper()
         try:
-            raw_date = sym[3:9]
+            raw_date = sym[ul_len:ul_len + 6]
             exp_str  = f"20{raw_date[0:2]}-{raw_date[2:4]}-{raw_date[4:6]}"
         except Exception:
             exp_str = "unknown"
@@ -4427,8 +4446,9 @@ def _cmd_closespy(resp_url: str):
             avg_px  = float(getattr(p, "avg_entry_price", 0) or 0)
             unreal  = float(getattr(p, "unrealized_pl", 0) or 0)
             try:
-                opt_type = "C" if sym[9] == "C" else "P"
-                strike   = int(sym[10:]) / 1000
+                type_idx = ul_len + 6
+                opt_type = "C" if sym[type_idx] == "C" else "P"
+                strike   = int(sym[type_idx + 1:]) / 1000
                 side_tag = "SHORT" if qty < 0 else "LONG"
                 desc     = f"{side_tag} {opt_type}${strike:.0f}"
             except Exception:
@@ -4447,15 +4467,15 @@ def _cmd_closespy(resp_url: str):
         close_cost = abs(net_debit_est)
         cost_word  = "debit" if net_debit_est > 0 else "credit"
         summary = (
-            f"{icon} *SPY {exp_str}*  _{dte_tag}_  "
+            f"{icon} *{ul} {exp_str}*  _{dte_tag}_  "
             f"unrealized P&L *${net_unreal:+,.2f}*\n"
             + "\n".join(leg_descs) + "\n"
             f"  _Est. close {cost_word}: ${close_cost:.2f} — "
             f"will re-price live at submission_"
         )
-        label = f"SPY {exp_str} spread ({len(legs)} legs)"
+        label = f"{ul} {exp_str} spread ({len(legs)} legs)"
         tid = register_exit(
-            kind="structure", underlying="SPY",
+            kind="structure", underlying=ul,
             label=label,
             text=summary,
         )
@@ -4467,12 +4487,20 @@ def _cmd_closespy(resp_url: str):
         return
 
     blocks, fallback = exit_blocks(
-        f":scissors: *Close SPY Options — {len(spy_opts)} legs across "
+        f":scissors: *Close {ul} Options — {len(opts)} legs across "
         f"{len(candidates)} expir{'y' if len(candidates)==1 else 'ies'}*",
         candidates,
     )
     send_blocks(blocks, fallback)
     _slack_respond(resp_url, ":white_check_mark: Close request posted to channel.")
+
+
+def _cmd_closespy(resp_url: str):
+    _cmd_closeopt("SPY", resp_url)
+
+
+def _cmd_closexsp(resp_url: str):
+    _cmd_closeopt("XSP", resp_url)
 
 
 def _monthly_nav_job():
